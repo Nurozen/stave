@@ -1,0 +1,196 @@
+name: Auto Tag & Release
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [weirwood]
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    name: Bump version and tag
+    runs-on: ubuntu-latest
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
+    outputs:
+      new_tag: ${{ steps.tag.outputs.new_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Bump version and push tag
+        id: tag
+        uses: anothrNick/github-tag-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEFAULT_BUMP: patch
+          TAG_PREFIX: v
+          RELEASE_BRANCHES: weirwood
+          MAJOR_STRING_TOKEN: "#major"
+          MINOR_STRING_TOKEN: "#minor"
+          PATCH_STRING_TOKEN: "#patch"
+          WITH_V: true
+          DRY_RUN: false
+
+      - name: Summary
+        if: steps.tag.outputs.new_tag != ''
+        run: |
+          echo "### New tag: ${{ steps.tag.outputs.new_tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "Previous: ${{ steps.tag.outputs.old_tag }}" >> $GITHUB_STEP_SUMMARY
+
+  release:
+    name: Release
+    needs: tag
+    if: needs.tag.outputs.new_tag != ''
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.tag.outputs.new_tag }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.2"
+          cache: true
+
+      - name: Import Apple signing certificate
+        if: env.APPLE_CERTIFICATE_BASE64 != ''
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          CERT_PATH=$RUNNER_TEMP/certificate.p12
+          echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$CERT_PATH"
+
+          KEYCHAIN_PATH=$RUNNER_TEMP/signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 16)
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          security import "$CERT_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
+            | grep "Developer ID Application" | head -1 \
+            | sed 's/.*"\(.*\)".*/\1/')
+
+          if [ -n "$IDENTITY" ]; then
+            echo "APPLE_SIGNING_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+            echo "Found signing identity: $IDENTITY"
+          else
+            echo "::warning::No Developer ID Application identity found in certificate"
+          fi
+
+      - name: Set up Apple notarization credentials
+        if: env.APPLE_API_KEY_BASE64 != ''
+        env:
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+        run: |
+          mkdir -p ~/private_keys
+          echo "$APPLE_API_KEY_BASE64" | base64 --decode \
+            > ~/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: latest
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_SIGNING_IDENTITY: ${{ env.APPLE_SIGNING_IDENTITY }}
+
+      - name: Notarize macOS binaries
+        if: env.APPLE_SIGNING_IDENTITY != '' && env.APPLE_API_KEY_ID != ''
+        env:
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          KEY_PATH=~/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8
+          SUBMISSION_IDS=()
+
+          for archive in dist/stave_*_darwin_*.zip; do
+            [ -f "$archive" ] || continue
+            echo "Submitting $archive..."
+            OUTPUT=$(xcrun notarytool submit "$archive" \
+              --key "$KEY_PATH" \
+              --key-id "$APPLE_API_KEY_ID" \
+              --issuer "$APPLE_API_ISSUER_ID" 2>&1)
+            echo "$OUTPUT"
+            ID=$(echo "$OUTPUT" | grep "id:" | head -1 | awk '{print $2}')
+            if [ -n "$ID" ]; then
+              SUBMISSION_IDS+=("$ID:$archive")
+              echo "Submitted $archive -> $ID"
+            else
+              echo "::warning::Failed to submit $archive"
+            fi
+          done
+
+          if [ ${#SUBMISSION_IDS[@]} -eq 0 ]; then
+            echo "No submissions to track."
+            exit 0
+          fi
+
+          DEADLINE=$((SECONDS + 900))
+          PENDING=("${SUBMISSION_IDS[@]}")
+
+          while [ ${#PENDING[@]} -gt 0 ] && [ $SECONDS -lt $DEADLINE ]; do
+            sleep 30
+            STILL_PENDING=()
+            for entry in "${PENDING[@]}"; do
+              ID="${entry%%:*}"
+              ARCHIVE="${entry#*:}"
+              STATUS=$(xcrun notarytool info "$ID" \
+                --key "$KEY_PATH" \
+                --key-id "$APPLE_API_KEY_ID" \
+                --issuer "$APPLE_API_ISSUER_ID" 2>&1 | grep "status:" | head -1 | awk '{print $2}')
+              case "$STATUS" in
+                Accepted)
+                  echo "$ARCHIVE notarized ($ID)"
+                  ;;
+                Invalid|Rejected)
+                  echo "::warning::$ARCHIVE notarization rejected ($ID)"
+                  xcrun notarytool log "$ID" \
+                    --key "$KEY_PATH" \
+                    --key-id "$APPLE_API_KEY_ID" \
+                    --issuer "$APPLE_API_ISSUER_ID" 2>&1 || true
+                  ;;
+                *)
+                  STILL_PENDING+=("$entry")
+                  echo "$ARCHIVE still processing ($STATUS)..."
+                  ;;
+              esac
+            done
+            PENDING=("${STILL_PENDING[@]}")
+          done
+
+          if [ ${#PENDING[@]} -gt 0 ]; then
+            echo "::warning::Notarization still pending for ${#PENDING[@]} archive(s) after timeout. Apple will complete asynchronously."
+            for entry in "${PENDING[@]}"; do
+              echo "  Pending: ${entry#*:} (${entry%%:*})"
+            done
+          fi
+
+      - name: Clean up keychain
+        if: always()
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/signing.keychain-db
+          if [ -f "$KEYCHAIN_PATH" ]; then
+            security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
+          fi
+          rm -f $RUNNER_TEMP/certificate.p12
+          rm -rf ~/private_keys

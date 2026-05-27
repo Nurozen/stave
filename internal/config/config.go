@@ -1,0 +1,257 @@
+package config
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+
+	"github.com/spf13/viper"
+	"gopkg.in/yaml.v3"
+)
+
+const (
+	AppName           = "stave"
+	DefaultBase       = "main"
+	ConfigFileName    = "config.yaml"
+	DefaultConfigMode = 0o600
+	DefaultDirMode    = 0o755
+)
+
+var safeNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+type Config struct {
+	Root         string                `mapstructure:"root" yaml:"root"`
+	BareReposDir string                `mapstructure:"bareReposDir" yaml:"bareReposDir"`
+	AgentWorkDir string                `mapstructure:"agentWorkDir" yaml:"agentWorkDir"`
+	DefaultBase  string                `mapstructure:"defaultBase" yaml:"defaultBase"`
+	Repos        map[string]Repository `mapstructure:"repos" yaml:"repos"`
+}
+
+type Repository struct {
+	Name          string `mapstructure:"name" yaml:"name"`
+	URL           string `mapstructure:"url" yaml:"url"`
+	BareRepoPath  string `mapstructure:"bareRepoPath" yaml:"bareRepoPath"`
+	DefaultBranch string `mapstructure:"defaultBranch,omitempty" yaml:"defaultBranch,omitempty"`
+}
+
+func DefaultRoot() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve home directory: %w", err)
+	}
+	return filepath.Join(home, AppName), nil
+}
+
+func DefaultConfigPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve home directory: %w", err)
+	}
+	return filepath.Join(home, ".config", AppName, ConfigFileName), nil
+}
+
+func Default() (*Config, error) {
+	root, err := DefaultRoot()
+	if err != nil {
+		return nil, err
+	}
+	return &Config{
+		Root:         root,
+		BareReposDir: filepath.Join(root, "bare-repos"),
+		AgentWorkDir: filepath.Join(root, "agent-work"),
+		DefaultBase:  DefaultBase,
+		Repos:        map[string]Repository{},
+	}, nil
+}
+
+func Load(path string) (*Config, string, error) {
+	if path == "" {
+		defaultPath, err := DefaultConfigPath()
+		if err != nil {
+			return nil, "", err
+		}
+		path = defaultPath
+	}
+
+	v := viper.New()
+	v.SetConfigFile(path)
+	v.SetConfigType("yaml")
+	defaults, err := Default()
+	if err != nil {
+		return nil, path, err
+	}
+	v.SetDefault("root", defaults.Root)
+	v.SetDefault("bareReposDir", defaults.BareReposDir)
+	v.SetDefault("agentWorkDir", defaults.AgentWorkDir)
+	v.SetDefault("defaultBase", defaults.DefaultBase)
+	v.SetDefault("repos", map[string]Repository{})
+
+	if err := v.ReadInConfig(); err != nil && !missingConfig(err) {
+		return nil, path, fmt.Errorf("read config: %w", err)
+	}
+
+	var cfg Config
+	if err := v.Unmarshal(&cfg); err != nil {
+		return nil, path, fmt.Errorf("decode config: %w", err)
+	}
+	if err := cfg.ApplyDefaults(); err != nil {
+		return nil, path, err
+	}
+	return &cfg, path, nil
+}
+
+func (c *Config) ApplyDefaults() error {
+	if c.Root == "" {
+		root, err := DefaultRoot()
+		if err != nil {
+			return err
+		}
+		c.Root = root
+	}
+	root, err := ExpandPath(c.Root)
+	if err != nil {
+		return err
+	}
+	c.Root = root
+	if c.BareReposDir == "" {
+		c.BareReposDir = filepath.Join(c.Root, "bare-repos")
+	}
+	if c.AgentWorkDir == "" {
+		c.AgentWorkDir = filepath.Join(c.Root, "agent-work")
+	}
+	c.BareReposDir, err = ExpandPath(c.BareReposDir)
+	if err != nil {
+		return err
+	}
+	c.AgentWorkDir, err = ExpandPath(c.AgentWorkDir)
+	if err != nil {
+		return err
+	}
+	if c.DefaultBase == "" {
+		c.DefaultBase = DefaultBase
+	}
+	if c.Repos == nil {
+		c.Repos = map[string]Repository{}
+	}
+	for name, repo := range c.Repos {
+		if repo.Name == "" {
+			repo.Name = name
+		}
+		if repo.BareRepoPath == "" {
+			repo.BareRepoPath = c.BareRepoPath(name)
+		}
+		repo.BareRepoPath, err = ExpandPath(repo.BareRepoPath)
+		if err != nil {
+			return err
+		}
+		c.Repos[name] = repo
+	}
+	return nil
+}
+
+func (c Config) Save(path string) error {
+	if path == "" {
+		defaultPath, err := DefaultConfigPath()
+		if err != nil {
+			return err
+		}
+		path = defaultPath
+	}
+	copied := c
+	if err := copied.ApplyDefaults(); err != nil {
+		return err
+	}
+	data, err := yaml.Marshal(copied)
+	if err != nil {
+		return fmt.Errorf("encode config: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), DefaultDirMode); err != nil {
+		return fmt.Errorf("create config directory: %w", err)
+	}
+	if err := os.WriteFile(path, data, DefaultConfigMode); err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
+	return nil
+}
+
+func (c Config) EnsureRootDirs() error {
+	for _, dir := range []string{c.Root, c.BareReposDir, c.AgentWorkDir} {
+		if err := os.MkdirAll(dir, DefaultDirMode); err != nil {
+			return fmt.Errorf("create %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
+func (c Config) BareRepoPath(name string) string {
+	return filepath.Join(c.BareReposDir, name+".git")
+}
+
+func (c *Config) RegisterRepository(name, url, defaultBranch string) (Repository, error) {
+	if err := ValidateName("repo name", name); err != nil {
+		return Repository{}, err
+	}
+	if err := ValidateGitURL(url); err != nil {
+		return Repository{}, err
+	}
+	if c.Repos == nil {
+		c.Repos = map[string]Repository{}
+	}
+	repo := Repository{
+		Name:          name,
+		URL:           url,
+		BareRepoPath:  c.BareRepoPath(name),
+		DefaultBranch: defaultBranch,
+	}
+	c.Repos[name] = repo
+	return repo, nil
+}
+
+func (c *Config) UnregisterRepository(name string) {
+	delete(c.Repos, name)
+}
+
+func ExpandPath(path string) (string, error) {
+	if path == "" {
+		return "", nil
+	}
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("resolve home directory: %w", err)
+		}
+		if path == "~" {
+			return home, nil
+		}
+		return filepath.Join(home, strings.TrimPrefix(path, "~/")), nil
+	}
+	return filepath.Abs(path)
+}
+
+func ValidateName(label, name string) error {
+	if !safeNamePattern.MatchString(name) {
+		return fmt.Errorf("%s %q must start with an alphanumeric character and contain only letters, numbers, dot, underscore, or dash", label, name)
+	}
+	return nil
+}
+
+func ValidateGitURL(raw string) error {
+	if raw == "" {
+		return errors.New("git URL is required")
+	}
+	if strings.HasPrefix(raw, "git@") || strings.HasPrefix(raw, "ssh://") ||
+		strings.HasPrefix(raw, "https://") || strings.HasPrefix(raw, "http://") ||
+		strings.HasPrefix(raw, "file://") || strings.HasPrefix(raw, "/") ||
+		strings.HasPrefix(raw, "./") || strings.HasPrefix(raw, "../") {
+		return nil
+	}
+	return fmt.Errorf("unsupported git URL %q; use SSH, HTTP(S), file URL, or local path", raw)
+}
+
+func missingConfig(err error) bool {
+	var notFound viper.ConfigFileNotFoundError
+	return errors.As(err, &notFound) || os.IsNotExist(err)
+}
