@@ -21,6 +21,7 @@ const (
 	ToolSpaceSync          = "stave_space_sync"
 	ToolSpaceCreate        = "stave_space_create"
 	ToolSpaceAdd           = "stave_space_add"
+	ToolSummon             = "stave_summon"
 	ToolExplainUnsupported = "stave_explain_unsupported"
 	ToolFinish             = "stave_finish"
 )
@@ -164,6 +165,19 @@ func ToolDefinitions() []ToolDefinition {
 			}, []string{"space_id", "repo", "mode"}),
 		},
 		{
+			Name:        ToolSummon,
+			Category:    ToolCategoryMutate,
+			Description: "Propose launching Codex, Claude Code, or Cursor Agent in a Stave space. Use this when the user asks to summon, open, start, or hand off to an interactive coding agent. The process starts in the Stave space root so it can see .stave.yaml, AGENTS.md, specs, editable repos, and references/. This interactive operation is queued for user confirmation before execution and never runs during planning.",
+			Parameters: objectSchema(map[string]any{
+				"space_id": stringSchema("Existing Stave space id, or a space id created earlier in this same plan."),
+				"summoner": map[string]any{
+					"type":        "string",
+					"description": "Interactive agent to launch.",
+					"enum":        []string{"codex", "claude", "cursor"},
+				},
+			}, []string{"space_id", "summoner"}),
+		},
+		{
 			Name:        ToolExplainUnsupported,
 			Category:    ToolCategoryControl,
 			Description: "Record that the user requested an operation Stave Agent will not execute in v1, such as destroy, archive, remove, reset, delete, push, PR creation, issue tracker updates, or arbitrary shell commands. Use this instead of inventing unsupported tools.",
@@ -236,6 +250,13 @@ func (d *ToolDispatcher) dispatch(ctx context.Context, call ToolCall) ToolResult
 			return toolError(call, err)
 		}
 		op := Operation{Type: OpSpaceAdd, SpaceID: args.SpaceID, Repo: args.Repo, Mode: args.Mode, Base: args.Base, Ref: args.Ref, Branch: args.Branch, NoFetch: args.NoFetch}
+		return d.queueOperation(call, op)
+	case ToolSummon:
+		var args summonArgs
+		if err := decodeToolArgs(call.Arguments, &args); err != nil {
+			return toolError(call, err)
+		}
+		op := Operation{Type: OpSummon, SpaceID: args.SpaceID, Summoner: args.Summoner}
 		return d.queueOperation(call, op)
 	case ToolExplainUnsupported:
 		var args explainUnsupportedArgs
@@ -388,6 +409,11 @@ type spaceAddArgs struct {
 	Ref     string `json:"ref"`
 	Branch  string `json:"branch"`
 	NoFetch bool   `json:"no_fetch"`
+}
+
+type summonArgs struct {
+	SpaceID  string `json:"space_id"`
+	Summoner string `json:"summoner"`
 }
 
 type explainUnsupportedArgs struct {

@@ -29,11 +29,24 @@ func TestValidatePlan(t *testing.T) {
 	}
 }
 
+func TestValidatePlanAcceptsSummonAfterCreate(t *testing.T) {
+	cfg := testConfig(t)
+	plan := Plan{Operations: []Operation{
+		{Type: OpSpaceCreate, SpaceID: "ex-2", Edits: []RepoRef{{Name: "api"}}},
+		{Type: OpSummon, SpaceID: "ex-2", Summoner: "codex"},
+	}}
+	if err := ValidatePlan(cfg, plan); err != nil {
+		t.Fatalf("ValidatePlan() error = %v", err)
+	}
+}
+
 func TestValidatePlanRejectsUnknownRepoExistingSpaceAndUnsupported(t *testing.T) {
 	cfg := testConfig(t)
 	tests := []Plan{
 		{Operations: []Operation{{Type: OpSpaceCreate, SpaceID: "ex-2", Edits: []RepoRef{{Name: "missing"}}}}},
 		{Operations: []Operation{{Type: OpSpaceCreate, SpaceID: "ex-1"}}},
+		{Operations: []Operation{{Type: OpSummon, SpaceID: "missing", Summoner: "codex"}}},
+		{Operations: []Operation{{Type: OpSummon, SpaceID: "ex-1", Summoner: "bad"}}},
 		{Operations: []Operation{{Type: "space_destroy", SpaceID: "ex-1"}}},
 	}
 	for _, plan := range tests {
@@ -82,6 +95,9 @@ func testConfig(t *testing.T) config.Config {
 		Repos: map[string]config.Repository{
 			"api": {Name: "api", URL: "https://example.test/api.git", BareRepoPath: filepath.Join(root, "bare-repos", "api.git")},
 		},
+	}
+	if err := cfg.ApplyDefaults(); err != nil {
+		t.Fatal(err)
 	}
 	if err := cfg.EnsureRootDirs(); err != nil {
 		t.Fatal(err)

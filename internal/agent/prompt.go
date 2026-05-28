@@ -19,6 +19,7 @@ Rules:
 - Do not produce destructive operations. Do not produce archive, destroy, remove, reset, or delete operations.
 - If a requested operation is destructive or unsupported, call stave_explain_unsupported.
 - For workspace setup, prefer one space_create operation over init plus add operations.
+- If the user asks to summon or hand off to Codex, Claude Code, or Cursor Agent, queue stave_summon after any needed space_create operation.
 - Do not invent file paths unless the user gave one.
 - Read-only tools execute immediately during planning.
 - Tools that propose mutations only queue operations; Stave validates them and asks for confirmation before executing.

@@ -30,6 +30,7 @@ stave
 ├── agent
 │   ├── configure
 │   └── <query>
+├── summon <space-id>
 ├── repos
 │   ├── add <name> <url>
 │   ├── list
@@ -63,11 +64,12 @@ stave space create ticket-482 \
   -s ~/notes/ticket-482.md \
   -e api \
   -e web:develop \
-  -r api:main
+  -r api:main \
+  --summon codex
 
 # Optional: configure the natural-language agent
 stave agent configure
-stave agent "create ticket-482 from ~/notes/ticket-482.md with api editable and web as a reference"
+stave agent "create ticket-482 from ~/notes/ticket-482.md with api editable, web as a reference, and summon codex"
 
 # Inspect the workspace
 stave space status ticket-482
@@ -151,10 +153,11 @@ The agent uses provider-native tool calls, not a free-form JSON response. OpenAI
 | `stave_space_sync` | Queue space sync for confirmation |
 | `stave_space_create` | Queue new space creation for confirmation |
 | `stave_space_add` | Queue adding a repo to an existing space for confirmation |
+| `stave_summon` | Queue launching Codex, Claude Code, or Cursor Agent in a space |
 | `stave_explain_unsupported` | Record unsupported/destructive requests as notes |
 | `stave_finish` | Finish planning with a summary, notes, and warnings |
 
-Read-only tools can run immediately while the model is planning. Mutating tools never apply changes inside the model loop; they only create a validated operation plan that Stave executes after confirmation, `--incant`, or `agent.autoIncant: true`.
+Read-only tools can run immediately while the model is planning. Mutating tools never apply changes inside the model loop; they only create a validated operation plan that Stave executes after confirmation, `--incant`, or `agent.autoIncant: true`. Summoning is interactive, so `--json` and non-interactive executions include the summon command but skip the launch.
 
 Destructive operations such as archive, destroy, repo removal, reset, delete, push, PR creation, issue tracker updates, and arbitrary shell commands are intentionally not executable by the agent in v1.
 
@@ -182,6 +185,7 @@ Space flags:
 | `--spec`, `-s` | `init`, `create` | Copy a spec file or directory into `spec/` |
 | `--edit`, `-e` | `create` | Editable worktree from base ref (`repo` or `repo:base`; repeatable) |
 | `--reference`, `-r` | `create` | Detached reference worktree (`repo` or `repo:ref`; repeatable) |
+| `--summon` | `create` | Launch `codex`, `claude`, or `cursor` after the space is created |
 | `--edit`, `-e` / `--reference`, `-r` | `add` | Mode (exactly one required) |
 | `--base`, `-b` | `add` | Base branch/ref for edits, or ref for references |
 | `--branch` | `add` | Branch name for editable repos |
@@ -191,6 +195,18 @@ Space flags:
 | `--dry-run` | `create`, `add`, `destroy` | Print Git operations without changing state |
 
 When `--spec` points at a file, it is copied under `spec/` with its original basename. When it points at a directory, the directory contents are copied into `spec/`. The manifest records `specPath: spec`.
+
+### `stave summon`
+
+| Command | Description |
+|---------|-------------|
+| `stave summon <space-id> --with codex` | Start Codex in the space root |
+| `stave summon <space-id> --with claude` | Start Claude Code in the space root |
+| `stave summon <space-id> --with cursor` | Start Cursor Agent in the space root |
+
+Summoned agents always launch from `agent-work/<space-id>`, not from an individual repo. That gives them the manifest, generated `AGENTS.md`, copied specs, editable top-level repos, and `references/` context in one working directory.
+
+`--print-command` prints the launch command instead of running it. Non-interactive terminals also print instead of launching. `cursor` maps to the Cursor Agent CLI (`cursor-agent`), not the Cursor GUI editor.
 
 ## Configuration
 
@@ -217,6 +233,12 @@ agent:
     anthropic:
       model: claude-opus-4-7
       apiKeyRef: env:ANTHROPIC_API_KEY
+summon:
+  default: codex
+  commands:
+    codex: codex
+    claude: claude
+    cursor: cursor-agent
 ```
 
 - **`defaultBase`** — fallback ref when a repo or `--edit` / `--reference` spec omits a branch.
@@ -224,6 +246,8 @@ agent:
 - **`agent.defaultProvider`** — provider used by `stave agent` unless `--provider` is set.
 - **`agent.autoIncant`** — when true, `stave agent` executes validated plans without prompting or requiring `--incant`; `--no-incant` still wins.
 - **`agent.providers.*.apiKeyRef`** — secret reference; either `keychain:stave/agent/<provider>` or `env:<NAME>`.
+- **`summon.default`** — summoner used when `stave summon` omits `--with`.
+- **`summon.commands.*`** — command names or paths for `codex`, `claude`, and `cursor`.
 
 Editable branches default to `stave/<space-id>/<repo>` unless `--branch` is set.
 

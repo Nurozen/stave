@@ -39,6 +39,12 @@ func TestLoadMissingConfigUsesDefaults(t *testing.T) {
 	if cfg.Agent.Providers["openai"].Model != DefaultAgentModelOpenAI {
 		t.Fatalf("openai model = %q", cfg.Agent.Providers["openai"].Model)
 	}
+	if cfg.Summon.Default != "codex" {
+		t.Fatalf("Summon.Default = %q", cfg.Summon.Default)
+	}
+	if cfg.Summon.Commands["cursor"] != "cursor-agent" {
+		t.Fatalf("cursor command = %q", cfg.Summon.Commands["cursor"])
+	}
 }
 
 func TestSaveAndLoadRoundTrip(t *testing.T) {
@@ -59,6 +65,8 @@ func TestSaveAndLoadRoundTrip(t *testing.T) {
 		Model:     "claude-opus-4-7",
 		APIKeyRef: "keychain:stave/agent/anthropic",
 	}
+	cfg.Summon.Default = "cursor"
+	cfg.Summon.Commands["cursor"] = "/opt/bin/cursor-agent"
 	if err := cfg.Save(path); err != nil {
 		t.Fatalf("Save() error = %v", err)
 	}
@@ -89,6 +97,9 @@ func TestSaveAndLoadRoundTrip(t *testing.T) {
 	}
 	if loaded.Agent.Providers["anthropic"].APIKeyRef != "keychain:stave/agent/anthropic" {
 		t.Fatalf("agent anthropic config = %#v", loaded.Agent.Providers["anthropic"])
+	}
+	if loaded.Summon.Default != "cursor" || loaded.Summon.Commands["cursor"] != "/opt/bin/cursor-agent" {
+		t.Fatalf("summon config = %#v", loaded.Summon)
 	}
 }
 

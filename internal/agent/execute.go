@@ -10,12 +10,15 @@ import (
 	"github.com/Nurozen/stave/internal/config"
 	"github.com/Nurozen/stave/internal/git"
 	"github.com/Nurozen/stave/internal/space"
+	"github.com/Nurozen/stave/internal/summon"
 )
 
 type Executor struct {
-	Config config.Config
-	Git    *git.Client
-	Out    io.Writer
+	Config           config.Config
+	Git              *git.Client
+	Out              io.Writer
+	SummonLauncher   summon.Launcher
+	AllowInteractive bool
 }
 
 func (e Executor) ExecutePlan(ctx context.Context, plan Plan) ([]ExecutionResult, error) {
@@ -24,13 +27,19 @@ func (e Executor) ExecutePlan(ctx context.Context, plan Plan) ([]ExecutionResult
 		result := ExecutionResult{
 			Operation: op,
 			Command:   EquivalentCommand(op),
-			Executed:  true,
+		}
+		if op.Type == OpSummon && !e.AllowInteractive {
+			result.Message = "summon skipped because interactive launch is disabled"
+			results = append(results, result)
+			continue
 		}
 		if err := e.executeOperation(ctx, op); err != nil {
+			result.Executed = true
 			result.Message = err.Error()
 			results = append(results, result)
 			return results, err
 		}
+		result.Executed = true
 		results = append(results, result)
 	}
 	return results, nil
@@ -104,6 +113,11 @@ func (e Executor) executeOperation(ctx context.Context, op Operation) error {
 			}
 		}
 		return nil
+	case OpSummon:
+		summoner := summon.ResolveName(e.Config, op.Summoner)
+		svc := summon.NewService(e.Config, e.SummonLauncher, out)
+		svc.Interactive = true
+		return svc.Summon(ctx, summon.Options{SpaceID: op.SpaceID, Summoner: summoner})
 	default:
 		return fmt.Errorf("unsupported operation %q", op.Type)
 	}

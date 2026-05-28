@@ -15,6 +15,7 @@ import (
 	"github.com/Nurozen/stave/internal/config"
 	"github.com/Nurozen/stave/internal/git"
 	"github.com/Nurozen/stave/internal/space"
+	"github.com/Nurozen/stave/internal/summon"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -23,6 +24,7 @@ type app struct {
 	configPath      string
 	providerFactory agent.ProviderFactory
 	secretStore     agent.SecretStore
+	summonLauncher  summon.Launcher
 	isTerminal      func(*cobra.Command) bool
 }
 
@@ -41,6 +43,7 @@ func newRootCommand(a *app) *cobra.Command {
 		a.reposCommand(),
 		a.spaceCommand(),
 		a.agentCommand(),
+		a.summonCommand(),
 	)
 	return cmd
 }
@@ -281,7 +284,17 @@ func (a *app) agentCommand() *cobra.Command {
 				execute = false
 			}
 			if execute {
-				results, err := (agent.Executor{Config: *cfg, Git: git.New(), Out: cmd.OutOrStdout()}).ExecutePlan(cmd.Context(), result.Plan)
+				execOut := cmd.OutOrStdout()
+				if jsonOut {
+					execOut = io.Discard
+				}
+				results, err := (agent.Executor{
+					Config:           *cfg,
+					Git:              git.New(),
+					Out:              execOut,
+					SummonLauncher:   a.effectiveSummonLauncher(),
+					AllowInteractive: !jsonOut && a.commandIsTerminal(cmd),
+				}).ExecutePlan(cmd.Context(), result.Plan)
 				result.Results = results
 				result.Executed = true
 				if err != nil {
@@ -421,6 +434,7 @@ func (a *app) createCommand() *cobra.Command {
 	var edits []string
 	var references []string
 	var dryRun bool
+	var summonName string
 	cmd := &cobra.Command{
 		Use:   "create <space-id>",
 		Short: "Create a workspace and add edit/reference repos in one command",
@@ -438,14 +452,44 @@ func (a *app) createCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return svc.Create(cmd.Context(), space.CreateOptions{ID: args[0], Kind: kind, SpecPath: spec, Edits: editSpecs, References: refSpecs, DryRun: dryRun})
+			if err := svc.Create(cmd.Context(), space.CreateOptions{ID: args[0], Kind: kind, SpecPath: spec, Edits: editSpecs, References: refSpecs, DryRun: dryRun}); err != nil {
+				return err
+			}
+			if summonName == "" {
+				return nil
+			}
+			if dryRun {
+				return a.printPlannedSummon(cmd, svc.Config, args[0], summonName, spec)
+			}
+			return a.runSummon(cmd, svc.Config, args[0], summonName, false)
 		},
 	}
 	cmd.Flags().StringVarP(&kind, "kind", "k", "", "space kind, such as ticket, spike, or audit")
 	cmd.Flags().StringVarP(&spec, "spec", "s", "", "path to a spec file or directory to copy into the space")
 	cmd.Flags().StringArrayVarP(&edits, "edit", "e", nil, "editable repo spec, optionally repo:base")
 	cmd.Flags().StringArrayVarP(&references, "reference", "r", nil, "reference repo spec, optionally repo:ref")
+	cmd.Flags().StringVar(&summonName, "summon", "", "launch a summoner after creation (codex, claude, or cursor)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print operations without changing state")
+	return cmd
+}
+
+func (a *app) summonCommand() *cobra.Command {
+	var summoner string
+	var printCommand bool
+	cmd := &cobra.Command{
+		Use:   "summon <space-id>",
+		Short: "Launch an interactive agent in a Stave space",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, _, err := a.loadConfig()
+			if err != nil {
+				return err
+			}
+			return a.runSummon(cmd, *cfg, args[0], summoner, printCommand)
+		},
+	}
+	cmd.Flags().StringVar(&summoner, "with", "", "summoner to launch (codex, claude, or cursor; defaults to config)")
+	cmd.Flags().BoolVar(&printCommand, "print-command", false, "print the launch command instead of running it")
 	return cmd
 }
 
@@ -589,6 +633,27 @@ func (a *app) serviceWithDryRun(cmd *cobra.Command, dryRun bool) (space.Service,
 		fmt.Fprintf(cmd.OutOrStdout(), format+"\n", args...)
 	}))
 	return space.NewService(*cfg, client, cmd.OutOrStdout()), nil
+}
+
+func (a *app) runSummon(cmd *cobra.Command, cfg config.Config, spaceID string, summoner string, printCommand bool) error {
+	svc := summon.NewService(cfg, a.effectiveSummonLauncher(), cmd.OutOrStdout())
+	svc.Interactive = a.commandIsTerminal(cmd)
+	return svc.Summon(cmd.Context(), summon.Options{SpaceID: spaceID, Summoner: summoner, PrintCommand: printCommand})
+}
+
+func (a *app) printPlannedSummon(cmd *cobra.Command, cfg config.Config, spaceID string, summoner string, specPath string) error {
+	spacePath := filepath.Join(cfg.AgentWorkDir, spaceID)
+	plannedSpec := ""
+	if specPath != "" {
+		plannedSpec = "spec"
+	}
+	invocation, err := summon.BuildInvocation(cfg, spacePath, summon.ResolveName(cfg, summoner), summon.Prompt(spacePath, plannedSpec))
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(cmd.OutOrStdout(), "dry-run: summon %s with %s\n", spaceID, invocation.Summoner)
+	fmt.Fprintln(cmd.OutOrStdout(), summon.CommandString(invocation))
+	return nil
 }
 
 func (a *app) loadConfig() (*config.Config, string, error) {
@@ -757,6 +822,13 @@ func (a *app) effectiveSecretStore() agent.SecretStore {
 		return a.secretStore
 	}
 	return agent.DefaultSecretStore()
+}
+
+func (a *app) effectiveSummonLauncher() summon.Launcher {
+	if a.summonLauncher != nil {
+		return a.summonLauncher
+	}
+	return summon.ExecLauncher{}
 }
 
 func (a *app) commandIsTerminal(cmd *cobra.Command) bool {

@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/Nurozen/stave/internal/space"
+	"github.com/Nurozen/stave/internal/summon"
 )
 
 const (
@@ -20,6 +21,7 @@ const (
 	OpSpaceStatus = "space_status"
 	OpReposList   = "repos_list"
 	OpReposSync   = "repos_sync"
+	OpSummon      = "summon"
 )
 
 type ProviderRequest struct {
@@ -57,6 +59,7 @@ type Operation struct {
 	Branch         string    `json:"branch,omitempty"`
 	NoFetch        bool      `json:"no_fetch,omitempty"`
 	ReferencesOnly bool      `json:"references_only,omitempty"`
+	Summoner       string    `json:"summoner,omitempty"`
 	Unsupported    string    `json:"unsupported,omitempty"`
 }
 
@@ -166,6 +169,12 @@ func EquivalentCommand(op Operation) string {
 			return strings.Join([]string{"stave", "repos", "sync", shellQuote(op.Repo)}, " ")
 		}
 		return "stave repos sync"
+	case OpSummon:
+		summoner := op.Summoner
+		if summoner == "" {
+			summoner = summon.Codex
+		}
+		return strings.Join([]string{"stave", "summon", shellQuote(op.SpaceID), "--with", shellQuote(summoner)}, " ")
 	default:
 		if op.Unsupported != "" {
 			return "# unsupported: " + op.Unsupported

@@ -32,6 +32,7 @@ type Config struct {
 	DefaultBase  string                `mapstructure:"defaultBase" yaml:"defaultBase"`
 	Repos        map[string]Repository `mapstructure:"repos" yaml:"repos"`
 	Agent        AgentConfig           `mapstructure:"agent" yaml:"agent,omitempty"`
+	Summon       SummonConfig          `mapstructure:"summon" yaml:"summon,omitempty"`
 }
 
 type Repository struct {
@@ -50,6 +51,11 @@ type AgentConfig struct {
 type AgentProviderConfig struct {
 	Model     string `mapstructure:"model" yaml:"model,omitempty"`
 	APIKeyRef string `mapstructure:"apiKeyRef" yaml:"apiKeyRef,omitempty"`
+}
+
+type SummonConfig struct {
+	Default  string            `mapstructure:"default" yaml:"default,omitempty"`
+	Commands map[string]string `mapstructure:"commands" yaml:"commands,omitempty"`
 }
 
 func DefaultRoot() (string, error) {
@@ -80,6 +86,7 @@ func Default() (*Config, error) {
 		DefaultBase:  DefaultBase,
 		Repos:        map[string]Repository{},
 		Agent:        DefaultAgentConfig(),
+		Summon:       DefaultSummonConfig(),
 	}, nil
 }
 
@@ -105,6 +112,7 @@ func Load(path string) (*Config, string, error) {
 	v.SetDefault("defaultBase", defaults.DefaultBase)
 	v.SetDefault("repos", map[string]Repository{})
 	v.SetDefault("agent", defaults.Agent)
+	v.SetDefault("summon", defaults.Summon)
 
 	if err := v.ReadInConfig(); err != nil && !missingConfig(err) {
 		return nil, path, fmt.Errorf("read config: %w", err)
@@ -167,6 +175,7 @@ func (c *Config) ApplyDefaults() error {
 		c.Repos[name] = repo
 	}
 	c.Agent.ApplyDefaults()
+	c.Summon.ApplyDefaults()
 	return nil
 }
 
@@ -248,6 +257,17 @@ func DefaultAgentConfig() AgentConfig {
 	}
 }
 
+func DefaultSummonConfig() SummonConfig {
+	return SummonConfig{
+		Default: "codex",
+		Commands: map[string]string{
+			"codex":  "codex",
+			"claude": "claude",
+			"cursor": "cursor-agent",
+		},
+	}
+}
+
 func (c *AgentConfig) ApplyDefaults() {
 	defaults := DefaultAgentConfig()
 	if c.DefaultProvider == "" {
@@ -265,6 +285,21 @@ func (c *AgentConfig) ApplyDefaults() {
 			current.APIKeyRef = defaultConfig.APIKeyRef
 		}
 		c.Providers[provider] = current
+	}
+}
+
+func (c *SummonConfig) ApplyDefaults() {
+	defaults := DefaultSummonConfig()
+	if c.Default == "" {
+		c.Default = defaults.Default
+	}
+	if c.Commands == nil {
+		c.Commands = map[string]string{}
+	}
+	for summoner, command := range defaults.Commands {
+		if c.Commands[summoner] == "" {
+			c.Commands[summoner] = command
+		}
 	}
 }
 

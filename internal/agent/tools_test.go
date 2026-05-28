@@ -15,6 +15,7 @@ func TestToolDefinitions(t *testing.T) {
 		ToolSpaceSync,
 		ToolSpaceCreate,
 		ToolSpaceAdd,
+		ToolSummon,
 		ToolExplainUnsupported,
 		ToolFinish,
 	}
@@ -42,6 +43,9 @@ func TestToolDefinitions(t *testing.T) {
 	if seen[ToolSpaceCreate].Category != ToolCategoryMutate {
 		t.Fatalf("space create category = %s", seen[ToolSpaceCreate].Category)
 	}
+	if seen[ToolSummon].Category != ToolCategoryMutate {
+		t.Fatalf("summon category = %s", seen[ToolSummon].Category)
+	}
 }
 
 func TestToolDispatcherQueuesOperationsAndFinishes(t *testing.T) {
@@ -68,6 +72,30 @@ func TestToolDispatcherQueuesOperationsAndFinishes(t *testing.T) {
 		t.Fatalf("session = %#v", dispatcher.Session)
 	}
 	if len(run.Plan.Operations) != 1 || run.Commands[0] != "stave space create ex-2 -e api" {
+		t.Fatalf("run = %#v", run)
+	}
+}
+
+func TestToolDispatcherQueuesSummonAfterCreate(t *testing.T) {
+	cfg := testConfig(t)
+	dispatcher := NewToolDispatcher(cfg, nil, nil)
+
+	result := dispatcher.Dispatch(context.Background(), toolCall(ToolSpaceCreate, map[string]any{
+		"space_id": "ex-2",
+		"edits":    []map[string]any{{"name": "api"}},
+	}))
+	if result.Error {
+		t.Fatalf("space create result = %#v", result)
+	}
+	result = dispatcher.Dispatch(context.Background(), toolCall(ToolSummon, map[string]any{
+		"space_id": "ex-2",
+		"summoner": "codex",
+	}))
+	if result.Error {
+		t.Fatalf("summon result = %#v", result)
+	}
+	run := dispatcher.Session.RunResult()
+	if len(run.Commands) != 2 || run.Commands[1] != "stave summon ex-2 --with codex" {
 		t.Fatalf("run = %#v", run)
 	}
 }

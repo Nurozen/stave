@@ -28,6 +28,7 @@ func TestEquivalentCommands(t *testing.T) {
 		"stave space status ex":                 {Type: OpSpaceStatus, SpaceID: "ex"},
 		"stave repos list":                      {Type: OpReposList},
 		"stave repos sync api":                  {Type: OpReposSync, Repo: "api"},
+		"stave summon ex --with cursor":         {Type: OpSummon, SpaceID: "ex", Summoner: "cursor"},
 	}
 	for want, op := range tests {
 		if got := EquivalentCommand(op); got != want {

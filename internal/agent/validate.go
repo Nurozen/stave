@@ -8,25 +8,33 @@ import (
 
 	"github.com/Nurozen/stave/internal/config"
 	"github.com/Nurozen/stave/internal/space"
+	"github.com/Nurozen/stave/internal/summon"
 )
 
 func ValidatePlan(cfg config.Config, plan Plan) error {
 	if len(plan.Operations) == 0 {
 		return nil
 	}
+	plannedSpaces := map[string]bool{}
 	for i, op := range plan.Operations {
-		if err := validateOperation(cfg, op); err != nil {
+		if err := validateOperation(cfg, op, plannedSpaces); err != nil {
 			return fmt.Errorf("operation %d (%s): %w", i+1, op.Type, err)
+		}
+		if op.Type == OpSpaceCreate {
+			plannedSpaces[op.SpaceID] = true
 		}
 	}
 	return nil
 }
 
-func validateOperation(cfg config.Config, op Operation) error {
+func validateOperation(cfg config.Config, op Operation, plannedSpaces map[string]bool) error {
 	switch op.Type {
 	case OpSpaceCreate:
 		if err := config.ValidateName("space id", op.SpaceID); err != nil {
 			return err
+		}
+		if plannedSpaces[op.SpaceID] {
+			return fmt.Errorf("space %q is already planned for creation", op.SpaceID)
 		}
 		if spaceExists(cfg, op.SpaceID) {
 			return fmt.Errorf("space %q already exists", op.SpaceID)
@@ -89,6 +97,17 @@ func validateOperation(cfg config.Config, op Operation) error {
 	case OpSpaceSync, OpSpaceStatus:
 		if !spaceExists(cfg, op.SpaceID) {
 			return fmt.Errorf("space %q does not exist", op.SpaceID)
+		}
+	case OpSummon:
+		if err := config.ValidateName("space id", op.SpaceID); err != nil {
+			return err
+		}
+		if !spaceExists(cfg, op.SpaceID) && !plannedSpaces[op.SpaceID] {
+			return fmt.Errorf("space %q does not exist", op.SpaceID)
+		}
+		summoner := summon.ResolveName(cfg, op.Summoner)
+		if err := summon.ValidateSummoner(summoner); err != nil {
+			return err
 		}
 	case OpReposList:
 		return nil

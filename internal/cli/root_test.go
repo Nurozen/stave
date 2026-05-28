@@ -13,6 +13,7 @@ import (
 	"github.com/Nurozen/stave/internal/agent"
 	"github.com/Nurozen/stave/internal/config"
 	"github.com/Nurozen/stave/internal/space"
+	"github.com/Nurozen/stave/internal/summon"
 	"github.com/spf13/cobra"
 )
 
@@ -23,6 +24,7 @@ func TestCLIHelpCommands(t *testing.T) {
 		{"space", "--help"},
 		{"space", "create", "--help"},
 		{"agent", "--help"},
+		{"summon", "--help"},
 	} {
 		cmd := NewRootCommand()
 		cmd.SetArgs(args)
@@ -93,6 +95,83 @@ func TestCLICreateDryRunDoesNotCreateSpace(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(home, "stave", "agent-work", "ex-1234")); !os.IsNotExist(err) {
 		t.Fatalf("dry-run created space: %v", err)
+	}
+}
+
+func TestCLICreateDryRunPrintsSummon(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	srcA := createGitRepo(t, "repo-a")
+	runCLI(t, "setup")
+	runCLI(t, "repos", "add", "repo-a", srcA)
+
+	out := runCLI(t, "space", "create", "ex-1234", "-e", "repo-a", "--summon", "codex", "--dry-run")
+	if !strings.Contains(out, "dry-run: summon ex-1234 with codex") || !strings.Contains(out, "codex --cd") {
+		t.Fatalf("dry-run output = %s", out)
+	}
+	if _, err := os.Stat(filepath.Join(home, "stave", "agent-work", "ex-1234")); !os.IsNotExist(err) {
+		t.Fatalf("dry-run created space: %v", err)
+	}
+}
+
+func TestCLISummonPrintCommand(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	runCLI(t, "setup")
+	runCLI(t, "space", "init", "ex-1234")
+
+	out := runCLI(t, "summon", "ex-1234", "--with", "codex", "--print-command")
+	if !strings.Contains(out, filepath.Join(home, "stave", "agent-work", "ex-1234")) || !strings.Contains(out, "codex --cd") {
+		t.Fatalf("summon output = %s", out)
+	}
+}
+
+func TestCLICreateSummonLaunchesAfterCreate(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	runCLI(t, "setup")
+	launcher := &fakeSummonLauncher{}
+	cmd := newRootCommand(&app{summonLauncher: launcher, isTerminal: func(cmd *cobra.Command) bool { return true }})
+	cmd.SetArgs([]string{"space", "create", "ex-1234", "--summon", "claude"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("space create --summon error = %v\n%s", err, out.String())
+	}
+	if !launcher.called || launcher.invocation.Summoner != summon.Claude {
+		t.Fatalf("launcher = %#v", launcher)
+	}
+	if launcher.invocation.Dir != filepath.Join(home, "stave", "agent-work", "ex-1234") {
+		t.Fatalf("launcher dir = %q", launcher.invocation.Dir)
+	}
+	if _, err := os.Stat(filepath.Join(home, "stave", "agent-work", "ex-1234", space.ManifestName)); err != nil {
+		t.Fatalf("space was not created: %v", err)
+	}
+}
+
+func TestCLICreateSummonFailureKeepsSpace(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	runCLI(t, "setup")
+	cfg, path, err := config.Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Summon.Commands["codex"] = filepath.Join(t.TempDir(), "missing-codex")
+	if err := cfg.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	cmd := newRootCommand(&app{isTerminal: func(cmd *cobra.Command) bool { return true }})
+	cmd.SetArgs([]string{"space", "create", "ex-1234", "--summon", "codex"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	if err := cmd.Execute(); err == nil {
+		t.Fatalf("space create --summon unexpectedly succeeded:\n%s", out.String())
+	}
+	if _, err := os.Stat(filepath.Join(home, "stave", "agent-work", "ex-1234", space.ManifestName)); err != nil {
+		t.Fatalf("space was not kept: %v", err)
 	}
 }
 
@@ -263,6 +342,63 @@ func TestCLIAgentJSONDoesNotPromptOnTTY(t *testing.T) {
 	}
 }
 
+func TestCLIAgentJSONIncantSkipsSummonLaunch(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OPENAI_API_KEY", "sk-env")
+	runCLI(t, "setup")
+	launcher := &fakeSummonLauncher{}
+	factory := func(providerName, model, apiKey string) (agent.Provider, error) {
+		return fakeProvider{plan: agent.Plan{Summary: "create and summon", Operations: []agent.Operation{
+			{Type: agent.OpSpaceCreate, SpaceID: "ex-2"},
+			{Type: agent.OpSummon, SpaceID: "ex-2", Summoner: "codex"},
+		}}}, nil
+	}
+	cmd := newRootCommand(&app{providerFactory: factory, summonLauncher: launcher, isTerminal: func(cmd *cobra.Command) bool { return true }})
+	cmd.SetArgs([]string{"agent", "--incant", "--json", "create ex-2 and summon codex"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("agent --incant --json summon error = %v\n%s", err, out.String())
+	}
+	var result agent.RunResult
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatalf("invalid JSON:\n%s\n%v", out.String(), err)
+	}
+	if launcher.called {
+		t.Fatal("summon launcher was called during JSON output")
+	}
+	if len(result.Results) != 2 || !result.Results[0].Executed || result.Results[1].Executed {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestCLIAgentIncantLaunchesSummonOnTTY(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OPENAI_API_KEY", "sk-env")
+	runCLI(t, "setup")
+	launcher := &fakeSummonLauncher{}
+	factory := func(providerName, model, apiKey string) (agent.Provider, error) {
+		return fakeProvider{plan: agent.Plan{Summary: "create and summon", Operations: []agent.Operation{
+			{Type: agent.OpSpaceCreate, SpaceID: "ex-2"},
+			{Type: agent.OpSummon, SpaceID: "ex-2", Summoner: "cursor"},
+		}}}, nil
+	}
+	cmd := newRootCommand(&app{providerFactory: factory, summonLauncher: launcher, isTerminal: func(cmd *cobra.Command) bool { return true }})
+	cmd.SetArgs([]string{"agent", "--incant", "create ex-2 and summon cursor"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("agent --incant summon error = %v\n%s", err, out.String())
+	}
+	if !launcher.called || launcher.invocation.Summoner != summon.Cursor {
+		t.Fatalf("launcher = %#v", launcher)
+	}
+}
+
 func TestCLITicketFlagIsRemoved(t *testing.T) {
 	cmd := NewRootCommand()
 	cmd.SetArgs([]string{"space", "create", "ex-1234", "--ticket", "ticket.md"})
@@ -285,6 +421,17 @@ func (f fakeProvider) Run(ctx context.Context, request agent.ProviderRequest) (a
 type fakeSecretStore struct {
 	available bool
 	values    map[string]string
+}
+
+type fakeSummonLauncher struct {
+	called     bool
+	invocation summon.Invocation
+}
+
+func (f *fakeSummonLauncher) Launch(ctx context.Context, invocation summon.Invocation) error {
+	f.called = true
+	f.invocation = invocation
+	return nil
 }
 
 func (f *fakeSecretStore) Available() bool {
