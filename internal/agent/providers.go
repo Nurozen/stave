@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 
 	anthropic "github.com/anthropics/anthropic-sdk-go"
 	anthropicoption "github.com/anthropics/anthropic-sdk-go/option"
@@ -171,13 +172,113 @@ func (p AnthropicProvider) Run(ctx context.Context, request ProviderRequest) (Ru
 func openAITools(defs []ToolDefinition) []responses.ToolUnionParam {
 	tools := make([]responses.ToolUnionParam, 0, len(defs))
 	for _, def := range defs {
-		tool := responses.ToolParamOfFunction(def.Name, def.Parameters, true)
+		tool := responses.ToolParamOfFunction(def.Name, openAISchema(def.Parameters), true)
 		if tool.OfFunction != nil {
 			tool.OfFunction.Description = openaiparam.NewOpt(def.Description)
 		}
 		tools = append(tools, tool)
 	}
 	return tools
+}
+
+func openAISchema(schema map[string]any) map[string]any {
+	normalized, _ := normalizeOpenAISchema(schema).(map[string]any)
+	return normalized
+}
+
+func normalizeOpenAISchema(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		normalized := make(map[string]any, len(typed)+1)
+		for key, inner := range typed {
+			normalized[key] = normalizeOpenAISchema(inner)
+		}
+		if props, ok := normalized["properties"].(map[string]any); ok {
+			originalRequired := stringSet(typed["required"])
+			required := make([]string, 0, len(props))
+			for name, prop := range props {
+				required = append(required, name)
+				if !originalRequired[name] {
+					props[name] = nullableSchema(prop)
+				}
+			}
+			sort.Strings(required)
+			normalized["required"] = required
+			normalized["additionalProperties"] = false
+		} else if typed["type"] == "object" {
+			normalized["required"] = []string{}
+			normalized["additionalProperties"] = false
+		}
+		return normalized
+	case []any:
+		normalized := make([]any, 0, len(typed))
+		for _, inner := range typed {
+			normalized = append(normalized, normalizeOpenAISchema(inner))
+		}
+		return normalized
+	case []string:
+		normalized := make([]any, 0, len(typed))
+		for _, inner := range typed {
+			normalized = append(normalized, inner)
+		}
+		return normalized
+	default:
+		return typed
+	}
+}
+
+func nullableSchema(value any) any {
+	schema, ok := value.(map[string]any)
+	if !ok {
+		return value
+	}
+	nullable := make(map[string]any, len(schema))
+	for key, inner := range schema {
+		nullable[key] = inner
+	}
+	switch typ := nullable["type"].(type) {
+	case string:
+		if typ != "null" {
+			nullable["type"] = []any{typ, "null"}
+		}
+	case []any:
+		hasNull := false
+		for _, entry := range typ {
+			if entry == "null" {
+				hasNull = true
+				break
+			}
+		}
+		if !hasNull {
+			nullable["type"] = append(append([]any(nil), typ...), "null")
+		}
+	}
+	if enum, ok := nullable["enum"].([]string); ok {
+		expanded := make([]any, 0, len(enum)+1)
+		for _, entry := range enum {
+			expanded = append(expanded, entry)
+		}
+		expanded = append(expanded, nil)
+		nullable["enum"] = expanded
+	}
+	return nullable
+}
+
+func stringSet(value any) map[string]bool {
+	set := map[string]bool{}
+	switch typed := value.(type) {
+	case []string:
+		for _, entry := range typed {
+			set[entry] = true
+		}
+	case []any:
+		for _, entry := range typed {
+			if text, ok := entry.(string); ok {
+				set[text] = true
+			}
+		}
+	}
+	return set
 }
 
 func openAIToolCalls(resp *responses.Response) []ToolCall {
@@ -211,7 +312,11 @@ func anthropicTools(defs []ToolDefinition) []anthropic.ToolUnionParam {
 func anthropicSchema(schema map[string]any) anthropic.ToolInputSchemaParam {
 	properties := schema["properties"]
 	required, _ := schema["required"].([]string)
-	return anthropic.ToolInputSchemaParam{Properties: properties, Required: required}
+	input := anthropic.ToolInputSchemaParam{Properties: properties, Required: required}
+	if additionalProperties, ok := schema["additionalProperties"]; ok {
+		input.ExtraFields = map[string]any{"additionalProperties": additionalProperties}
+	}
+	return input
 }
 
 func anthropicToolCalls(resp *anthropic.Message) []ToolCall {

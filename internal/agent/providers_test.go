@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -47,6 +48,89 @@ func TestOpenAIProviderToolLoop(t *testing.T) {
 	}
 }
 
+func TestOpenAIToolsEncodeRequiredAsArray(t *testing.T) {
+	tools := openAITools(ToolDefinitions())
+	if len(tools) == 0 {
+		t.Fatal("openAITools returned no tools")
+	}
+	data, err := json.Marshal(tools[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var encoded map[string]any
+	if err := json.Unmarshal(data, &encoded); err != nil {
+		t.Fatal(err)
+	}
+	parameters, ok := encoded["parameters"].(map[string]any)
+	if !ok {
+		t.Fatalf("parameters encoded as %T in %s", encoded["parameters"], data)
+	}
+	required, ok := parameters["required"].([]any)
+	if !ok {
+		t.Fatalf("required encoded as %T in %s", parameters["required"], data)
+	}
+	if len(required) != 0 {
+		t.Fatalf("required = %#v, want empty array", required)
+	}
+	if parameters["additionalProperties"] != false {
+		t.Fatalf("additionalProperties = %#v", parameters["additionalProperties"])
+	}
+}
+
+func TestOpenAISchemaStrictCompatibility(t *testing.T) {
+	var repoSync ToolDefinition
+	var spaceCreate ToolDefinition
+	for _, def := range ToolDefinitions() {
+		switch def.Name {
+		case ToolReposSync:
+			repoSync = def
+		case ToolSpaceCreate:
+			spaceCreate = def
+		}
+	}
+
+	repoSchema := openAISchema(repoSync.Parameters)
+	if got := repoSchema["required"]; !reflect.DeepEqual(got, []string{"repo"}) {
+		t.Fatalf("repos sync required = %#v", got)
+	}
+	repoProperty := repoSchema["properties"].(map[string]any)["repo"].(map[string]any)
+	if got := repoProperty["type"]; !reflect.DeepEqual(got, []any{"string", "null"}) {
+		t.Fatalf("repo type = %#v", got)
+	}
+
+	createSchema := openAISchema(spaceCreate.Parameters)
+	if got := createSchema["required"]; !reflect.DeepEqual(got, []string{"edits", "kind", "references", "space_id", "spec_path"}) {
+		t.Fatalf("space create required = %#v", got)
+	}
+	edits := createSchema["properties"].(map[string]any)["edits"].(map[string]any)
+	if got := edits["type"]; !reflect.DeepEqual(got, []any{"array", "null"}) {
+		t.Fatalf("edits type = %#v", got)
+	}
+	item := edits["items"].(map[string]any)
+	if got := item["required"]; !reflect.DeepEqual(got, []string{"name", "ref"}) {
+		t.Fatalf("repo ref required = %#v", got)
+	}
+	ref := item["properties"].(map[string]any)["ref"].(map[string]any)
+	if got := ref["type"]; !reflect.DeepEqual(got, []any{"string", "null"}) {
+		t.Fatalf("repo ref type = %#v", got)
+	}
+}
+
+func TestToolDefinitionsRequiredFieldsAreArrays(t *testing.T) {
+	for _, def := range ToolDefinitions() {
+		required, ok := def.Parameters["required"].([]string)
+		if !ok {
+			t.Fatalf("%s required has type %T", def.Name, def.Parameters["required"])
+		}
+		if required == nil {
+			t.Fatalf("%s required is nil", def.Name)
+		}
+	}
+	if got := ToolDefinitions()[0].Parameters["required"]; !reflect.DeepEqual(got, []string{}) {
+		t.Fatalf("repos list required = %#v", got)
+	}
+}
+
 func TestAnthropicProviderToolLoop(t *testing.T) {
 	cfg := testConfig(t)
 	dispatcher := NewToolDispatcher(cfg, nil, nil)
@@ -57,6 +141,10 @@ func TestAnthropicProviderToolLoop(t *testing.T) {
 			calls++
 			if len(params.Tools) != len(ToolDefinitions()) {
 				t.Fatalf("tools = %d, want %d", len(params.Tools), len(ToolDefinitions()))
+			}
+			disableParallel := params.ToolChoice.GetDisableParallelToolUse()
+			if disableParallel == nil || !*disableParallel {
+				t.Fatalf("disable_parallel_tool_use = %#v, want true", disableParallel)
 			}
 			switch calls {
 			case 1:
@@ -78,6 +166,48 @@ func TestAnthropicProviderToolLoop(t *testing.T) {
 	}
 	if result.Plan.Summary != "create ex-2" || len(result.Plan.Operations) != 1 || len(result.ReadResults) != 1 {
 		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestAnthropicToolsStrictSchemaEncoding(t *testing.T) {
+	tools := anthropicTools(ToolDefinitions())
+	if len(tools) != len(ToolDefinitions()) {
+		t.Fatalf("tools = %d, want %d", len(tools), len(ToolDefinitions()))
+	}
+	for index, tool := range tools {
+		data, err := json.Marshal(tool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var encoded map[string]any
+		if err := json.Unmarshal(data, &encoded); err != nil {
+			t.Fatal(err)
+		}
+		if encoded["name"] != ToolDefinitions()[index].Name {
+			t.Fatalf("tool %d name = %#v in %s", index, encoded["name"], data)
+		}
+		if encoded["description"] == "" {
+			t.Fatalf("tool %d missing description in %s", index, data)
+		}
+		if encoded["strict"] != true {
+			t.Fatalf("tool %d strict = %#v in %s", index, encoded["strict"], data)
+		}
+		inputSchema, ok := encoded["input_schema"].(map[string]any)
+		if !ok {
+			t.Fatalf("tool %d input_schema encoded as %T in %s", index, encoded["input_schema"], data)
+		}
+		if inputSchema["type"] != "object" {
+			t.Fatalf("tool %d input_schema.type = %#v in %s", index, inputSchema["type"], data)
+		}
+		if _, ok := inputSchema["properties"].(map[string]any); !ok {
+			t.Fatalf("tool %d properties encoded as %T in %s", index, inputSchema["properties"], data)
+		}
+		if _, ok := inputSchema["required"].([]any); !ok {
+			t.Fatalf("tool %d required encoded as %T in %s", index, inputSchema["required"], data)
+		}
+		if inputSchema["additionalProperties"] != false {
+			t.Fatalf("tool %d additionalProperties = %#v in %s", index, inputSchema["additionalProperties"], data)
+		}
 	}
 }
 
