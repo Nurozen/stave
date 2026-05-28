@@ -57,7 +57,7 @@ stave repos add web https://github.com/you/web.git
 # Create a space with editable + reference repos in one step
 stave space create ticket-482 \
   --kind ticket \
-  --ticket ~/notes/ticket-482.md \
+  --spec ~/notes/ticket-482.md \
   --edit api \
   --edit web:develop \
   --reference api:main
@@ -85,7 +85,7 @@ A typical space:
 agent-work/ticket-482/
 ├── .stave.yaml          # manifest (repos, modes, branches, refs)
 ├── AGENTS.md            # instructions for agents (generated)
-├── ticket-482.md        # optional ticket/notes (if --ticket was used)
+├── spec/                # optional spec file or tree (if --spec was used)
 ├── api/                 # edit worktree
 ├── web/                 # edit worktree
 └── references/
@@ -129,17 +129,19 @@ Space flags:
 
 | Flag | Commands | Meaning |
 |------|----------|---------|
-| `--kind` | `init`, `create` | Label the space (e.g. `ticket`, `spike`, `audit`) |
-| `--ticket <path>` | `init`, `create` | Copy a notes file into the space |
-| `--edit repo` or `repo:base` | `create` | Editable worktree from base ref (repeatable) |
-| `--reference repo` or `repo:ref` | `create` | Detached reference worktree (repeatable) |
-| `--edit` / `--reference` | `add` | Mode (exactly one required) |
-| `--base` | `add` | Base branch/ref for edits, or ref for references |
+| `--kind`, `-k` | `init`, `create` | Label the space (e.g. `ticket`, `spike`, `audit`) |
+| `--spec`, `-s` | `init`, `create` | Copy a spec file or directory into `spec/` |
+| `--edit`, `-e` | `create` | Editable worktree from base ref (`repo` or `repo:base`; repeatable) |
+| `--reference`, `-r` | `create` | Detached reference worktree (`repo` or `repo:ref`; repeatable) |
+| `--edit`, `-e` / `--reference`, `-r` | `add` | Mode (exactly one required) |
+| `--base`, `-b` | `add` | Base branch/ref for edits, or ref for references |
 | `--branch` | `add` | Branch name for editable repos |
 | `--no-fetch` | `add` | Skip fetching the bare repo before adding |
 | `--references-only` | `sync` | Only sync reference worktrees |
 | `--force` | `archive`, `destroy` | Proceed despite dirty edit worktrees |
 | `--dry-run` | `create`, `add`, `destroy` | Print Git operations without changing state |
+
+When `--spec` points at a file, it is copied under `spec/` with its original basename. When it points at a directory, the directory contents are copied into `spec/`. The manifest records `specPath: spec`.
 
 ## Configuration
 

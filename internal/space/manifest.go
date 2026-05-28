@@ -21,11 +21,11 @@ const (
 )
 
 type Manifest struct {
-	ID         string         `yaml:"id"`
-	Kind       string         `yaml:"kind,omitempty"`
-	CreatedAt  time.Time      `yaml:"createdAt"`
-	TicketPath string         `yaml:"ticketPath,omitempty"`
-	Repos      []RepoManifest `yaml:"repos"`
+	ID        string         `yaml:"id"`
+	Kind      string         `yaml:"kind,omitempty"`
+	CreatedAt time.Time      `yaml:"createdAt"`
+	SpecPath  string         `yaml:"specPath,omitempty"`
+	Repos     []RepoManifest `yaml:"repos"`
 }
 
 type RepoManifest struct {

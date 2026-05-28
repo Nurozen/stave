@@ -36,9 +36,9 @@ type Service struct {
 }
 
 type InitOptions struct {
-	ID         string
-	Kind       string
-	TicketPath string
+	ID       string
+	Kind     string
+	SpecPath string
 }
 
 type RepoSpec struct {
@@ -49,7 +49,7 @@ type RepoSpec struct {
 type CreateOptions struct {
 	ID         string
 	Kind       string
-	TicketPath string
+	SpecPath   string
 	Edits      []RepoSpec
 	References []RepoSpec
 	DryRun     bool
@@ -152,23 +152,23 @@ func (s Service) InitSpace(ctx context.Context, opts InitOptions) error {
 		return err
 	}
 
-	ticketPath := ""
-	if opts.TicketPath != "" {
-		source, err := filepath.Abs(opts.TicketPath)
+	specPath := ""
+	if opts.SpecPath != "" {
+		source, err := filepath.Abs(opts.SpecPath)
 		if err != nil {
 			return err
 		}
-		ticketPath = filepath.Base(source)
-		if err := copyFile(source, filepath.Join(spacePath, ticketPath)); err != nil {
+		if err := copySpec(source, filepath.Join(spacePath, "spec")); err != nil {
 			return err
 		}
+		specPath = "spec"
 	}
 	manifest := Manifest{
-		ID:         opts.ID,
-		Kind:       opts.Kind,
-		CreatedAt:  s.now(),
-		TicketPath: ticketPath,
-		Repos:      []RepoManifest{},
+		ID:        opts.ID,
+		Kind:      opts.Kind,
+		CreatedAt: s.now(),
+		SpecPath:  specPath,
+		Repos:     []RepoManifest{},
 	}
 	if err := SaveManifest(spacePath, manifest); err != nil {
 		return err
@@ -184,7 +184,7 @@ func (s Service) Create(ctx context.Context, opts CreateOptions) error {
 	if opts.DryRun {
 		return s.createDryRun(opts)
 	}
-	if err := s.InitSpace(ctx, InitOptions{ID: opts.ID, Kind: opts.Kind, TicketPath: opts.TicketPath}); err != nil {
+	if err := s.InitSpace(ctx, InitOptions{ID: opts.ID, Kind: opts.Kind, SpecPath: opts.SpecPath}); err != nil {
 		return err
 	}
 	for _, spec := range opts.Edits {
@@ -208,8 +208,15 @@ func (s Service) createDryRun(opts CreateOptions) error {
 	s.printf("dry-run: create space directory %s\n", spacePath)
 	s.printf("dry-run: write %s\n", filepath.Join(spacePath, ManifestName))
 	s.printf("dry-run: write %s\n", filepath.Join(spacePath, AgentsName))
-	if opts.TicketPath != "" {
-		s.printf("dry-run: copy ticket file %s into %s\n", opts.TicketPath, spacePath)
+	if opts.SpecPath != "" {
+		source, err := filepath.Abs(opts.SpecPath)
+		if err != nil {
+			return err
+		}
+		if _, err := os.Stat(source); err != nil {
+			return err
+		}
+		s.printf("dry-run: copy spec %s into %s\n", source, filepath.Join(spacePath, "spec"))
 	}
 	for _, spec := range opts.Edits {
 		repoCfg, ok := s.Config.Repos[spec.Name]
@@ -534,9 +541,46 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+func copySpec(src, destDir string) error {
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	if err := os.RemoveAll(destDir); err != nil {
+		return err
+	}
+	if info.IsDir() {
+		return copyDirContents(src, destDir)
+	}
+	return copyFile(src, filepath.Join(destDir, filepath.Base(src)))
+}
+
+func copyDirContents(srcDir, destDir string) error {
+	return filepath.WalkDir(srcDir, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(srcDir, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return os.MkdirAll(destDir, 0o755)
+		}
+		dest := filepath.Join(destDir, rel)
+		if entry.IsDir() {
+			return os.MkdirAll(dest, 0o755)
+		}
+		return copyFile(path, dest)
+	})
+}
+
 func copyFile(src, dest string) error {
 	data, err := os.ReadFile(src)
 	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		return err
 	}
 	return os.WriteFile(dest, data, 0o644)

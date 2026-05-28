@@ -37,11 +37,15 @@ func TestCLISetupReposAddAndCreate(t *testing.T) {
 	t.Setenv("HOME", home)
 	srcA := createGitRepo(t, "repo-a")
 	srcB := createGitRepo(t, "repo-b")
+	spec := filepath.Join(t.TempDir(), "ticket.md")
+	if err := os.WriteFile(spec, []byte("ticket"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	runCLI(t, "setup")
 	runCLI(t, "repos", "add", "repo-a", srcA)
 	runCLI(t, "repos", "add", "repo-b", srcB)
-	runCLI(t, "space", "create", "ex-1234", "--kind", "ticket", "--edit", "repo-a", "--reference", "repo-b")
+	runCLI(t, "space", "create", "ex-1234", "-k", "ticket", "-s", spec, "-e", "repo-a", "-r", "repo-b")
 
 	root := filepath.Join(home, "stave")
 	spacePath := filepath.Join(root, "agent-work", "ex-1234")
@@ -61,8 +65,11 @@ func TestCLISetupReposAddAndCreate(t *testing.T) {
 	if manifest.ID != "ex-1234" || len(manifest.Repos) != 2 {
 		t.Fatalf("manifest = %#v", manifest)
 	}
+	if manifest.SpecPath != "spec" {
+		t.Fatalf("SpecPath = %q", manifest.SpecPath)
+	}
 	status := runCLI(t, "space", "status", "ex-1234")
-	if !strings.Contains(status, "repo-a [edit]") || !strings.Contains(status, "repo-b [reference]") {
+	if !strings.Contains(status, "spec:") || !strings.Contains(status, "repo-a [edit]") || !strings.Contains(status, "repo-b [reference]") {
 		t.Fatalf("status output missing repos:\n%s", status)
 	}
 }
@@ -74,12 +81,23 @@ func TestCLICreateDryRunDoesNotCreateSpace(t *testing.T) {
 	runCLI(t, "setup")
 	runCLI(t, "repos", "add", "repo-a", srcA)
 
-	out := runCLI(t, "space", "create", "ex-1234", "--edit", "repo-a", "--dry-run")
+	out := runCLI(t, "space", "create", "ex-1234", "-e", "repo-a", "--dry-run")
 	if !strings.Contains(out, "dry-run: create space directory") {
 		t.Fatalf("dry-run output = %s", out)
 	}
 	if _, err := os.Stat(filepath.Join(home, "stave", "agent-work", "ex-1234")); !os.IsNotExist(err) {
 		t.Fatalf("dry-run created space: %v", err)
+	}
+}
+
+func TestCLITicketFlagIsRemoved(t *testing.T) {
+	cmd := NewRootCommand()
+	cmd.SetArgs([]string{"space", "create", "ex-1234", "--ticket", "ticket.md"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	if err := cmd.Execute(); err == nil {
+		t.Fatalf("--ticket unexpectedly succeeded:\n%s", out.String())
 	}
 }
 

@@ -228,7 +228,7 @@ func (a *app) spaceCommand() *cobra.Command {
 
 func (a *app) initCommand() *cobra.Command {
 	var kind string
-	var ticket string
+	var spec string
 	cmd := &cobra.Command{
 		Use:   "init <space-id>",
 		Short: "Create an empty agent workspace",
@@ -238,17 +238,17 @@ func (a *app) initCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return svc.InitSpace(cmd.Context(), space.InitOptions{ID: args[0], Kind: kind, TicketPath: ticket})
+			return svc.InitSpace(cmd.Context(), space.InitOptions{ID: args[0], Kind: kind, SpecPath: spec})
 		},
 	}
-	cmd.Flags().StringVar(&kind, "kind", "", "space kind, such as ticket, spike, or audit")
-	cmd.Flags().StringVar(&ticket, "ticket", "", "path to a ticket or notes file to copy into the space")
+	cmd.Flags().StringVarP(&kind, "kind", "k", "", "space kind, such as ticket, spike, or audit")
+	cmd.Flags().StringVarP(&spec, "spec", "s", "", "path to a spec file or directory to copy into the space")
 	return cmd
 }
 
 func (a *app) createCommand() *cobra.Command {
 	var kind string
-	var ticket string
+	var spec string
 	var edits []string
 	var references []string
 	var dryRun bool
@@ -269,13 +269,13 @@ func (a *app) createCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return svc.Create(cmd.Context(), space.CreateOptions{ID: args[0], Kind: kind, TicketPath: ticket, Edits: editSpecs, References: refSpecs, DryRun: dryRun})
+			return svc.Create(cmd.Context(), space.CreateOptions{ID: args[0], Kind: kind, SpecPath: spec, Edits: editSpecs, References: refSpecs, DryRun: dryRun})
 		},
 	}
-	cmd.Flags().StringVar(&kind, "kind", "", "space kind, such as ticket, spike, or audit")
-	cmd.Flags().StringVar(&ticket, "ticket", "", "path to a ticket or notes file to copy into the space")
-	cmd.Flags().StringArrayVar(&edits, "edit", nil, "editable repo spec, optionally repo:base")
-	cmd.Flags().StringArrayVar(&references, "reference", nil, "reference repo spec, optionally repo:ref")
+	cmd.Flags().StringVarP(&kind, "kind", "k", "", "space kind, such as ticket, spike, or audit")
+	cmd.Flags().StringVarP(&spec, "spec", "s", "", "path to a spec file or directory to copy into the space")
+	cmd.Flags().StringArrayVarP(&edits, "edit", "e", nil, "editable repo spec, optionally repo:base")
+	cmd.Flags().StringArrayVarP(&references, "reference", "r", nil, "reference repo spec, optionally repo:ref")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print operations without changing state")
 	return cmd
 }
@@ -317,9 +317,9 @@ func (a *app) addCommand() *cobra.Command {
 			})
 		},
 	}
-	cmd.Flags().BoolVar(&edit, "edit", false, "add as an editable top-level worktree")
-	cmd.Flags().BoolVar(&reference, "reference", false, "add as a detached reference worktree under references/")
-	cmd.Flags().StringVar(&base, "base", "", "base branch/ref for edit repos, or ref for reference repos")
+	cmd.Flags().BoolVarP(&edit, "edit", "e", false, "add as an editable top-level worktree")
+	cmd.Flags().BoolVarP(&reference, "reference", "r", false, "add as a detached reference worktree under references/")
+	cmd.Flags().StringVarP(&base, "base", "b", "", "base branch/ref for edit repos, or ref for reference repos")
 	cmd.Flags().StringVar(&branch, "branch", "", "branch name for editable repos")
 	cmd.Flags().BoolVar(&noFetch, "no-fetch", false, "skip fetching the bare repo before adding the worktree")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print operations without changing state")
@@ -440,8 +440,8 @@ func parseRepoSpecs(values []string) ([]space.RepoSpec, error) {
 
 func printStatus(out interface{ Write([]byte) (int, error) }, spacePath string, status space.Status) {
 	fmt.Fprintf(out, "space %s (%s)\npath: %s\n", status.Manifest.ID, status.Manifest.Kind, spacePath)
-	if status.Manifest.TicketPath != "" {
-		fmt.Fprintf(out, "ticket: %s\n", filepath.Join(spacePath, status.Manifest.TicketPath))
+	if status.Manifest.SpecPath != "" {
+		fmt.Fprintf(out, "spec: %s\n", filepath.Join(spacePath, status.Manifest.SpecPath))
 	}
 	for _, repo := range status.Repos {
 		state := "clean"

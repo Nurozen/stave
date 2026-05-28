@@ -120,15 +120,15 @@ func TestParseRepoSpec(t *testing.T) {
 
 func TestCreateAddsEditAndReference(t *testing.T) {
 	svc, fg, cfg := testService(t)
-	ticket := filepath.Join(t.TempDir(), "ticket.md")
-	if err := os.WriteFile(ticket, []byte("ticket"), 0o644); err != nil {
+	spec := filepath.Join(t.TempDir(), "ticket.md")
+	if err := os.WriteFile(spec, []byte("ticket"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	err := svc.Create(context.Background(), CreateOptions{
 		ID:         "ex-1234",
 		Kind:       "ticket",
-		TicketPath: ticket,
+		SpecPath:   spec,
 		Edits:      []RepoSpec{{Name: "repo-a"}},
 		References: []RepoSpec{{Name: "repo-b", Ref: "release"}},
 	})
@@ -141,8 +141,11 @@ func TestCreateAddsEditAndReference(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if manifest.TicketPath != "ticket.md" || len(manifest.Repos) != 2 {
+	if manifest.SpecPath != "spec" || len(manifest.Repos) != 2 {
 		t.Fatalf("manifest = %#v", manifest)
+	}
+	if _, err := os.Stat(filepath.Join(spacePath, "spec", "ticket.md")); err != nil {
+		t.Fatalf("spec file missing: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(spacePath, "repo-a")); err != nil {
 		t.Fatalf("edit worktree missing: %v", err)
@@ -160,6 +163,37 @@ func TestCreateAddsEditAndReference(t *testing.T) {
 	want := "add-branch|" + filepath.Join(cfg.BareReposDir, "repo-a.git") + "|" + filepath.Join(spacePath, "repo-a") + "|stave/ex-1234/repo-a|origin/main"
 	if !containsCall(fg.calls, want) {
 		t.Fatalf("missing call %q in %#v", want, fg.calls)
+	}
+}
+
+func TestInitCopiesSpecDirectory(t *testing.T) {
+	svc, _, cfg := testService(t)
+	specDir := filepath.Join(t.TempDir(), "spec-source")
+	if err := os.MkdirAll(filepath.Join(specDir, "details"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(specDir, "overview.md"), []byte("overview"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(specDir, "details", "plan.md"), []byte("plan"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := svc.InitSpace(context.Background(), InitOptions{ID: "audit-1", Kind: "audit", SpecPath: specDir}); err != nil {
+		t.Fatalf("InitSpace() error = %v", err)
+	}
+	spacePath := filepath.Join(cfg.AgentWorkDir, "audit-1")
+	for _, rel := range []string{"spec/overview.md", "spec/details/plan.md"} {
+		if _, err := os.Stat(filepath.Join(spacePath, rel)); err != nil {
+			t.Fatalf("missing copied spec path %s: %v", rel, err)
+		}
+	}
+	manifest, err := LoadManifest(spacePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.SpecPath != "spec" {
+		t.Fatalf("SpecPath = %q", manifest.SpecPath)
 	}
 }
 
