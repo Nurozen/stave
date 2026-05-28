@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/Nurozen/stave/internal/space"
@@ -26,6 +27,7 @@ type ProviderRequest struct {
 	Context    Context
 	Dispatcher *ToolDispatcher
 	MaxTurns   int
+	Trace      io.Writer
 }
 
 type Provider interface {

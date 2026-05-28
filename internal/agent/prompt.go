@@ -22,6 +22,8 @@ Rules:
 - Do not invent file paths unless the user gave one.
 - Read-only tools execute immediately during planning.
 - Tools that propose mutations only queue operations; Stave validates them and asks for confirmation before executing.
+- Do not repeat the same read-only tool call unless the prior result had an error and the new call changes the arguments.
+- Once the needed read results have been gathered and the requested mutations have been queued, call stave_finish immediately.
 - Always call stave_finish exactly once when planning is complete.`
 	user = fmt.Sprintf("Stave context:\n%s\n\nUser request:\n%s", contextJSON, request.Query)
 	return system, user, nil

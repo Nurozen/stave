@@ -255,7 +255,11 @@ func (a *app) agentCommand() *cobra.Command {
 				return err
 			}
 			dispatcher := agent.NewToolDispatcher(*cfg, git.New(), cmd.OutOrStdout())
-			result, err := provider.Run(cmd.Context(), agent.ProviderRequest{Query: query, Context: agentContext, Dispatcher: dispatcher})
+			trace := io.Writer(nil)
+			if !jsonOut {
+				trace = cmd.ErrOrStderr()
+			}
+			result, err := provider.Run(cmd.Context(), agent.ProviderRequest{Query: query, Context: agentContext, Dispatcher: dispatcher, Trace: trace})
 			if err != nil {
 				return err
 			}

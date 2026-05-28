@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"sort"
+	"strings"
 
 	anthropic "github.com/anthropics/anthropic-sdk-go"
 	anthropicoption "github.com/anthropics/anthropic-sdk-go/option"
@@ -59,43 +61,51 @@ func (p OpenAIProvider) Run(ctx context.Context, request ProviderRequest) (RunRe
 		return RunResult{}, fmt.Errorf("OpenAI provider is not configured")
 	}
 	maxTurns := maxToolTurns(request.MaxTurns)
-	input := responses.ResponseNewParamsInputUnion{OfString: openaiparam.NewOpt(user)}
-	previousResponseID := ""
+	history := responses.ResponseInputParam{
+		responses.ResponseInputItemParamOfMessage(user, responses.EasyInputMessageRoleUser),
+	}
+	seenTools := map[string]int{}
 	for turn := 0; turn < maxTurns; turn++ {
+		tracef(request.Trace, "agent: thinking with openai (turn %d/%d)\n", turn+1, maxTurns)
 		params := responses.ResponseNewParams{
 			Model:             shared.ResponsesModel(p.Model),
 			Instructions:      openaiparam.NewOpt(system),
-			Input:             input,
+			Input:             responses.ResponseNewParamsInputUnion{OfInputItemList: history},
 			Tools:             openAITools(ToolDefinitions()),
 			ToolChoice:        responses.ResponseNewParamsToolChoiceUnion{OfToolChoiceMode: openaiparam.NewOpt(responses.ToolChoiceOptionsAuto)},
 			ParallelToolCalls: openaiparam.NewOpt(false),
 			MaxOutputTokens:   openaiparam.NewOpt[int64](4096),
 			Store:             openaiparam.NewOpt(false),
 		}
-		if previousResponseID != "" {
-			params.PreviousResponseID = openaiparam.NewOpt(previousResponseID)
-		}
 		resp, err := createResponse(ctx, params)
 		if err != nil {
 			return RunResult{}, err
 		}
-		previousResponseID = resp.ID
 		calls := openAIToolCalls(resp)
 		if len(calls) == 0 {
 			if request.Dispatcher.Session.Finished {
 				return request.Dispatcher.Session.RunResult(), nil
 			}
+			if finishFromText(request.Dispatcher.Session, strings.TrimSpace(resp.OutputText())) {
+				tracef(request.Trace, "agent: finished planning from model text\n")
+				return request.Dispatcher.Session.RunResult(), nil
+			}
 			return RunResult{}, fmt.Errorf("OpenAI response did not call a Stave tool")
 		}
-		outputs := make(responses.ResponseInputParam, 0, len(calls))
 		for _, call := range calls {
+			if err := checkRepeatedToolCall(seenTools, call); err != nil {
+				return RunResult{}, err
+			}
+			traceToolCall(request.Trace, call)
+			history = append(history, responses.ResponseInputItemParamOfFunctionCall(string(call.Arguments), call.ID, call.Name))
 			result := request.Dispatcher.Dispatch(ctx, call)
-			outputs = append(outputs, responses.ResponseInputItemParamOfFunctionCallOutput(call.ID, result.OutputString()))
+			traceToolResult(request.Trace, result)
+			history = append(history, responses.ResponseInputItemParamOfFunctionCallOutput(call.ID, result.OutputString()))
 		}
 		if request.Dispatcher.Session.Finished {
+			tracef(request.Trace, "agent: finished planning\n")
 			return request.Dispatcher.Session.RunResult(), nil
 		}
-		input = responses.ResponseNewParamsInputUnion{OfInputItemList: outputs}
 	}
 	return RunResult{}, fmt.Errorf("agent exceeded %d tool turns", maxTurns)
 }
@@ -133,7 +143,9 @@ func (p AnthropicProvider) Run(ctx context.Context, request ProviderRequest) (Ru
 	messages := []anthropic.MessageParam{
 		anthropic.NewUserMessage(anthropic.NewTextBlock(user)),
 	}
+	seenTools := map[string]int{}
 	for turn := 0; turn < maxTurns; turn++ {
+		tracef(request.Trace, "agent: thinking with anthropic (turn %d/%d)\n", turn+1, maxTurns)
 		resp, err := createMessage(ctx, anthropic.MessageNewParams{
 			Model:     anthropic.Model(p.Model),
 			MaxTokens: 4096,
@@ -152,14 +164,24 @@ func (p AnthropicProvider) Run(ctx context.Context, request ProviderRequest) (Ru
 			if request.Dispatcher.Session.Finished {
 				return request.Dispatcher.Session.RunResult(), nil
 			}
+			if finishFromText(request.Dispatcher.Session, strings.TrimSpace(anthropicText(resp))) {
+				tracef(request.Trace, "agent: finished planning from model text\n")
+				return request.Dispatcher.Session.RunResult(), nil
+			}
 			return RunResult{}, fmt.Errorf("anthropic response did not call a Stave tool")
 		}
 		resultBlocks := make([]anthropic.ContentBlockParamUnion, 0, len(calls))
 		for _, call := range calls {
+			if err := checkRepeatedToolCall(seenTools, call); err != nil {
+				return RunResult{}, err
+			}
+			traceToolCall(request.Trace, call)
 			result := request.Dispatcher.Dispatch(ctx, call)
+			traceToolResult(request.Trace, result)
 			resultBlocks = append(resultBlocks, anthropic.NewToolResultBlock(call.ID, result.OutputString(), result.Error))
 		}
 		if request.Dispatcher.Session.Finished {
+			tracef(request.Trace, "agent: finished planning\n")
 			return request.Dispatcher.Session.RunResult(), nil
 		}
 		messages = append(messages, resp.ToParam(), anthropic.NewUserMessage(resultBlocks...))
@@ -331,9 +353,79 @@ func anthropicToolCalls(resp *anthropic.Message) []ToolCall {
 	return calls
 }
 
+func anthropicText(resp *anthropic.Message) string {
+	if resp == nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, block := range resp.Content {
+		if block.Type == "text" {
+			b.WriteString(block.Text)
+		}
+	}
+	return b.String()
+}
+
 func maxToolTurns(value int) int {
 	if value > 0 {
 		return value
 	}
 	return defaultMaxToolTurns
+}
+
+func finishFromText(session *ToolSession, text string) bool {
+	if session == nil || text == "" {
+		return false
+	}
+	session.Plan.Summary = text
+	session.Finished = true
+	return true
+}
+
+func checkRepeatedToolCall(seen map[string]int, call ToolCall) error {
+	key := call.Name + "\x00" + string(call.Arguments)
+	seen[key]++
+	if seen[key] > 3 {
+		return fmt.Errorf("agent repeated tool call %s with the same arguments %d times; stopping to avoid an infinite planning loop", call.Name, seen[key])
+	}
+	return nil
+}
+
+func traceToolCall(out io.Writer, call ToolCall) {
+	if out == nil {
+		return
+	}
+	args := strings.TrimSpace(string(call.Arguments))
+	if args == "" {
+		args = "{}"
+	}
+	tracef(out, "agent: tool %s %s\n", call.Name, truncateTrace(args, 240))
+}
+
+func traceToolResult(out io.Writer, result ToolResult) {
+	if out == nil {
+		return
+	}
+	status := "ok"
+	if result.Error {
+		status = "error"
+	}
+	tracef(out, "agent: tool result %s %s: %s\n", result.Name, status, truncateTrace(result.Summary, 240))
+}
+
+func tracef(out io.Writer, format string, args ...any) {
+	if out != nil {
+		_, _ = fmt.Fprintf(out, format, args...)
+	}
+}
+
+func truncateTrace(value string, limit int) string {
+	value = strings.Join(strings.Fields(value), " ")
+	if len(value) <= limit {
+		return value
+	}
+	if limit <= 3 {
+		return value[:limit]
+	}
+	return value[:limit-3] + "..."
 }

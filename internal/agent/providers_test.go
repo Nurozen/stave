@@ -14,6 +14,7 @@ import (
 func TestOpenAIProviderToolLoop(t *testing.T) {
 	cfg := testConfig(t)
 	dispatcher := NewToolDispatcher(cfg, nil, nil)
+	var trace strings.Builder
 	var calls int
 	provider := OpenAIProvider{
 		Model: "test-model",
@@ -24,6 +25,18 @@ func TestOpenAIProviderToolLoop(t *testing.T) {
 			}
 			if params.Temperature.Valid() {
 				t.Fatalf("temperature should be omitted for OpenAI Responses requests")
+			}
+			if params.PreviousResponseID.Valid() {
+				t.Fatalf("previous_response_id should be omitted for stateless OpenAI tool loops")
+			}
+			if calls > 1 {
+				data, err := json.Marshal(params)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !strings.Contains(string(data), "function_call_output") {
+					t.Fatalf("follow-up request missing function_call_output in %s", data)
+				}
 			}
 			switch calls {
 			case 1:
@@ -39,7 +52,7 @@ func TestOpenAIProviderToolLoop(t *testing.T) {
 		},
 	}
 
-	result, err := provider.Run(context.Background(), ProviderRequest{Query: "create ex-2", Context: Context{}, Dispatcher: dispatcher})
+	result, err := provider.Run(context.Background(), ProviderRequest{Query: "create ex-2", Context: Context{}, Dispatcher: dispatcher, Trace: &trace})
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
@@ -48,6 +61,9 @@ func TestOpenAIProviderToolLoop(t *testing.T) {
 	}
 	if calls != 3 {
 		t.Fatalf("calls = %d", calls)
+	}
+	if got := trace.String(); !strings.Contains(got, "agent: thinking with openai") || !strings.Contains(got, "agent: tool stave_repos_list") {
+		t.Fatalf("trace missing provider/tool details:\n%s", got)
 	}
 }
 
@@ -137,6 +153,7 @@ func TestToolDefinitionsRequiredFieldsAreArrays(t *testing.T) {
 func TestAnthropicProviderToolLoop(t *testing.T) {
 	cfg := testConfig(t)
 	dispatcher := NewToolDispatcher(cfg, nil, nil)
+	var trace strings.Builder
 	var calls int
 	provider := AnthropicProvider{
 		Model: "test-model",
@@ -166,12 +183,15 @@ func TestAnthropicProviderToolLoop(t *testing.T) {
 		},
 	}
 
-	result, err := provider.Run(context.Background(), ProviderRequest{Query: "create ex-2", Context: Context{}, Dispatcher: dispatcher})
+	result, err := provider.Run(context.Background(), ProviderRequest{Query: "create ex-2", Context: Context{}, Dispatcher: dispatcher, Trace: &trace})
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
 	if result.Plan.Summary != "create ex-2" || len(result.Plan.Operations) != 1 || len(result.ReadResults) != 1 {
 		t.Fatalf("result = %#v", result)
+	}
+	if got := trace.String(); !strings.Contains(got, "agent: thinking with anthropic") || !strings.Contains(got, "agent: tool stave_repos_list") {
+		t.Fatalf("trace missing provider/tool details:\n%s", got)
 	}
 }
 
