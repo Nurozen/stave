@@ -13,11 +13,14 @@ import (
 )
 
 const (
-	AppName           = "stave"
-	DefaultBase       = "main"
-	ConfigFileName    = "config.yaml"
-	DefaultConfigMode = 0o600
-	DefaultDirMode    = 0o755
+	AppName                    = "stave"
+	DefaultBase                = "main"
+	DefaultAgentModelOpenAI    = "gpt-5.5"
+	DefaultAgentModelAnthropic = "claude-opus-4-7"
+	DefaultAgentProvider       = "openai"
+	ConfigFileName             = "config.yaml"
+	DefaultConfigMode          = 0o600
+	DefaultDirMode             = 0o755
 )
 
 var safeNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
@@ -28,6 +31,7 @@ type Config struct {
 	AgentWorkDir string                `mapstructure:"agentWorkDir" yaml:"agentWorkDir"`
 	DefaultBase  string                `mapstructure:"defaultBase" yaml:"defaultBase"`
 	Repos        map[string]Repository `mapstructure:"repos" yaml:"repos"`
+	Agent        AgentConfig           `mapstructure:"agent" yaml:"agent,omitempty"`
 }
 
 type Repository struct {
@@ -35,6 +39,17 @@ type Repository struct {
 	URL           string `mapstructure:"url" yaml:"url"`
 	BareRepoPath  string `mapstructure:"bareRepoPath" yaml:"bareRepoPath"`
 	DefaultBranch string `mapstructure:"defaultBranch,omitempty" yaml:"defaultBranch,omitempty"`
+}
+
+type AgentConfig struct {
+	DefaultProvider string                         `mapstructure:"defaultProvider" yaml:"defaultProvider,omitempty"`
+	AutoIncant      bool                           `mapstructure:"autoIncant" yaml:"autoIncant,omitempty"`
+	Providers       map[string]AgentProviderConfig `mapstructure:"providers" yaml:"providers,omitempty"`
+}
+
+type AgentProviderConfig struct {
+	Model     string `mapstructure:"model" yaml:"model,omitempty"`
+	APIKeyRef string `mapstructure:"apiKeyRef" yaml:"apiKeyRef,omitempty"`
 }
 
 func DefaultRoot() (string, error) {
@@ -64,6 +79,7 @@ func Default() (*Config, error) {
 		AgentWorkDir: filepath.Join(root, "agent-work"),
 		DefaultBase:  DefaultBase,
 		Repos:        map[string]Repository{},
+		Agent:        DefaultAgentConfig(),
 	}, nil
 }
 
@@ -88,6 +104,7 @@ func Load(path string) (*Config, string, error) {
 	v.SetDefault("agentWorkDir", defaults.AgentWorkDir)
 	v.SetDefault("defaultBase", defaults.DefaultBase)
 	v.SetDefault("repos", map[string]Repository{})
+	v.SetDefault("agent", defaults.Agent)
 
 	if err := v.ReadInConfig(); err != nil && !missingConfig(err) {
 		return nil, path, fmt.Errorf("read config: %w", err)
@@ -149,6 +166,7 @@ func (c *Config) ApplyDefaults() error {
 		}
 		c.Repos[name] = repo
 	}
+	c.Agent.ApplyDefaults()
 	return nil
 }
 
@@ -212,6 +230,42 @@ func (c *Config) RegisterRepository(name, url, defaultBranch string) (Repository
 
 func (c *Config) UnregisterRepository(name string) {
 	delete(c.Repos, name)
+}
+
+func DefaultAgentConfig() AgentConfig {
+	return AgentConfig{
+		DefaultProvider: DefaultAgentProvider,
+		Providers: map[string]AgentProviderConfig{
+			"openai": {
+				Model:     DefaultAgentModelOpenAI,
+				APIKeyRef: "env:OPENAI_API_KEY",
+			},
+			"anthropic": {
+				Model:     DefaultAgentModelAnthropic,
+				APIKeyRef: "env:ANTHROPIC_API_KEY",
+			},
+		},
+	}
+}
+
+func (c *AgentConfig) ApplyDefaults() {
+	defaults := DefaultAgentConfig()
+	if c.DefaultProvider == "" {
+		c.DefaultProvider = defaults.DefaultProvider
+	}
+	if c.Providers == nil {
+		c.Providers = map[string]AgentProviderConfig{}
+	}
+	for provider, defaultConfig := range defaults.Providers {
+		current := c.Providers[provider]
+		if current.Model == "" {
+			current.Model = defaultConfig.Model
+		}
+		if current.APIKeyRef == "" {
+			current.APIKeyRef = defaultConfig.APIKeyRef
+		}
+		c.Providers[provider] = current
+	}
 }
 
 func ExpandPath(path string) (string, error) {

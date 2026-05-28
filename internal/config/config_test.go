@@ -30,6 +30,15 @@ func TestLoadMissingConfigUsesDefaults(t *testing.T) {
 	if cfg.DefaultBase != "main" {
 		t.Fatalf("DefaultBase = %q", cfg.DefaultBase)
 	}
+	if cfg.Agent.DefaultProvider != DefaultAgentProvider {
+		t.Fatalf("Agent.DefaultProvider = %q", cfg.Agent.DefaultProvider)
+	}
+	if cfg.Agent.AutoIncant {
+		t.Fatal("Agent.AutoIncant defaulted to true")
+	}
+	if cfg.Agent.Providers["openai"].Model != DefaultAgentModelOpenAI {
+		t.Fatalf("openai model = %q", cfg.Agent.Providers["openai"].Model)
+	}
 }
 
 func TestSaveAndLoadRoundTrip(t *testing.T) {
@@ -43,6 +52,12 @@ func TestSaveAndLoadRoundTrip(t *testing.T) {
 	}
 	if _, err := cfg.RegisterRepository("api", "https://example.test/api.git", "main"); err != nil {
 		t.Fatalf("RegisterRepository() error = %v", err)
+	}
+	cfg.Agent.DefaultProvider = "anthropic"
+	cfg.Agent.AutoIncant = true
+	cfg.Agent.Providers["anthropic"] = AgentProviderConfig{
+		Model:     "claude-opus-4-7",
+		APIKeyRef: "keychain:stave/agent/anthropic",
 	}
 	if err := cfg.Save(path); err != nil {
 		t.Fatalf("Save() error = %v", err)
@@ -65,6 +80,15 @@ func TestSaveAndLoadRoundTrip(t *testing.T) {
 	}
 	if repo.BareRepoPath != filepath.Join(home, "stave", "bare-repos", "api.git") {
 		t.Fatalf("BareRepoPath = %q", repo.BareRepoPath)
+	}
+	if loaded.Agent.DefaultProvider != "anthropic" {
+		t.Fatalf("agent provider = %q", loaded.Agent.DefaultProvider)
+	}
+	if !loaded.Agent.AutoIncant {
+		t.Fatal("agent autoIncant did not round-trip")
+	}
+	if loaded.Agent.Providers["anthropic"].APIKeyRef != "keychain:stave/agent/anthropic" {
+		t.Fatalf("agent anthropic config = %#v", loaded.Agent.Providers["anthropic"])
 	}
 }
 

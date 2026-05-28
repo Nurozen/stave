@@ -2,13 +2,18 @@ package cli
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/Nurozen/stave/internal/agent"
+	"github.com/Nurozen/stave/internal/config"
 	"github.com/Nurozen/stave/internal/space"
+	"github.com/spf13/cobra"
 )
 
 func TestCLIHelpCommands(t *testing.T) {
@@ -17,6 +22,7 @@ func TestCLIHelpCommands(t *testing.T) {
 		{"repos", "--help"},
 		{"space", "--help"},
 		{"space", "create", "--help"},
+		{"agent", "--help"},
 	} {
 		cmd := NewRootCommand()
 		cmd.SetArgs(args)
@@ -90,6 +96,173 @@ func TestCLICreateDryRunDoesNotCreateSpace(t *testing.T) {
 	}
 }
 
+func TestCLIAgentConfigureWithFakeSecretStore(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := &fakeSecretStore{available: true}
+	cmd := newRootCommand(&app{secretStore: store})
+	cmd.SetArgs([]string{"agent", "configure"})
+	cmd.SetIn(strings.NewReader("openai\ngpt-test\nsk-test\n"))
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("agent configure error = %v\n%s", err, out.String())
+	}
+	if store.values["keychain:stave/agent/openai"] != "sk-test" {
+		t.Fatalf("secret store = %#v", store.values)
+	}
+	configBytes, err := os.ReadFile(filepath.Join(home, ".config", "stave", "config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(configBytes)
+	if !strings.Contains(text, "model: gpt-test") || !strings.Contains(text, "apiKeyRef: keychain:stave/agent/openai") {
+		t.Fatalf("config missing agent settings:\n%s", text)
+	}
+}
+
+func TestCLIAgentPlanOnlyNonTTY(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OPENAI_API_KEY", "sk-env")
+	runCLI(t, "setup")
+	factory := func(providerName, model, apiKey string) (agent.Provider, error) {
+		return fakeProvider{plan: agent.Plan{Summary: "list repos", Operations: []agent.Operation{{Type: agent.OpReposList}}}}, nil
+	}
+	cmd := newRootCommand(&app{providerFactory: factory, isTerminal: func(cmd *cobra.Command) bool { return false }})
+	cmd.SetArgs([]string{"agent", "list repos"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("agent query error = %v\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "stave repos list") || !strings.Contains(out.String(), "no operations were executed") {
+		t.Fatalf("unexpected output:\n%s", out.String())
+	}
+}
+
+func TestCLIAgentJSONAndIncantExecutes(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OPENAI_API_KEY", "sk-env")
+	runCLI(t, "setup")
+	factory := func(providerName, model, apiKey string) (agent.Provider, error) {
+		return fakeProvider{plan: agent.Plan{Summary: "list repos", Operations: []agent.Operation{{Type: agent.OpReposList}}}}, nil
+	}
+	cmd := newRootCommand(&app{providerFactory: factory, isTerminal: func(cmd *cobra.Command) bool { return false }})
+	cmd.SetArgs([]string{"agent", "--incant", "--json", "list repos"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("agent --incant --json error = %v\n%s", err, out.String())
+	}
+	var result agent.RunResult
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatalf("invalid JSON:\n%s\n%v", out.String(), err)
+	}
+	if !result.Executed || len(result.Results) != 1 {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestCLIAgentAutoIncantExecutesWithoutFlag(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OPENAI_API_KEY", "sk-env")
+	runCLI(t, "setup")
+	cfg, path, err := config.Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Agent.AutoIncant = true
+	if err := cfg.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	factory := func(providerName, model, apiKey string) (agent.Provider, error) {
+		return fakeProvider{plan: agent.Plan{Summary: "list repos", Operations: []agent.Operation{{Type: agent.OpReposList}}}}, nil
+	}
+	cmd := newRootCommand(&app{providerFactory: factory, isTerminal: func(cmd *cobra.Command) bool { return false }})
+	cmd.SetArgs([]string{"agent", "--json", "list repos"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("agent auto-incant error = %v\n%s", err, out.String())
+	}
+	var result agent.RunResult
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatalf("invalid JSON:\n%s\n%v", out.String(), err)
+	}
+	if !result.Executed || len(result.Results) != 1 {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestCLIAgentNoIncantOverridesAutoIncant(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OPENAI_API_KEY", "sk-env")
+	runCLI(t, "setup")
+	cfg, path, err := config.Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Agent.AutoIncant = true
+	if err := cfg.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	factory := func(providerName, model, apiKey string) (agent.Provider, error) {
+		return fakeProvider{plan: agent.Plan{Summary: "list repos", Operations: []agent.Operation{{Type: agent.OpReposList}}}}, nil
+	}
+	cmd := newRootCommand(&app{providerFactory: factory, isTerminal: func(cmd *cobra.Command) bool { return false }})
+	cmd.SetArgs([]string{"agent", "--no-incant", "--json", "list repos"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("agent --no-incant auto-incant error = %v\n%s", err, out.String())
+	}
+	var result agent.RunResult
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatalf("invalid JSON:\n%s\n%v", out.String(), err)
+	}
+	if result.Executed {
+		t.Fatalf("--no-incant did not override autoIncant: %#v", result)
+	}
+}
+
+func TestCLIAgentJSONDoesNotPromptOnTTY(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OPENAI_API_KEY", "sk-env")
+	runCLI(t, "setup")
+	factory := func(providerName, model, apiKey string) (agent.Provider, error) {
+		return fakeProvider{plan: agent.Plan{Summary: "list repos", Operations: []agent.Operation{{Type: agent.OpReposList}}}}, nil
+	}
+	cmd := newRootCommand(&app{providerFactory: factory, isTerminal: func(cmd *cobra.Command) bool { return true }})
+	cmd.SetArgs([]string{"agent", "--json", "list repos"})
+	cmd.SetIn(strings.NewReader("y\n"))
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("agent --json error = %v\n%s", err, out.String())
+	}
+	if strings.Contains(out.String(), "Proceed?") {
+		t.Fatalf("--json prompted unexpectedly:\n%s", out.String())
+	}
+	var result agent.RunResult
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatalf("invalid JSON:\n%s\n%v", out.String(), err)
+	}
+	if result.Executed {
+		t.Fatalf("--json without --incant executed unexpectedly: %#v", result)
+	}
+}
+
 func TestCLITicketFlagIsRemoved(t *testing.T) {
 	cmd := NewRootCommand()
 	cmd.SetArgs([]string{"space", "create", "ex-1234", "--ticket", "ticket.md"})
@@ -99,6 +272,40 @@ func TestCLITicketFlagIsRemoved(t *testing.T) {
 	if err := cmd.Execute(); err == nil {
 		t.Fatalf("--ticket unexpectedly succeeded:\n%s", out.String())
 	}
+}
+
+type fakeProvider struct {
+	plan agent.Plan
+}
+
+func (f fakeProvider) Run(ctx context.Context, request agent.ProviderRequest) (agent.RunResult, error) {
+	return agent.RunResult{Plan: f.plan, Commands: f.plan.Commands()}, nil
+}
+
+type fakeSecretStore struct {
+	available bool
+	values    map[string]string
+}
+
+func (f *fakeSecretStore) Available() bool {
+	return f.available
+}
+
+func (f *fakeSecretStore) Put(ctx context.Context, ref string, value string) error {
+	if f.values == nil {
+		f.values = map[string]string{}
+	}
+	f.values[ref] = value
+	return nil
+}
+
+func (f *fakeSecretStore) Get(ctx context.Context, ref string) (string, error) {
+	return f.values[ref], nil
+}
+
+func (f *fakeSecretStore) Delete(ctx context.Context, ref string) error {
+	delete(f.values, ref)
+	return nil
 }
 
 func TestCLISpaceCommandsAreNotTopLevel(t *testing.T) {

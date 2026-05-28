@@ -166,6 +166,30 @@ func TestCreateAddsEditAndReference(t *testing.T) {
 	}
 }
 
+func TestCreateAllowsSameRepoAsEditAndReference(t *testing.T) {
+	svc, _, cfg := testService(t)
+
+	if err := svc.Create(context.Background(), CreateOptions{
+		ID:         "ex-1234",
+		Edits:      []RepoSpec{{Name: "repo-a"}},
+		References: []RepoSpec{{Name: "repo-a", Ref: "main"}},
+	}); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	spacePath := filepath.Join(cfg.AgentWorkDir, "ex-1234")
+	manifest, err := LoadManifest(spacePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Repos) != 2 {
+		t.Fatalf("manifest repos = %#v", manifest.Repos)
+	}
+	if !manifest.HasPath("repo-a") || !manifest.HasPath(filepath.Join("references", "repo-a")) {
+		t.Fatalf("manifest paths = %#v", manifest.Repos)
+	}
+}
+
 func TestInitCopiesSpecDirectory(t *testing.T) {
 	svc, _, cfg := testService(t)
 	specDir := filepath.Join(t.TempDir(), "spec-source")

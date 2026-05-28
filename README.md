@@ -27,6 +27,9 @@ go install github.com/Nurozen/stave/cmd/stave@latest
 ```text
 stave
 ├── setup
+├── agent
+│   ├── configure
+│   └── <query>
 ├── repos
 │   ├── add <name> <url>
 │   ├── list
@@ -56,11 +59,15 @@ stave repos add web https://github.com/you/web.git
 
 # Create a space with editable + reference repos in one step
 stave space create ticket-482 \
-  --kind ticket \
-  --spec ~/notes/ticket-482.md \
-  --edit api \
-  --edit web:develop \
-  --reference api:main
+  -k ticket \
+  -s ~/notes/ticket-482.md \
+  -e api \
+  -e web:develop \
+  -r api:main
+
+# Optional: configure the natural-language agent
+stave agent configure
+stave agent "create ticket-482 from ~/notes/ticket-482.md with api editable and web as a reference"
 
 # Inspect the workspace
 stave space status ticket-482
@@ -113,6 +120,48 @@ Global flag on all commands: `--config <path>` (default `~/.config/stave/config.
 
 Flags: `--dry-run` on `add`.
 
+### `stave agent`
+
+Your agentic paraclete for Stave: it reads your workspace state, proposes safe operations, and incants validated plans when allowed.
+
+| Command | Description |
+|---------|-------------|
+| `stave agent configure` | Interactively choose provider/model and configure the API key |
+| `stave agent <query>` | Ask the agent to plan Stave operations from natural language |
+
+Agent query flags:
+
+| Flag | Meaning |
+|------|---------|
+| `--provider` | Override configured provider (`openai` or `anthropic`) |
+| `--model` | Override configured model |
+| `--incant` | Execute the validated plan without prompting |
+| `--no-incant` | Always print the plan only |
+| `--json` | Emit machine-readable JSON |
+
+By default, interactive terminals show the typed plan and equivalent `stave ...` commands, then prompt before execution. Non-interactive runs print the plan only unless `--incant` is set or `agent.autoIncant: true` is configured. `--no-incant` always keeps the run plan-only.
+
+The agent uses provider-native tool calls, not a free-form JSON response. OpenAI and Anthropic both receive the same Stave tool catalog:
+
+| Tool | Behavior |
+|------|----------|
+| `stave_repos_list` | Read registered repos during planning |
+| `stave_space_status` | Read one existing space during planning |
+| `stave_repos_sync` | Queue repo cache sync for confirmation |
+| `stave_space_sync` | Queue space sync for confirmation |
+| `stave_space_create` | Queue new space creation for confirmation |
+| `stave_space_add` | Queue adding a repo to an existing space for confirmation |
+| `stave_explain_unsupported` | Record unsupported/destructive requests as notes |
+| `stave_finish` | Finish planning with a summary, notes, and warnings |
+
+Read-only tools can run immediately while the model is planning. Mutating tools never apply changes inside the model loop; they only create a validated operation plan that Stave executes after confirmation, `--incant`, or `agent.autoIncant: true`.
+
+Destructive operations such as archive, destroy, repo removal, reset, delete, push, PR creation, issue tracker updates, and arbitrary shell commands are intentionally not executable by the agent in v1.
+
+`stave agent configure` stores API keys in macOS Keychain when available. If Keychain is unavailable, config stores an environment-variable reference such as `env:OPENAI_API_KEY` or `env:ANTHROPIC_API_KEY`. Stave does not write plaintext API keys to `config.yaml` and does not edit shell startup files.
+
+Current built-in model defaults are `gpt-5.5` for OpenAI and `claude-opus-4-7` for Anthropic.
+
 ### `stave space`
 
 | Command | Description |
@@ -158,10 +207,23 @@ repos:
     url: https://github.com/you/api.git
     bareRepoPath: ~/stave/bare-repos/api.git
     defaultBranch: main
+agent:
+  defaultProvider: openai
+  autoIncant: false
+  providers:
+    openai:
+      model: gpt-5.5
+      apiKeyRef: keychain:stave/agent/openai
+    anthropic:
+      model: claude-opus-4-7
+      apiKeyRef: env:ANTHROPIC_API_KEY
 ```
 
 - **`defaultBase`** — fallback ref when a repo or `--edit` / `--reference` spec omits a branch.
 - **`defaultBranch`** (per repo) — detected on `repos add` when possible; overrides `defaultBase` for that repo.
+- **`agent.defaultProvider`** — provider used by `stave agent` unless `--provider` is set.
+- **`agent.autoIncant`** — when true, `stave agent` executes validated plans without prompting or requiring `--incant`; `--no-incant` still wins.
+- **`agent.providers.*.apiKeyRef`** — secret reference; either `keychain:stave/agent/<provider>` or `env:<NAME>`.
 
 Editable branches default to `stave/<space-id>/<repo>` unless `--branch` is set.
 

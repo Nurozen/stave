@@ -1,24 +1,36 @@
 package cli
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
+	"github.com/Nurozen/stave/internal/agent"
 	"github.com/Nurozen/stave/internal/config"
 	"github.com/Nurozen/stave/internal/git"
 	"github.com/Nurozen/stave/internal/space"
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 )
 
 type app struct {
-	configPath string
+	configPath      string
+	providerFactory agent.ProviderFactory
+	secretStore     agent.SecretStore
+	isTerminal      func(*cobra.Command) bool
 }
 
 func NewRootCommand() *cobra.Command {
-	a := &app{}
+	return newRootCommand(&app{})
+}
+
+func newRootCommand(a *app) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "stave",
 		Short: "Manage agent workspaces backed by shared bare Git repositories",
@@ -28,6 +40,7 @@ func NewRootCommand() *cobra.Command {
 		a.setupCommand(),
 		a.reposCommand(),
 		a.spaceCommand(),
+		a.agentCommand(),
 	)
 	return cmd
 }
@@ -207,6 +220,158 @@ func (a *app) reposRemoveCommand() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+func (a *app) agentCommand() *cobra.Command {
+	var providerName string
+	var model string
+	var incant bool
+	var noIncant bool
+	var jsonOut bool
+	cmd := &cobra.Command{
+		Use:   "agent [query]",
+		Short: "Ask your agentic paraclete to plan and run Stave operations",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			query := strings.Join(args, " ")
+			cfg, _, err := a.loadConfig()
+			if err != nil {
+				return err
+			}
+			resolvedProvider, providerCfg, err := resolveAgentProvider(*cfg, providerName, model)
+			if err != nil {
+				return err
+			}
+			secret, err := agent.ResolveSecret(cmd.Context(), a.effectiveSecretStore(), providerCfg.APIKeyRef)
+			if err != nil {
+				return err
+			}
+			provider, err := a.effectiveProviderFactory()(resolvedProvider, providerCfg.Model, secret)
+			if err != nil {
+				return err
+			}
+			agentContext, err := agent.BuildContext(*cfg)
+			if err != nil {
+				return err
+			}
+			dispatcher := agent.NewToolDispatcher(*cfg, git.New(), cmd.OutOrStdout())
+			result, err := provider.Run(cmd.Context(), agent.ProviderRequest{Query: query, Context: agentContext, Dispatcher: dispatcher})
+			if err != nil {
+				return err
+			}
+			if err := agent.ValidatePlan(*cfg, result.Plan); err != nil {
+				return err
+			}
+			result.Commands = result.Plan.Commands()
+			execute := false
+			if incant || cfg.Agent.AutoIncant {
+				execute = true
+			} else if !noIncant && !jsonOut && a.commandIsTerminal(cmd) {
+				printAgentPlan(cmd.OutOrStdout(), result)
+				execute, err = confirm(cmd.InOrStdin(), cmd.OutOrStdout())
+				if err != nil {
+					return err
+				}
+			}
+			if noIncant {
+				execute = false
+			}
+			if execute {
+				results, err := (agent.Executor{Config: *cfg, Git: git.New(), Out: cmd.OutOrStdout()}).ExecutePlan(cmd.Context(), result.Plan)
+				result.Results = results
+				result.Executed = true
+				if err != nil {
+					if jsonOut {
+						_ = writeJSON(cmd.OutOrStdout(), result)
+					}
+					return err
+				}
+			}
+			if jsonOut {
+				return writeJSON(cmd.OutOrStdout(), result)
+			}
+			if !execute || incant || cfg.Agent.AutoIncant {
+				printAgentPlan(cmd.OutOrStdout(), result)
+			}
+			if !execute && !noIncant && !a.commandIsTerminal(cmd) {
+				fmt.Fprintln(cmd.OutOrStdout(), "\nNon-interactive terminal detected; no operations were executed. Re-run with --incant or set agent.autoIncant: true to execute.")
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&providerName, "provider", "", "agent provider override (openai or anthropic)")
+	cmd.Flags().StringVar(&model, "model", "", "model override")
+	cmd.Flags().BoolVar(&incant, "incant", false, "execute the validated plan without prompting")
+	cmd.Flags().BoolVar(&noIncant, "no-incant", false, "plan only; never execute operations")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON")
+	cmd.AddCommand(a.agentConfigureCommand())
+	return cmd
+}
+
+func (a *app) agentConfigureCommand() *cobra.Command {
+	var providerName string
+	var model string
+	cmd := &cobra.Command{
+		Use:   "configure",
+		Short: "Interactively configure the Stave agent provider and API key",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, path, err := a.loadConfig()
+			if err != nil {
+				return err
+			}
+			reader := bufio.NewReader(cmd.InOrStdin())
+			if providerName == "" {
+				providerName, err = promptDefault(reader, cmd.OutOrStdout(), "Provider", firstNonEmpty(cfg.Agent.DefaultProvider, config.DefaultAgentProvider))
+				if err != nil {
+					return err
+				}
+			}
+			if providerName != agent.ProviderOpenAI && providerName != agent.ProviderAnthropic {
+				return fmt.Errorf("provider must be openai or anthropic")
+			}
+			defaultModel := defaultModelForProvider(providerName)
+			if existing := cfg.Agent.Providers[providerName].Model; existing != "" {
+				defaultModel = existing
+			}
+			if model == "" {
+				model, err = promptDefault(reader, cmd.OutOrStdout(), "Model", defaultModel)
+				if err != nil {
+					return err
+				}
+			}
+			store := a.effectiveSecretStore()
+			keychain := store.Available()
+			apiKeyRef := agent.APIKeyRefForProvider(providerName, keychain)
+			if keychain {
+				secret, err := readSecret(cmd, reader, fmt.Sprintf("%s API key", providerName))
+				if err != nil {
+					return err
+				}
+				if secret == "" {
+					return fmt.Errorf("API key is required")
+				}
+				if err := store.Put(cmd.Context(), apiKeyRef, secret); err != nil {
+					return err
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "Stored %s API key in Keychain as %s\n", providerName, apiKeyRef)
+			} else {
+				fmt.Fprintf(cmd.OutOrStdout(), "Keychain unavailable; using %s. Set that environment variable before running `stave agent`.\n", apiKeyRef)
+			}
+			if cfg.Agent.Providers == nil {
+				cfg.Agent.Providers = map[string]config.AgentProviderConfig{}
+			}
+			cfg.Agent.DefaultProvider = providerName
+			cfg.Agent.Providers[providerName] = config.AgentProviderConfig{Model: model, APIKeyRef: apiKeyRef}
+			if err := cfg.Save(path); err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "Configured agent provider %s with model %s\n", providerName, model)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&providerName, "provider", "", "provider to configure (openai or anthropic)")
+	cmd.Flags().StringVar(&model, "model", "", "model to configure")
+	return cmd
 }
 
 func (a *app) spaceCommand() *cobra.Command {
@@ -468,6 +633,143 @@ func printStatus(out interface{ Write([]byte) (int, error) }, spacePath string, 
 			}
 		}
 	}
+}
+
+func resolveAgentProvider(cfg config.Config, providerOverride, modelOverride string) (string, config.AgentProviderConfig, error) {
+	providerName := firstNonEmpty(providerOverride, cfg.Agent.DefaultProvider, config.DefaultAgentProvider)
+	if providerName != agent.ProviderOpenAI && providerName != agent.ProviderAnthropic {
+		return "", config.AgentProviderConfig{}, fmt.Errorf("provider must be openai or anthropic")
+	}
+	providerCfg := cfg.Agent.Providers[providerName]
+	if providerCfg.Model == "" {
+		providerCfg.Model = defaultModelForProvider(providerName)
+	}
+	if modelOverride != "" {
+		providerCfg.Model = modelOverride
+	}
+	if providerCfg.APIKeyRef == "" {
+		providerCfg.APIKeyRef = agent.APIKeyRefForProvider(providerName, false)
+	}
+	return providerName, providerCfg, nil
+}
+
+func defaultModelForProvider(provider string) string {
+	if provider == agent.ProviderAnthropic {
+		return config.DefaultAgentModelAnthropic
+	}
+	return config.DefaultAgentModelOpenAI
+}
+
+func promptDefault(reader *bufio.Reader, out io.Writer, label string, defaultValue string) (string, error) {
+	fmt.Fprintf(out, "%s [%s]: ", label, defaultValue)
+	value, err := reader.ReadString('\n')
+	if err != nil && err != io.EOF {
+		return "", err
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return defaultValue, nil
+	}
+	return value, nil
+}
+
+func readSecret(cmd *cobra.Command, reader *bufio.Reader, label string) (string, error) {
+	fmt.Fprintf(cmd.OutOrStdout(), "%s: ", label)
+	if file, ok := cmd.InOrStdin().(*os.File); ok && term.IsTerminal(int(file.Fd())) {
+		data, err := term.ReadPassword(int(file.Fd()))
+		fmt.Fprintln(cmd.OutOrStdout())
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(string(data)), nil
+	}
+	value, err := reader.ReadString('\n')
+	if err != nil && err != io.EOF {
+		return "", err
+	}
+	return strings.TrimSpace(value), nil
+}
+
+func confirm(in io.Reader, out io.Writer) (bool, error) {
+	reader := bufio.NewReader(in)
+	if _, err := fmt.Fprint(out, "\nProceed? [y/N]: "); err != nil {
+		return false, err
+	}
+	value, err := reader.ReadString('\n')
+	if err != nil && err != io.EOF {
+		return false, err
+	}
+	value = strings.ToLower(strings.TrimSpace(value))
+	return value == "y" || value == "yes", nil
+}
+
+func printAgentPlan(out io.Writer, result agent.RunResult) {
+	if result.Plan.Summary != "" {
+		fmt.Fprintf(out, "Plan: %s\n", result.Plan.Summary)
+	} else {
+		fmt.Fprintln(out, "Plan:")
+	}
+	for i, op := range result.Plan.Operations {
+		fmt.Fprintf(out, "  %d. %s\n", i+1, op.Type)
+	}
+	if len(result.Commands) > 0 {
+		fmt.Fprintln(out, "\nCommands:")
+		for _, command := range result.Commands {
+			fmt.Fprintf(out, "  %s\n", command)
+		}
+	}
+	if len(result.Plan.Notes) > 0 {
+		fmt.Fprintln(out, "\nNotes:")
+		for _, note := range result.Plan.Notes {
+			fmt.Fprintf(out, "  - %s\n", note)
+		}
+	}
+	if len(result.Plan.Warnings) > 0 {
+		fmt.Fprintln(out, "\nWarnings:")
+		for _, warning := range result.Plan.Warnings {
+			fmt.Fprintf(out, "  - %s\n", warning)
+		}
+	}
+	if result.Executed {
+		fmt.Fprintln(out, "\nExecuted.")
+	}
+}
+
+func writeJSON(out io.Writer, value any) error {
+	encoder := json.NewEncoder(out)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(value)
+}
+
+func (a *app) effectiveProviderFactory() agent.ProviderFactory {
+	if a.providerFactory != nil {
+		return a.providerFactory
+	}
+	return agent.DefaultProviderFactory
+}
+
+func (a *app) effectiveSecretStore() agent.SecretStore {
+	if a.secretStore != nil {
+		return a.secretStore
+	}
+	return agent.DefaultSecretStore()
+}
+
+func (a *app) commandIsTerminal(cmd *cobra.Command) bool {
+	if a.isTerminal != nil {
+		return a.isTerminal(cmd)
+	}
+	file, ok := cmd.InOrStdin().(*os.File)
+	return ok && term.IsTerminal(int(file.Fd()))
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func ExecuteContext(ctx context.Context) error {

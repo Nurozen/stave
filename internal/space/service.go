@@ -258,9 +258,6 @@ func (s Service) AddRepo(ctx context.Context, opts AddOptions) error {
 	if err != nil {
 		return err
 	}
-	if _, _, exists := manifest.FindRepo(opts.RepoName); exists {
-		return fmt.Errorf("repo %q is already in space %q", opts.RepoName, opts.SpaceID)
-	}
 	if !opts.NoFetch && opts.DryRun {
 		s.printf("dry-run: fetch %s\n", repoCfg.BareRepoPath)
 	} else if !opts.NoFetch {
