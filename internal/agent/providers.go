@@ -70,7 +70,6 @@ func (p OpenAIProvider) Run(ctx context.Context, request ProviderRequest) (RunRe
 			ToolChoice:        responses.ResponseNewParamsToolChoiceUnion{OfToolChoiceMode: openaiparam.NewOpt(responses.ToolChoiceOptionsAuto)},
 			ParallelToolCalls: openaiparam.NewOpt(false),
 			MaxOutputTokens:   openaiparam.NewOpt[int64](4096),
-			Temperature:       openaiparam.NewOpt(0.1),
 			Store:             openaiparam.NewOpt(false),
 		}
 		if previousResponseID != "" {
@@ -144,7 +143,6 @@ func (p AnthropicProvider) Run(ctx context.Context, request ProviderRequest) (Ru
 			ToolChoice: anthropic.ToolChoiceUnionParam{OfAuto: &anthropic.ToolChoiceAutoParam{
 				DisableParallelToolUse: anthropicparam.NewOpt(true),
 			}},
-			Temperature: anthropicparam.NewOpt(0.1),
 		})
 		if err != nil {
 			return RunResult{}, err

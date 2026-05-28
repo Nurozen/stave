@@ -22,6 +22,9 @@ func TestOpenAIProviderToolLoop(t *testing.T) {
 			if len(params.Tools) != len(ToolDefinitions()) {
 				t.Fatalf("tools = %d, want %d", len(params.Tools), len(ToolDefinitions()))
 			}
+			if params.Temperature.Valid() {
+				t.Fatalf("temperature should be omitted for OpenAI Responses requests")
+			}
 			switch calls {
 			case 1:
 				return openAIResponse(t, `{"id":"r1","output":[{"type":"function_call","call_id":"c1","name":"stave_repos_list","arguments":"{}"}]}`), nil
@@ -145,6 +148,9 @@ func TestAnthropicProviderToolLoop(t *testing.T) {
 			disableParallel := params.ToolChoice.GetDisableParallelToolUse()
 			if disableParallel == nil || !*disableParallel {
 				t.Fatalf("disable_parallel_tool_use = %#v, want true", disableParallel)
+			}
+			if params.Temperature.Valid() {
+				t.Fatalf("temperature should be omitted for Anthropic Messages requests")
 			}
 			switch calls {
 			case 1:
