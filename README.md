@@ -31,6 +31,18 @@ stave
 │   ├── configure
 │   └── <query>
 ├── summon <space-id>
+├── portal
+│   ├── init <space-id> [portal-id]
+│   ├── attach ssh|ec2 <space-id> ...
+│   ├── configure <space-id> [portal-id]
+│   ├── drivers
+│   ├── doctor <space-id> [portal-id]
+│   ├── list [space-id]
+│   ├── status <space-id> [portal-id]
+│   ├── inspect <space-id> [portal-id]
+│   ├── auth status|login|inherit|revoke <space-id> [portal-id]
+│   ├── up|sync|shell|exec|summon|logs <space-id> [portal-id]
+│   └── down|detach|destroy <space-id> [portal-id]
 ├── repos
 │   ├── add <name> <url>
 │   ├── list
@@ -207,6 +219,24 @@ When `--spec` points at a file, it is copied under `spec/` with its original bas
 Summoned agents always launch from `agent-work/<space-id>`, not from an individual repo. That gives them the manifest, generated `AGENTS.md`, copied specs, editable top-level repos, and `references/` context in one working directory.
 
 `--print-command` prints the launch command instead of running it. Non-interactive terminals also print instead of launching. `cursor` maps to the Cursor Agent CLI (`cursor-agent`), not the Cursor GUI editor.
+
+### `stave portal`
+
+Attach execution environments to an existing Stave space without changing the
+space as the source of truth.
+
+| Command | Description |
+|---------|-------------|
+| `stave portal init container <space-id>` | Record a Stave-owned Docker portal |
+| `stave portal init devcontainer <space-id>` | Record a devcontainer portal |
+| `stave portal attach ssh <space-id> <host>` | Attach an existing SSH host |
+| `stave portal attach ec2 <space-id> <instance-id> --region <region>` | Attach an existing EC2 instance |
+| `stave portal status <space-id> --json` | Emit stable portal status JSON |
+| `stave portal summon <space-id> --with codex --mode print` | Print the in-portal agent launch command |
+
+Local login credentials are never copied silently. Use `stave portal auth
+login` to authenticate inside the portal target, or explicit `auth inherit`
+methods when you really want inherited auth behavior.
 
 ## Configuration
 

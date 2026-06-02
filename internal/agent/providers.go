@@ -377,7 +377,14 @@ func finishFromText(session *ToolSession, text string) bool {
 	if session == nil || text == "" {
 		return false
 	}
+	for _, op := range session.Plan.Operations {
+		if isPortalOperation(op) {
+			return false
+		}
+	}
 	session.Plan.Summary = text
+	session.Status = RunStatusPlanReady
+	session.Message = text
 	session.Finished = true
 	return true
 }
@@ -399,7 +406,7 @@ func traceToolCall(out io.Writer, call ToolCall) {
 	if args == "" {
 		args = "{}"
 	}
-	tracef(out, "agent: tool %s %s\n", call.Name, truncateTrace(args, 240))
+	tracef(out, "agent: tool %s %s\n", call.Name, truncateTrace(RedactText(args), 240))
 }
 
 func traceToolResult(out io.Writer, result ToolResult) {
@@ -410,7 +417,7 @@ func traceToolResult(out io.Writer, result ToolResult) {
 	if result.Error {
 		status = "error"
 	}
-	tracef(out, "agent: tool result %s %s: %s\n", result.Name, status, truncateTrace(result.Summary, 240))
+	tracef(out, "agent: tool result %s %s: %s\n", result.Name, status, truncateTrace(RedactText(result.Summary), 240))
 }
 
 func tracef(out io.Writer, format string, args ...any) {

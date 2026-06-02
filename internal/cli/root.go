@@ -14,6 +14,7 @@ import (
 	"github.com/Nurozen/stave/internal/agent"
 	"github.com/Nurozen/stave/internal/config"
 	"github.com/Nurozen/stave/internal/git"
+	"github.com/Nurozen/stave/internal/portal"
 	"github.com/Nurozen/stave/internal/space"
 	"github.com/Nurozen/stave/internal/summon"
 	"github.com/spf13/cobra"
@@ -25,6 +26,7 @@ type app struct {
 	providerFactory agent.ProviderFactory
 	secretStore     agent.SecretStore
 	summonLauncher  summon.Launcher
+	portalRunner    portal.Runner
 	isTerminal      func(*cobra.Command) bool
 }
 
@@ -42,6 +44,7 @@ func newRootCommand(a *app) *cobra.Command {
 		a.setupCommand(),
 		a.reposCommand(),
 		a.spaceCommand(),
+		a.portalCommand(),
 		a.agentCommand(),
 		a.summonCommand(),
 	)
@@ -257,19 +260,46 @@ func (a *app) agentCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			dispatcher := agent.NewToolDispatcher(*cfg, git.New(), cmd.OutOrStdout())
 			trace := io.Writer(nil)
 			if !jsonOut {
 				trace = cmd.ErrOrStderr()
 			}
-			result, err := provider.Run(cmd.Context(), agent.ProviderRequest{Query: query, Context: agentContext, Dispatcher: dispatcher, Trace: trace})
-			if err != nil {
-				return err
+			queryForProvider := query
+			var result agent.RunResult
+			for turns := 0; turns < 3; turns++ {
+				dispatcher := agent.NewToolDispatcher(*cfg, git.New(), cmd.OutOrStdout())
+				result, err = provider.Run(cmd.Context(), agent.ProviderRequest{Query: queryForProvider, Context: agentContext, Dispatcher: dispatcher, Trace: trace})
+				if err != nil {
+					return fmt.Errorf("%s", agent.RedactText(err.Error()))
+				}
+				if err := agent.ValidatePlan(*cfg, result.Plan); err != nil {
+					return fmt.Errorf("%s", agent.RedactText(err.Error()))
+				}
+				if result.Status == "" {
+					result.Status = agent.RunStatusPlanReady
+				}
+				if result.Status != agent.RunStatusNeedsInput || jsonOut || !a.commandIsTerminal(cmd) {
+					break
+				}
+				answers, err := collectQuestionAnswers(cmd.InOrStdin(), cmd.OutOrStdout(), result)
+				if err != nil {
+					return err
+				}
+				queryForProvider = query + "\n\nAdditional answers from inline portal setup:\n" + answers
 			}
-			if err := agent.ValidatePlan(*cfg, result.Plan); err != nil {
-				return err
-			}
+			executionPlan := result.Plan
 			result.Commands = result.Plan.Commands()
+			if result.Status == "" {
+				result.Status = agent.RunStatusPlanReady
+			}
+			if result.Status != agent.RunStatusPlanReady {
+				result = agent.RedactRunResult(result)
+				if jsonOut {
+					return writeJSON(cmd.OutOrStdout(), result)
+				}
+				printAgentPlan(cmd.OutOrStdout(), result)
+				return nil
+			}
 			execute := false
 			if incant || cfg.Agent.AutoIncant {
 				execute = true
@@ -293,17 +323,20 @@ func (a *app) agentCommand() *cobra.Command {
 					Git:              git.New(),
 					Out:              execOut,
 					SummonLauncher:   a.effectiveSummonLauncher(),
+					PortalRunner:     a.effectivePortalRunner(),
 					AllowInteractive: !jsonOut && a.commandIsTerminal(cmd),
-				}).ExecutePlan(cmd.Context(), result.Plan)
+				}).ExecutePlan(cmd.Context(), executionPlan)
 				result.Results = results
 				result.Executed = true
 				if err != nil {
+					result = agent.RedactRunResult(result)
 					if jsonOut {
 						_ = writeJSON(cmd.OutOrStdout(), result)
 					}
-					return err
+					return fmt.Errorf("%s", agent.RedactText(err.Error()))
 				}
 			}
+			result = agent.RedactRunResult(result)
 			if jsonOut {
 				return writeJSON(cmd.OutOrStdout(), result)
 			}
@@ -493,6 +526,729 @@ func (a *app) summonCommand() *cobra.Command {
 	return cmd
 }
 
+func (a *app) portalCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "portal",
+		Short: "Attach execution environments to Stave spaces",
+	}
+	cmd.AddCommand(
+		a.portalInitCommand(),
+		a.portalAttachCommand(),
+		a.portalConfigureCommand(),
+		a.portalDriversCommand(),
+		a.portalDoctorCommand(),
+		a.portalListCommand(),
+		a.portalStatusCommand(),
+		a.portalInspectCommand(),
+		a.portalAuthCommand(),
+		a.portalUpCommand(),
+		a.portalSyncCommand(),
+		a.portalShellCommand(),
+		a.portalExecCommand(),
+		a.portalSummonCommand(),
+		a.portalLogsCommand(),
+		a.portalDownCommand(),
+		a.portalDetachCommand(),
+		a.portalDestroyCommand(),
+	)
+	return cmd
+}
+
+func (a *app) portalInitCommand() *cobra.Command {
+	var preset string
+	var yes bool
+	var dryRun bool
+	cmd := &cobra.Command{
+		Use:   "init <space-id> [portal-id]",
+		Short: "Guided portal setup for a space",
+		Args:  cobra.RangeArgs(1, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			svc, err := a.portalService(cmd)
+			if err != nil {
+				return err
+			}
+			portalID := optionalPortalID(args)
+			if strings.HasPrefix(preset, "ssh-") {
+				return fmt.Errorf("preset %s attaches an external resource; use `stave portal attach ssh`", preset)
+			}
+			kind := guidedPortalKind(preset)
+			reader := bufio.NewReader(cmd.InOrStdin())
+			if !yes && !dryRun && a.commandIsTerminal(cmd) && preset == "" {
+				kind, err = promptDefault(reader, cmd.OutOrStdout(), "Portal kind (container/devcontainer)", kind)
+				if err != nil {
+					return err
+				}
+				if kind != "container" && kind != "devcontainer" {
+					return fmt.Errorf("portal kind must be container or devcontainer")
+				}
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "Equivalent command: %s\n", guidedPortalCommand(args[0], portalID, kind, preset))
+			previewPlan, err := guidedPortalPreview(cmd.Context(), svc, args[0], portalID, kind, preset)
+			if err != nil {
+				return err
+			}
+			printPortalPlan(cmd.OutOrStdout(), previewPlan)
+			if dryRun {
+				return nil
+			}
+			if !yes && !dryRun && a.commandIsTerminal(cmd) {
+				ok, err := confirm(reader, cmd.OutOrStdout())
+				if err != nil {
+					return err
+				}
+				if !ok {
+					fmt.Fprintln(cmd.OutOrStdout(), "cancelled")
+					return nil
+				}
+			}
+			var plan portal.Plan
+			if kind == "devcontainer" {
+				plan, err = svc.InitDevcontainer(cmd.Context(), portal.InitDevcontainerOptions{SpaceID: args[0], PortalID: portalID, Preset: preset, DryRun: dryRun})
+			} else {
+				plan, err = svc.InitContainer(cmd.Context(), portal.InitContainerOptions{SpaceID: args[0], PortalID: portalID, Preset: preset, DryRun: dryRun})
+			}
+			if err != nil {
+				return err
+			}
+			printPortalPlan(cmd.OutOrStdout(), plan)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&preset, "preset", "", "preset such as local-codex, local-claude, or claude-devcontainer")
+	cmd.Flags().BoolVar(&yes, "yes", false, "accept guided defaults")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview without writing")
+	cmd.AddCommand(a.portalInitContainerCommand(), a.portalInitDevcontainerCommand())
+	return cmd
+}
+
+func (a *app) portalInitContainerCommand() *cobra.Command {
+	var image, engine, containerRoot, preset string
+	var dryRun bool
+	cmd := &cobra.Command{
+		Use:   "container <space-id> [portal-id]",
+		Short: "Create local container portal metadata",
+		Args:  cobra.RangeArgs(1, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			svc, err := a.portalService(cmd)
+			if err != nil {
+				return err
+			}
+			plan, err := svc.InitContainer(cmd.Context(), portal.InitContainerOptions{SpaceID: args[0], PortalID: optionalPortalID(args), Engine: portal.Driver(engine), Image: image, ContainerRoot: containerRoot, Preset: preset, DryRun: dryRun})
+			if err != nil {
+				return err
+			}
+			printPortalPlan(cmd.OutOrStdout(), plan)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&image, "image", "", "container image")
+	cmd.Flags().StringVar(&engine, "engine", "docker", "container engine: docker")
+	cmd.Flags().StringVar(&containerRoot, "container-root", "", "space root inside the container")
+	cmd.Flags().StringVar(&preset, "preset", "", "preset such as local-codex or local-claude")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview without writing")
+	return cmd
+}
+
+func (a *app) portalInitDevcontainerCommand() *cobra.Command {
+	var path, service, containerRoot, preset string
+	var composeFiles []string
+	var dryRun bool
+	cmd := &cobra.Command{
+		Use:   "devcontainer <space-id> [portal-id]",
+		Short: "Create devcontainer portal metadata",
+		Args:  cobra.RangeArgs(1, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			svc, err := a.portalService(cmd)
+			if err != nil {
+				return err
+			}
+			plan, err := svc.InitDevcontainer(cmd.Context(), portal.InitDevcontainerOptions{SpaceID: args[0], PortalID: optionalPortalID(args), DevcontainerPath: path, Service: service, ContainerRoot: containerRoot, ComposeFiles: composeFiles, Preset: preset, DryRun: dryRun})
+			if err != nil {
+				return err
+			}
+			printPortalPlan(cmd.OutOrStdout(), plan)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&path, "path", "", "path to devcontainer.json")
+	cmd.Flags().StringVar(&service, "service", "", "devcontainer service")
+	cmd.Flags().StringArrayVar(&composeFiles, "compose-file", nil, "compose file, repeatable")
+	cmd.Flags().StringVar(&containerRoot, "container-root", "", "space root inside the container")
+	cmd.Flags().StringVar(&preset, "preset", "", "preset such as claude-devcontainer")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview without writing")
+	return cmd
+}
+
+func (a *app) portalAttachCommand() *cobra.Command {
+	cmd := &cobra.Command{Use: "attach", Short: "Attach existing external resources"}
+	cmd.AddCommand(a.portalAttachSSHCommand(), a.portalAttachEC2Command())
+	return cmd
+}
+
+func (a *app) portalAttachSSHCommand() *cobra.Command {
+	var remoteRoot, identity, knownHosts, strictHostKey, syncMode, preset string
+	var port int
+	var dryRun bool
+	cmd := &cobra.Command{
+		Use:   "ssh <space-id> <host> [portal-id]",
+		Short: "Attach an existing SSH host",
+		Args:  cobra.RangeArgs(2, 3),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			svc, err := a.portalService(cmd)
+			if err != nil {
+				return err
+			}
+			portalID := ""
+			if len(args) == 3 {
+				portalID = args[2]
+			}
+			plan, err := svc.AttachSSH(cmd.Context(), portal.AttachSSHOptions{SpaceID: args[0], Host: args[1], PortalID: portalID, Port: port, IdentityPath: identity, KnownHostsPath: knownHosts, StrictHostKey: strictHostKey, RemoteRoot: remoteRoot, SyncMode: portal.SyncMode(syncMode), Preset: preset, DryRun: dryRun})
+			if err != nil {
+				return err
+			}
+			printPortalPlan(cmd.OutOrStdout(), plan)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&remoteRoot, "remote-root", "", "remote space root")
+	cmd.Flags().IntVar(&port, "port", 22, "ssh port")
+	cmd.Flags().StringVar(&identity, "identity", "", "ssh identity path")
+	cmd.Flags().StringVar(&knownHosts, "known-hosts", "", "ssh known_hosts file")
+	cmd.Flags().StringVar(&strictHostKey, "strict-host-key", "", "ssh StrictHostKeyChecking value")
+	cmd.Flags().StringVar(&syncMode, "sync", "", "sync mode: rsync or reconstruct")
+	cmd.Flags().StringVar(&preset, "preset", "", "preset such as ssh-codex or ssh-claude")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview without writing")
+	return cmd
+}
+
+func (a *app) portalAttachEC2Command() *cobra.Command {
+	var region, profile, sshUser, identity, remoteRoot, syncMode, preset string
+	var dryRun bool
+	cmd := &cobra.Command{
+		Use:   "ec2 <space-id> <instance-id> [portal-id]",
+		Short: "Attach an existing EC2 instance",
+		Args:  cobra.RangeArgs(2, 3),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			svc, err := a.portalService(cmd)
+			if err != nil {
+				return err
+			}
+			portalID := ""
+			if len(args) == 3 {
+				portalID = args[2]
+			}
+			plan, err := svc.AttachEC2(cmd.Context(), portal.AttachEC2Options{SpaceID: args[0], InstanceID: args[1], PortalID: portalID, Region: region, Profile: profile, SSHUser: sshUser, IdentityPath: identity, RemoteRoot: remoteRoot, SyncMode: portal.SyncMode(syncMode), Preset: preset, DryRun: dryRun})
+			if err != nil {
+				return err
+			}
+			printPortalPlan(cmd.OutOrStdout(), plan)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&region, "region", "", "AWS region")
+	cmd.Flags().StringVar(&profile, "profile", "", "AWS profile")
+	cmd.Flags().StringVar(&sshUser, "ssh-user", "", "SSH username")
+	cmd.Flags().StringVar(&identity, "identity", "", "ssh identity path")
+	cmd.Flags().StringVar(&remoteRoot, "remote-root", "", "remote space root")
+	cmd.Flags().StringVar(&syncMode, "sync", "", "sync mode: rsync or reconstruct")
+	cmd.Flags().StringVar(&preset, "preset", "", "preset such as ssh-codex or ssh-claude")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview without writing")
+	return cmd
+}
+
+func (a *app) portalConfigureCommand() *cobra.Command {
+	var syncMode, containerRoot, remoteRoot, agentName, authMode string
+	var dryRun bool
+	cmd := &cobra.Command{
+		Use:   "configure <space-id> [portal-id]",
+		Short: "Tune an existing portal",
+		Args:  cobra.RangeArgs(1, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			svc, err := a.portalService(cmd)
+			if err != nil {
+				return err
+			}
+			plan, err := svc.Configure(portal.ConfigureOptions{SpaceID: args[0], PortalID: optionalPortalID(args), SyncMode: portal.SyncMode(syncMode), ContainerRoot: containerRoot, RemoteRoot: remoteRoot, Agent: agentName, AuthMode: portal.AuthMode(authMode), DryRun: dryRun})
+			if err != nil {
+				return err
+			}
+			printPortalPlan(cmd.OutOrStdout(), plan)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&syncMode, "sync", "", "sync mode")
+	cmd.Flags().StringVar(&containerRoot, "container-root", "", "container root")
+	cmd.Flags().StringVar(&remoteRoot, "remote-root", "", "remote root")
+	cmd.Flags().StringVar(&agentName, "agent", "", "agent provider: codex, claude, or cursor")
+	cmd.Flags().StringVar(&authMode, "auth", "", "auth mode")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview without writing")
+	return cmd
+}
+
+func (a *app) portalDriversCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "drivers",
+		Short: "List supported portal drivers",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			svc, err := a.portalService(cmd)
+			if err != nil {
+				return err
+			}
+			for _, driver := range svc.Drivers() {
+				ownership := "create"
+				if driver.AttachOnly {
+					ownership = "attach-only"
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\t%s\n", driver.Driver, ownership, driver.Binary, driver.Description)
+			}
+			return nil
+		},
+	}
+}
+
+func (a *app) portalDoctorCommand() *cobra.Command {
+	var jsonOut bool
+	cmd := &cobra.Command{
+		Use:   "doctor <space-id> [portal-id]",
+		Short: "Run portal preflight diagnostics",
+		Args:  cobra.RangeArgs(1, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			svc, err := a.portalService(cmd)
+			if err != nil {
+				return err
+			}
+			report, err := svc.Doctor(cmd.Context(), portal.SelectOptions{SpaceID: args[0], PortalID: optionalPortalID(args)})
+			if err != nil {
+				return err
+			}
+			if jsonOut {
+				return writeJSON(cmd.OutOrStdout(), report)
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "portal %s doctor (%s)\n", report.PortalID, report.Overall)
+			for _, diagnostic := range report.Diagnostics {
+				fmt.Fprintf(cmd.OutOrStdout(), "  [%s] %s: %s\n", diagnostic.Severity, diagnostic.Code, diagnostic.Message)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON")
+	return cmd
+}
+
+func (a *app) portalListCommand() *cobra.Command {
+	var jsonOut bool
+	cmd := &cobra.Command{
+		Use:   "list [space-id]",
+		Short: "List portals",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			svc, err := a.portalService(cmd)
+			if err != nil {
+				return err
+			}
+			spaceID := ""
+			if len(args) == 1 {
+				spaceID = args[0]
+			}
+			entries, err := svc.List(spaceID)
+			if err != nil {
+				return err
+			}
+			if jsonOut {
+				return writeJSON(cmd.OutOrStdout(), entries)
+			}
+			for _, entry := range entries {
+				fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\t%s\t%s\n", entry.SpaceID, entry.PortalID, entry.Driver, entry.SyncMode, entry.Auth)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON")
+	return cmd
+}
+
+func (a *app) portalStatusCommand() *cobra.Command {
+	var jsonOut bool
+	cmd := &cobra.Command{
+		Use:   "status <space-id> [portal-id]",
+		Short: "Show portal status",
+		Args:  cobra.RangeArgs(1, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			svc, err := a.portalService(cmd)
+			if err != nil {
+				return err
+			}
+			status, err := svc.Status(cmd.Context(), portal.SelectOptions{SpaceID: args[0], PortalID: optionalPortalID(args)})
+			if err != nil {
+				return err
+			}
+			if jsonOut {
+				return writeJSON(cmd.OutOrStdout(), status)
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "portal %s (%s)\nspace: %s\ndriver: %s\nstate: %s\nhealth: %s\n", status.PortalID, status.Overall, status.SpaceID, status.Driver, status.State, status.Health)
+			for _, diagnostic := range status.Diagnostics {
+				fmt.Fprintf(cmd.OutOrStdout(), "  [%s] %s: %s\n", diagnostic.Severity, diagnostic.Code, diagnostic.Message)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON")
+	return cmd
+}
+
+func (a *app) portalInspectCommand() *cobra.Command {
+	var jsonOut bool
+	cmd := &cobra.Command{
+		Use:   "inspect <space-id> [portal-id]",
+		Short: "Show portal configuration and ownership",
+		Args:  cobra.RangeArgs(1, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			svc, err := a.portalService(cmd)
+			if err != nil {
+				return err
+			}
+			report, err := svc.Inspect(cmd.Context(), portal.SelectOptions{SpaceID: args[0], PortalID: optionalPortalID(args)})
+			if err != nil {
+				return err
+			}
+			if jsonOut {
+				return writeJSON(cmd.OutOrStdout(), report)
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "manifest: %s\nportal: %s\ndriver: %s\n", report.ManifestPath, report.Portal.ID, report.Portal.Driver)
+			for _, resource := range report.OwnedResources {
+				fmt.Fprintf(cmd.OutOrStdout(), "owned: %s\n", resource)
+			}
+			for _, note := range report.DestroyDryRunNotes {
+				fmt.Fprintf(cmd.OutOrStdout(), "destroy-preview: %s\n", note)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON")
+	return cmd
+}
+
+func (a *app) portalAuthCommand() *cobra.Command {
+	cmd := &cobra.Command{Use: "auth", Short: "Manage portal target auth"}
+	cmd.AddCommand(a.portalAuthStatusCommand(), a.portalAuthLoginCommand(), a.portalAuthInheritCommand(), a.portalAuthRevokeCommand())
+	return cmd
+}
+
+func (a *app) portalAuthStatusCommand() *cobra.Command {
+	var provider string
+	var jsonOut bool
+	cmd := &cobra.Command{
+		Use:   "status <space-id> [portal-id]",
+		Short: "Show portal auth status",
+		Args:  cobra.RangeArgs(1, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			svc, err := a.portalService(cmd)
+			if err != nil {
+				return err
+			}
+			portalValue, _, err := svc.LoadPortal(portal.SelectOptions{SpaceID: args[0], PortalID: optionalPortalID(args)})
+			if err != nil {
+				return err
+			}
+			auth := portalValue.Auth
+			if provider != "" && provider != "all" {
+				if err := portal.ValidateProviderName(provider); err != nil {
+					return err
+				}
+				filtered := auth.Providers[:0]
+				for _, current := range auth.Providers {
+					if current.Provider == provider {
+						filtered = append(filtered, current)
+					}
+				}
+				auth.Providers = filtered
+			}
+			if jsonOut {
+				return writeJSON(cmd.OutOrStdout(), auth)
+			}
+			for _, current := range auth.Providers {
+				fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\n", current.Provider, current.Mode, current.Status)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&provider, "provider", "all", "provider: codex, claude, cursor, or all")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON")
+	return cmd
+}
+
+func (a *app) portalAuthLoginCommand() *cobra.Command {
+	var provider, method string
+	var dryRun bool
+	cmd := &cobra.Command{
+		Use:   "login <space-id> [portal-id]",
+		Short: "Run provider-native login inside the portal",
+		Args:  cobra.RangeArgs(1, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.runPortalPlanningCommand(cmd, func(svc portal.Service) (portal.Plan, error) {
+				return svc.PlanAuthLogin(cmd.Context(), portal.AuthCommandOptions{SpaceID: args[0], PortalID: optionalPortalID(args), Provider: provider, Method: portal.AuthMode(method), DryRun: dryRun})
+			}, dryRun, false)
+		},
+	}
+	cmd.Flags().StringVar(&provider, "provider", "codex", "provider: codex, claude, or cursor")
+	cmd.Flags().StringVar(&method, "method", "native", "login method")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print command without running")
+	return cmd
+}
+
+func (a *app) portalAuthInheritCommand() *cobra.Command {
+	var provider, method string
+	var dryRun, yes bool
+	cmd := &cobra.Command{
+		Use:   "inherit <space-id> [portal-id]",
+		Short: "Explicitly inherit auth into the portal",
+		Args:  cobra.RangeArgs(1, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.runPortalPlanningCommand(cmd, func(svc portal.Service) (portal.Plan, error) {
+				return svc.PlanAuthInherit(cmd.Context(), portal.AuthCommandOptions{SpaceID: args[0], PortalID: optionalPortalID(args), Provider: provider, Method: portal.AuthMode(method), DryRun: dryRun, Yes: yes})
+			}, dryRun, false)
+		},
+	}
+	cmd.Flags().StringVar(&provider, "provider", "codex", "provider: codex, claude, or cursor")
+	cmd.Flags().StringVar(&method, "method", "", "inherit method: env, volume, ssh-forward, or copy-cache")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print command without running")
+	cmd.Flags().BoolVar(&yes, "yes", false, "confirm explicit inherit behavior")
+	return cmd
+}
+
+func (a *app) portalAuthRevokeCommand() *cobra.Command {
+	var provider, target string
+	var dryRun, yes bool
+	cmd := &cobra.Command{
+		Use:   "revoke <space-id> [portal-id]",
+		Short: "Revoke target-local portal auth",
+		Args:  cobra.RangeArgs(1, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.runPortalPlanningCommand(cmd, func(svc portal.Service) (portal.Plan, error) {
+				return svc.PlanAuthRevoke(cmd.Context(), portal.AuthCommandOptions{SpaceID: args[0], PortalID: optionalPortalID(args), Provider: provider, Target: target, DryRun: dryRun, Yes: yes})
+			}, dryRun, false)
+		},
+	}
+	cmd.Flags().StringVar(&provider, "provider", "codex", "provider: codex, claude, or cursor")
+	cmd.Flags().StringVar(&target, "target", "portal", "target: local, portal, or all")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print command without running")
+	cmd.Flags().BoolVar(&yes, "yes", false, "confirm revocation")
+	return cmd
+}
+
+func (a *app) portalUpCommand() *cobra.Command {
+	var attach, workdir string
+	var printCommand, dryRun bool
+	cmd := &cobra.Command{
+		Use:   "up <space-id> [portal-id]",
+		Short: "Start or validate portal runtime",
+		Args:  cobra.RangeArgs(1, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.runPortalPlanningCommand(cmd, func(svc portal.Service) (portal.Plan, error) {
+				return svc.PlanUp(cmd.Context(), portal.UpOptions{SpaceID: args[0], PortalID: optionalPortalID(args), Attach: attach, Workdir: workdir, DryRun: dryRun})
+			}, dryRun, printCommand)
+		},
+	}
+	cmd.Flags().StringVar(&attach, "attach", "none", "attach mode: shell or none")
+	cmd.Flags().StringVar(&workdir, "workdir", "", "portal working directory")
+	cmd.Flags().BoolVar(&printCommand, "print-command", false, "print commands without running")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print commands without running")
+	cmd.Flags().Bool("json", false, "reserved for future machine-readable execution status")
+	return cmd
+}
+
+func (a *app) portalSyncCommand() *cobra.Command {
+	var direction, mode string
+	var includes, excludes []string
+	var referencesOnly, deleteFiles, allowDirty, dryRun, yes bool
+	var maxDelete int
+	cmd := &cobra.Command{
+		Use:   "sync <space-id> [portal-id]",
+		Short: "Sync workspace files with the portal target",
+		Args:  cobra.RangeArgs(1, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.runPortalPlanningCommand(cmd, func(svc portal.Service) (portal.Plan, error) {
+				return svc.PlanSync(cmd.Context(), portal.SyncOptions{SpaceID: args[0], PortalID: optionalPortalID(args), Direction: portal.SyncDirection(direction), Mode: portal.SyncMode(mode), ReferencesOnly: referencesOnly, Include: includes, Exclude: excludes, Delete: deleteFiles, MaxDelete: maxDelete, AllowDirty: allowDirty, DryRun: dryRun, Yes: yes})
+			}, dryRun, false)
+		},
+	}
+	cmd.Flags().StringVar(&direction, "direction", "to", "sync direction: to, from, or both")
+	cmd.Flags().StringVar(&mode, "mode", "", "sync mode: auto, mount, rsync, or reconstruct")
+	cmd.Flags().BoolVar(&referencesOnly, "references-only", false, "sync only references")
+	cmd.Flags().StringArrayVar(&includes, "include", nil, "include pattern")
+	cmd.Flags().StringArrayVar(&excludes, "exclude", nil, "exclude pattern")
+	cmd.Flags().BoolVar(&deleteFiles, "delete", false, "delete files missing from source")
+	cmd.Flags().IntVar(&maxDelete, "max-delete", 0, "maximum deletes after dry-run parsing")
+	cmd.Flags().BoolVar(&allowDirty, "allow-dirty", false, "allow destructive pull with dirty edits")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview sync")
+	cmd.Flags().BoolVar(&yes, "yes", false, "confirm sync")
+	return cmd
+}
+
+func (a *app) portalShellCommand() *cobra.Command {
+	var cwd, user, ttyMode string
+	var printCommand bool
+	cmd := &cobra.Command{
+		Use:   "shell <space-id> [portal-id]",
+		Short: "Open a shell in the portal",
+		Args:  cobra.RangeArgs(1, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !printCommand && !a.commandIsTerminal(cmd) {
+				printCommand = true
+				fmt.Fprintln(cmd.OutOrStdout(), "Non-interactive terminal detected; printing shell command instead of launching.")
+			}
+			return a.runPortalPlanningCommand(cmd, func(svc portal.Service) (portal.Plan, error) {
+				return svc.PlanShell(cmd.Context(), portal.ShellOptions{SpaceID: args[0], PortalID: optionalPortalID(args), CWD: cwd, User: user, TTY: portal.TTYMode(ttyMode)})
+			}, false, printCommand)
+		},
+	}
+	cmd.Flags().StringVar(&cwd, "cwd", "", "working directory inside portal")
+	cmd.Flags().StringVar(&user, "user", "", "user inside portal")
+	cmd.Flags().StringVar(&ttyMode, "tty", "auto", "tty mode: auto, always, or never")
+	cmd.Flags().BoolVar(&printCommand, "print-command", false, "print shell command instead of running")
+	return cmd
+}
+
+func (a *app) portalExecCommand() *cobra.Command {
+	var cwd, user, ttyMode string
+	var dryRun bool
+	cmd := &cobra.Command{
+		Use:   "exec <space-id> [portal-id] -- <command...>",
+		Short: "Run a command in the portal",
+		Args:  cobra.MinimumNArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			svc, err := a.portalService(cmd)
+			if err != nil {
+				return err
+			}
+			spaceID, portalID, argv := splitPortalExecArgs(svc, args)
+			return a.runPortalPlanningCommand(cmd, func(svc portal.Service) (portal.Plan, error) {
+				return svc.PlanExec(cmd.Context(), portal.ExecOptions{SpaceID: spaceID, PortalID: portalID, Command: argv, CWD: cwd, User: user, TTY: portal.TTYMode(ttyMode)})
+			}, dryRun, false)
+		},
+	}
+	cmd.Flags().StringVar(&cwd, "cwd", "", "working directory inside portal")
+	cmd.Flags().StringVar(&user, "user", "", "user inside portal")
+	cmd.Flags().StringVar(&ttyMode, "tty", "never", "tty mode: auto, always, or never")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print command without running")
+	cmd.Flags().Bool("json", false, "reserved for future machine-readable execution output")
+	return cmd
+}
+
+func (a *app) portalSummonCommand() *cobra.Command {
+	var with, mode, permission string
+	var printCommand, dryRun bool
+	cmd := &cobra.Command{
+		Use:   "summon <space-id> [portal-id]",
+		Short: "Launch a coding agent inside the portal",
+		Args:  cobra.RangeArgs(1, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if mode == "print" {
+				printCommand = true
+			}
+			if !printCommand && !a.commandIsTerminal(cmd) {
+				printCommand = true
+				fmt.Fprintln(cmd.OutOrStdout(), "Non-interactive terminal detected; printing summon command instead of launching.")
+			}
+			return a.runPortalPlanningCommand(cmd, func(svc portal.Service) (portal.Plan, error) {
+				return svc.PlanSummon(cmd.Context(), portal.SummonOptions{SpaceID: args[0], PortalID: optionalPortalID(args), With: with, Mode: mode, Permission: permission, DryRun: dryRun})
+			}, dryRun, printCommand)
+		},
+	}
+	cmd.Flags().StringVar(&with, "with", "codex", "summoner: codex, claude, or cursor")
+	cmd.Flags().StringVar(&mode, "mode", "foreground", "mode: foreground, tmux, headless, or print")
+	cmd.Flags().StringVar(&permission, "permission", "workspace-write", "permission: read-only or workspace-write")
+	cmd.Flags().BoolVar(&printCommand, "print-command", false, "print command without launching")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print command without launching")
+	cmd.Flags().Bool("json", false, "reserved for future machine-readable launch status")
+	return cmd
+}
+
+func (a *app) portalLogsCommand() *cobra.Command {
+	var agentName string
+	var follow bool
+	var tail int
+	cmd := &cobra.Command{
+		Use:   "logs <space-id> [portal-id]",
+		Short: "Show portal runtime or agent logs",
+		Args:  cobra.RangeArgs(1, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.runPortalPlanningCommand(cmd, func(svc portal.Service) (portal.Plan, error) {
+				return svc.PlanLogs(cmd.Context(), portal.LogsOptions{SpaceID: args[0], PortalID: optionalPortalID(args), Agent: agentName, Follow: follow, Tail: tail})
+			}, true, true)
+		},
+	}
+	cmd.Flags().StringVar(&agentName, "agent", "", "agent session name")
+	cmd.Flags().BoolVar(&follow, "follow", false, "follow logs")
+	cmd.Flags().IntVar(&tail, "tail", 100, "number of lines")
+	return cmd
+}
+
+func (a *app) portalDownCommand() *cobra.Command {
+	var timeout int
+	var force, dryRun bool
+	cmd := &cobra.Command{
+		Use:   "down <space-id> [portal-id]",
+		Short: "Stop a Stave-owned portal runtime",
+		Args:  cobra.RangeArgs(1, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.runPortalPlanningCommand(cmd, func(svc portal.Service) (portal.Plan, error) {
+				return svc.PlanDown(cmd.Context(), portal.DownOptions{SpaceID: args[0], PortalID: optionalPortalID(args), Timeout: timeout, Force: force, DryRun: dryRun})
+			}, dryRun, false)
+		},
+	}
+	cmd.Flags().IntVar(&timeout, "timeout", 0, "graceful stop timeout")
+	cmd.Flags().BoolVar(&force, "force", false, "force stop")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print command without running")
+	return cmd
+}
+
+func (a *app) portalDetachCommand() *cobra.Command {
+	var dryRun, yes bool
+	cmd := &cobra.Command{
+		Use:   "detach <space-id> [portal-id]",
+		Short: "Remove attach-only portal metadata",
+		Args:  cobra.RangeArgs(1, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_ = yes
+			svc, err := a.portalService(cmd)
+			if err != nil {
+				return err
+			}
+			plan, err := svc.Detach(portal.DetachOptions{SpaceID: args[0], PortalID: optionalPortalID(args), DryRun: dryRun})
+			if err != nil {
+				return err
+			}
+			printPortalPlan(cmd.OutOrStdout(), plan)
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview without writing")
+	cmd.Flags().BoolVar(&yes, "yes", false, "confirm detach")
+	return cmd
+}
+
+func (a *app) portalDestroyCommand() *cobra.Command {
+	var timeout int
+	var deleteVolumes, deleteRemoteData, force, dryRun bool
+	cmd := &cobra.Command{
+		Use:   "destroy <space-id> [portal-id]",
+		Short: "Destroy Stave-owned portal runtime resources",
+		Args:  cobra.RangeArgs(1, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.runPortalPlanningCommand(cmd, func(svc portal.Service) (portal.Plan, error) {
+				return svc.PlanDestroy(cmd.Context(), portal.DestroyOptions{SpaceID: args[0], PortalID: optionalPortalID(args), Timeout: timeout, DeleteVolumes: deleteVolumes, DeleteRemoteData: deleteRemoteData, Force: force, DryRun: dryRun})
+			}, dryRun, false)
+		},
+	}
+	cmd.Flags().IntVar(&timeout, "timeout", 0, "graceful stop timeout")
+	cmd.Flags().BoolVar(&deleteVolumes, "delete-volumes", false, "delete recorded Stave-owned volumes")
+	cmd.Flags().BoolVar(&deleteRemoteData, "delete-remote-data", false, "delete exact recorded remote data when supported")
+	cmd.Flags().BoolVar(&force, "force", false, "force destroy")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print commands without running")
+	return cmd
+}
+
 func (a *app) addCommand() *cobra.Command {
 	var edit bool
 	var reference bool
@@ -635,6 +1391,120 @@ func (a *app) serviceWithDryRun(cmd *cobra.Command, dryRun bool) (space.Service,
 	return space.NewService(*cfg, client, cmd.OutOrStdout()), nil
 }
 
+func (a *app) portalService(cmd *cobra.Command) (portal.Service, error) {
+	cfg, _, err := a.loadConfig()
+	if err != nil {
+		return portal.Service{}, err
+	}
+	return portal.NewService(*cfg, a.effectivePortalRunner(), nil), nil
+}
+
+func (a *app) runPortalPlanningCommand(cmd *cobra.Command, build func(portal.Service) (portal.Plan, error), dryRun bool, printOnly bool) error {
+	svc, err := a.portalService(cmd)
+	if err != nil {
+		return err
+	}
+	plan, err := build(svc)
+	if err != nil {
+		return err
+	}
+	printPortalPlan(cmd.OutOrStdout(), plan)
+	if dryRun || printOnly || len(plan.Commands) == 0 {
+		return nil
+	}
+	previousFailed := false
+	for _, command := range plan.Commands {
+		if command.RunIfPreviousFailed && !previousFailed {
+			continue
+		}
+		result, err := svc.Runner.Run(cmd.Context(), command)
+		if err != nil {
+			previousFailed = true
+			if command.ContinueOnError {
+				continue
+			}
+			return portalCommandError(command, result, err)
+		}
+		previousFailed = false
+	}
+	return nil
+}
+
+func portalCommandError(command portal.Command, result portal.RunResult, err error) error {
+	output := strings.TrimSpace(firstNonEmpty(result.Stderr, result.Stdout))
+	if output == "" {
+		return fmt.Errorf("%s failed: %w", command.String(), err)
+	}
+	return fmt.Errorf("%s failed: %w: %s", command.String(), err, output)
+}
+
+func printPortalPlan(out io.Writer, plan portal.Plan) {
+	if plan.Summary != "" {
+		fmt.Fprintf(out, "Plan: %s\n", plan.Summary)
+	}
+	if len(plan.Commands) > 0 {
+		fmt.Fprintln(out, "Commands:")
+		for _, command := range plan.EquivalentCommands() {
+			fmt.Fprintf(out, "  %s\n", command)
+		}
+	}
+	if plan.ManifestPreview != "" {
+		fmt.Fprintln(out, "Manifest preview:")
+		_, _ = fmt.Fprint(out, plan.ManifestPreview)
+		if !strings.HasSuffix(plan.ManifestPreview, "\n") {
+			fmt.Fprintln(out)
+		}
+	}
+	for _, diagnostic := range plan.Diagnostics {
+		fmt.Fprintf(out, "[%s] %s: %s\n", diagnostic.Severity, diagnostic.Code, diagnostic.Message)
+		if diagnostic.NextAction != "" {
+			fmt.Fprintf(out, "  next: %s\n", diagnostic.NextAction)
+		}
+	}
+}
+
+func optionalPortalID(args []string) string {
+	if len(args) > 1 {
+		return args[1]
+	}
+	return ""
+}
+
+func guidedPortalKind(preset string) string {
+	if preset == "claude-devcontainer" {
+		return "devcontainer"
+	}
+	return "container"
+}
+
+func guidedPortalCommand(spaceID, portalID, kind, preset string) string {
+	parts := []string{"stave", "portal", "init", kind, spaceID}
+	if portalID != "" {
+		parts = append(parts, portalID)
+	}
+	if preset != "" {
+		parts = append(parts, "--preset", preset)
+	}
+	return strings.Join(parts, " ")
+}
+
+func guidedPortalPreview(ctx context.Context, svc portal.Service, spaceID, portalID, kind, preset string) (portal.Plan, error) {
+	if kind == "devcontainer" {
+		return svc.InitDevcontainer(ctx, portal.InitDevcontainerOptions{SpaceID: spaceID, PortalID: portalID, Preset: preset, DryRun: true})
+	}
+	return svc.InitContainer(ctx, portal.InitContainerOptions{SpaceID: spaceID, PortalID: portalID, Preset: preset, DryRun: true})
+}
+
+func splitPortalExecArgs(svc portal.Service, args []string) (string, string, []string) {
+	spaceID := args[0]
+	if len(args) >= 3 {
+		if _, _, err := svc.LoadPortal(portal.SelectOptions{SpaceID: spaceID, PortalID: args[1]}); err == nil {
+			return spaceID, args[1], args[2:]
+		}
+	}
+	return spaceID, "", args[1:]
+}
+
 func (a *app) runSummon(cmd *cobra.Command, cfg config.Config, spaceID string, summoner string, printCommand bool) error {
 	svc := summon.NewService(cfg, a.effectiveSummonLauncher(), cmd.OutOrStdout())
 	svc.Interactive = a.commandIsTerminal(cmd)
@@ -760,7 +1630,10 @@ func readSecret(cmd *cobra.Command, reader *bufio.Reader, label string) (string,
 }
 
 func confirm(in io.Reader, out io.Writer) (bool, error) {
-	reader := bufio.NewReader(in)
+	reader, ok := in.(*bufio.Reader)
+	if !ok {
+		reader = bufio.NewReader(in)
+	}
 	if _, err := fmt.Fprint(out, "\nProceed? [y/N]: "); err != nil {
 		return false, err
 	}
@@ -772,7 +1645,66 @@ func confirm(in io.Reader, out io.Writer) (bool, error) {
 	return value == "y" || value == "yes", nil
 }
 
+func collectQuestionAnswers(in io.Reader, out io.Writer, result agent.RunResult) (string, error) {
+	reader, ok := in.(*bufio.Reader)
+	if !ok {
+		reader = bufio.NewReader(in)
+	}
+	if result.Message != "" {
+		fmt.Fprintf(out, "%s\n", result.Message)
+	}
+	var b strings.Builder
+	for _, question := range result.Questions {
+		answer := ""
+		var err error
+		if len(question.Options) > 0 {
+			fmt.Fprintf(out, "%s\n", question.Prompt)
+			for i, option := range question.Options {
+				fmt.Fprintf(out, "  %d. %s\n", i+1, option)
+			}
+			answer, err = promptDefault(reader, out, "Answer", question.Options[0])
+		} else {
+			for {
+				fmt.Fprintf(out, "%s: ", question.Prompt)
+				answer, err = reader.ReadString('\n')
+				if err != nil && err != io.EOF {
+					return "", err
+				}
+				answer = strings.TrimSpace(answer)
+				if answer != "" || !question.Required {
+					break
+				}
+				fmt.Fprintln(out, "A value is required.")
+			}
+		}
+		if err != nil && err != io.EOF {
+			return "", err
+		}
+		answer = strings.TrimSpace(answer)
+		if answer == "" && len(question.Options) > 0 {
+			answer = question.Options[0]
+		}
+		fmt.Fprintf(&b, "- %s: %s\n", question.ID, answer)
+	}
+	return b.String(), nil
+}
+
 func printAgentPlan(out io.Writer, result agent.RunResult) {
+	if result.Status != "" && result.Status != agent.RunStatusPlanReady {
+		fmt.Fprintf(out, "Status: %s\n", result.Status)
+	}
+	if result.Message != "" && result.Message != result.Plan.Summary {
+		fmt.Fprintf(out, "Message: %s\n", result.Message)
+	}
+	if len(result.Questions) > 0 {
+		fmt.Fprintln(out, "Questions:")
+		for _, question := range result.Questions {
+			fmt.Fprintf(out, "  - %s\n", question.Prompt)
+			if len(question.Options) > 0 {
+				fmt.Fprintf(out, "    options: %s\n", strings.Join(question.Options, ", "))
+			}
+		}
+	}
 	if result.Plan.Summary != "" {
 		fmt.Fprintf(out, "Plan: %s\n", result.Plan.Summary)
 	} else {
@@ -807,7 +1739,8 @@ func printAgentPlan(out io.Writer, result agent.RunResult) {
 func writeJSON(out io.Writer, value any) error {
 	encoder := json.NewEncoder(out)
 	encoder.SetIndent("", "  ")
-	return encoder.Encode(value)
+	encoder.SetEscapeHTML(false)
+	return encoder.Encode(agent.RedactForJSON(value))
 }
 
 func (a *app) effectiveProviderFactory() agent.ProviderFactory {
@@ -829,6 +1762,10 @@ func (a *app) effectiveSummonLauncher() summon.Launcher {
 		return a.summonLauncher
 	}
 	return summon.ExecLauncher{}
+}
+
+func (a *app) effectivePortalRunner() portal.Runner {
+	return a.portalRunner
 }
 
 func (a *app) commandIsTerminal(cmd *cobra.Command) bool {

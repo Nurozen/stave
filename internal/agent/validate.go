@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/Nurozen/stave/internal/config"
+	"github.com/Nurozen/stave/internal/portal"
 	"github.com/Nurozen/stave/internal/space"
 	"github.com/Nurozen/stave/internal/summon"
 )
@@ -16,18 +17,26 @@ func ValidatePlan(cfg config.Config, plan Plan) error {
 		return nil
 	}
 	plannedSpaces := map[string]bool{}
+	plannedPortals := map[string]string{}
+	plannedAuth := map[string]bool{}
 	for i, op := range plan.Operations {
-		if err := validateOperation(cfg, op, plannedSpaces); err != nil {
+		if err := validateOperation(cfg, op, plannedSpaces, plannedPortals, plannedAuth); err != nil {
 			return fmt.Errorf("operation %d (%s): %w", i+1, op.Type, err)
 		}
 		if op.Type == OpSpaceCreate {
 			plannedSpaces[op.SpaceID] = true
 		}
+		if op.Type == OpPortalInit || op.Type == OpPortalAttach {
+			plannedPortals[portalPlanKey(op.SpaceID, op.PortalID)] = op.Driver
+		}
+		if op.Type == OpPortalAuthLogin || op.Type == OpPortalAuthInherit {
+			plannedAuth[portalAuthPlanKey(op.SpaceID, op.PortalID, op.Provider)] = true
+		}
 	}
 	return nil
 }
 
-func validateOperation(cfg config.Config, op Operation, plannedSpaces map[string]bool) error {
+func validateOperation(cfg config.Config, op Operation, plannedSpaces map[string]bool, plannedPortals map[string]string, plannedAuth map[string]bool) error {
 	switch op.Type {
 	case OpSpaceCreate:
 		if err := config.ValidateName("space id", op.SpaceID); err != nil {
@@ -117,6 +126,90 @@ func validateOperation(cfg config.Config, op Operation, plannedSpaces map[string
 				return fmt.Errorf("repo %q is not registered", op.Repo)
 			}
 		}
+	case OpPortalList:
+		if op.SpaceID != "" {
+			return validatePortalSpace(cfg, op.SpaceID, plannedSpaces)
+		}
+	case OpPortalStatus, OpPortalDoctor, OpPortalInspect, OpPortalAuthStatus, OpPortalLogs, OpPortalDestroyPreview:
+		if err := validatePortalSpace(cfg, op.SpaceID, plannedSpaces); err != nil {
+			return err
+		}
+		if op.Type == OpPortalLogs {
+			if op.Follow {
+				return fmt.Errorf("portal logs follow mode is unsupported for agent planning")
+			}
+			if op.Tail <= 0 {
+				return fmt.Errorf("portal logs requires a positive tail")
+			}
+		}
+		return validatePortalExists(cfg, op, plannedPortals)
+	case OpPortalInit:
+		if err := validatePortalSpace(cfg, op.SpaceID, plannedSpaces); err != nil {
+			return err
+		}
+		if err := validatePortalID(op.PortalID); err != nil {
+			return err
+		}
+		if op.Driver != string(portal.DriverDocker) && op.Driver != string(portal.DriverDevcontainer) {
+			return fmt.Errorf("portal init driver must be docker or devcontainer")
+		}
+		if portalExists(cfg, op.SpaceID, op.PortalID) || plannedPortals[portalPlanKey(op.SpaceID, op.PortalID)] != "" {
+			return fmt.Errorf("portal %q already exists in space %q", portalID(op.PortalID), op.SpaceID)
+		}
+		if op.Repo != "" {
+			if _, ok := cfg.Repos[op.Repo]; !ok {
+				return fmt.Errorf("repo %q is not registered", op.Repo)
+			}
+		}
+		return validatePortalPaths(op)
+	case OpPortalAttach:
+		if err := validatePortalSpace(cfg, op.SpaceID, plannedSpaces); err != nil {
+			return err
+		}
+		if err := validatePortalID(op.PortalID); err != nil {
+			return err
+		}
+		if op.Driver != string(portal.DriverSSH) && op.Driver != string(portal.DriverEC2Attach) {
+			return fmt.Errorf("portal attach driver must be ssh or ec2-attach")
+		}
+		if op.Driver == string(portal.DriverSSH) && op.Host == "" {
+			return fmt.Errorf("ssh portal attach requires host")
+		}
+		if op.Driver == string(portal.DriverEC2Attach) && op.InstanceID == "" {
+			return fmt.Errorf("ec2-attach portal attach requires instance_id")
+		}
+		if portalExists(cfg, op.SpaceID, op.PortalID) || plannedPortals[portalPlanKey(op.SpaceID, op.PortalID)] != "" {
+			return fmt.Errorf("portal %q already exists in space %q", portalID(op.PortalID), op.SpaceID)
+		}
+		return validatePortalPaths(op)
+	case OpPortalConfigure, OpPortalAuthLogin, OpPortalAuthInherit, OpPortalAuthRevoke, OpPortalUp, OpPortalSync, OpPortalSummon, OpPortalDown, OpPortalDetach:
+		if err := validatePortalSpace(cfg, op.SpaceID, plannedSpaces); err != nil {
+			return err
+		}
+		driver, err := portalDriverForPlan(cfg, op, plannedPortals)
+		if err != nil {
+			return err
+		}
+		if err := validatePortalPaths(op); err != nil {
+			return err
+		}
+		if op.Type == OpPortalAuthInherit && op.Method == string(portal.AuthCopyCache) {
+			return fmt.Errorf("agent-planned portal auth inherit cannot use copy-cache")
+		}
+		if op.Type == OpPortalDown && isAttachOnlyPortalDriver(driver) {
+			return fmt.Errorf("portal down is only valid for Stave-owned local runtimes; use portal detach for attach-only portals")
+		}
+		if op.Type == OpPortalDetach && !isAttachOnlyPortalDriver(driver) {
+			return fmt.Errorf("portal detach is only valid for attach-only portals")
+		}
+		if op.Type == OpPortalSync && op.Delete && op.MaxDelete <= 0 {
+			return fmt.Errorf("portal sync delete requires a positive max_delete")
+		}
+		if op.Type == OpPortalSummon {
+			if err := validatePortalSummonAuth(cfg, op, plannedAuth); err != nil {
+				return err
+			}
+		}
 	default:
 		return fmt.Errorf("unsupported operation")
 	}
@@ -165,4 +258,124 @@ func validateRefish(label, value string) error {
 func spaceExists(cfg config.Config, id string) bool {
 	_, err := os.Stat(filepath.Join(cfg.AgentWorkDir, id, space.ManifestName))
 	return err == nil
+}
+
+func validatePortalSpace(cfg config.Config, id string, plannedSpaces map[string]bool) error {
+	if err := config.ValidateName("space id", id); err != nil {
+		return err
+	}
+	if !spaceExists(cfg, id) && !plannedSpaces[id] {
+		return fmt.Errorf("space %q does not exist", id)
+	}
+	return nil
+}
+
+func validatePortalID(id string) error {
+	if id == "" {
+		return nil
+	}
+	return config.ValidateName("portal id", id)
+}
+
+func portalPlanKey(spaceID, portalIDValue string) string {
+	return spaceID + "\x00" + portalID(portalIDValue)
+}
+
+func portalAuthPlanKey(spaceID, portalIDValue, provider string) string {
+	return portalPlanKey(spaceID, portalIDValue) + "\x00" + provider
+}
+
+func portalExists(cfg config.Config, spaceID, portalIDValue string) bool {
+	manifest, err := portal.LoadManifest(filepath.Join(cfg.AgentWorkDir, spaceID))
+	if err != nil {
+		return false
+	}
+	_, ok := manifest.Portals[portalID(portalIDValue)]
+	return ok
+}
+
+func portalDriverForPlan(cfg config.Config, op Operation, plannedPortals map[string]string) (string, error) {
+	key := portalPlanKey(op.SpaceID, op.PortalID)
+	if driver := plannedPortals[key]; driver != "" {
+		return driver, nil
+	}
+	manifest, err := portal.LoadManifest(filepath.Join(cfg.AgentWorkDir, op.SpaceID))
+	if err != nil {
+		return "", fmt.Errorf("portal %q does not exist in space %q", portalID(op.PortalID), op.SpaceID)
+	}
+	item, ok := manifest.Portals[portalID(op.PortalID)]
+	if !ok {
+		return "", fmt.Errorf("portal %q does not exist in space %q", portalID(op.PortalID), op.SpaceID)
+	}
+	return string(item.Driver), nil
+}
+
+func validatePortalExists(cfg config.Config, op Operation, plannedPortals map[string]string) error {
+	_, err := portalDriverForPlan(cfg, op, plannedPortals)
+	return err
+}
+
+func validatePortalSummonAuth(cfg config.Config, op Operation, plannedAuth map[string]bool) error {
+	provider := op.Summoner
+	if provider == "" {
+		provider = summon.Codex
+	}
+	if plannedAuth[portalAuthPlanKey(op.SpaceID, op.PortalID, provider)] {
+		return nil
+	}
+	manifest, err := portal.LoadManifest(filepath.Join(cfg.AgentWorkDir, op.SpaceID))
+	if err != nil {
+		return fmt.Errorf("portal summon requires confirmed %s auth or a preceding portal auth login/inherit operation", provider)
+	}
+	item, ok := manifest.Portals[portalID(op.PortalID)]
+	if !ok {
+		return fmt.Errorf("portal %q does not exist in space %q", portalID(op.PortalID), op.SpaceID)
+	}
+	for _, auth := range item.Auth.Providers {
+		if auth.Provider == provider && auth.Status == portal.AuthOK {
+			return nil
+		}
+	}
+	return fmt.Errorf("portal summon requires confirmed %s auth or a preceding portal auth login/inherit operation", provider)
+}
+
+func isAttachOnlyPortalDriver(driver string) bool {
+	return driver == string(portal.DriverSSH) || driver == string(portal.DriverEC2Attach)
+}
+
+func validatePortalPaths(op Operation) error {
+	for label, value := range map[string]string{
+		"identity_path":     op.IdentityPath,
+		"remote_root":       op.RemoteRoot,
+		"container_root":    op.ContainerRoot,
+		"devcontainer_path": op.DevcontainerPath,
+		"workdir":           op.Workdir,
+	} {
+		if err := validateSafePortalPath(label, value); err != nil {
+			return err
+		}
+	}
+	for _, value := range op.ComposeFiles {
+		if err := validateSafePortalPath("compose_file", value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateSafePortalPath(label, value string) error {
+	if value == "" {
+		return nil
+	}
+	if strings.ContainsAny(value, "\x00\r\n") {
+		return fmt.Errorf("%s %q contains unsafe characters", label, value)
+	}
+	cleaned := filepath.Clean(value)
+	if cleaned == "." || cleaned == string(filepath.Separator) {
+		return fmt.Errorf("%s %q is not a safe portal path", label, value)
+	}
+	if strings.Contains(value, "*") || strings.Contains(value, "?") {
+		return fmt.Errorf("%s %q must not contain glob characters", label, value)
+	}
+	return nil
 }

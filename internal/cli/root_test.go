@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/Nurozen/stave/internal/agent"
 	"github.com/Nurozen/stave/internal/config"
+	"github.com/Nurozen/stave/internal/portal"
 	"github.com/Nurozen/stave/internal/space"
 	"github.com/Nurozen/stave/internal/summon"
 	"github.com/spf13/cobra"
@@ -23,6 +25,33 @@ func TestCLIHelpCommands(t *testing.T) {
 		{"repos", "--help"},
 		{"space", "--help"},
 		{"space", "create", "--help"},
+		{"portal", "--help"},
+		{"portal", "init", "--help"},
+		{"portal", "init", "container", "--help"},
+		{"portal", "init", "devcontainer", "--help"},
+		{"portal", "attach", "--help"},
+		{"portal", "attach", "ssh", "--help"},
+		{"portal", "attach", "ec2", "--help"},
+		{"portal", "configure", "--help"},
+		{"portal", "drivers", "--help"},
+		{"portal", "doctor", "--help"},
+		{"portal", "list", "--help"},
+		{"portal", "status", "--help"},
+		{"portal", "inspect", "--help"},
+		{"portal", "auth", "--help"},
+		{"portal", "auth", "status", "--help"},
+		{"portal", "auth", "login", "--help"},
+		{"portal", "auth", "inherit", "--help"},
+		{"portal", "auth", "revoke", "--help"},
+		{"portal", "up", "--help"},
+		{"portal", "sync", "--help"},
+		{"portal", "shell", "--help"},
+		{"portal", "exec", "--help"},
+		{"portal", "summon", "--help"},
+		{"portal", "logs", "--help"},
+		{"portal", "down", "--help"},
+		{"portal", "detach", "--help"},
+		{"portal", "destroy", "--help"},
 		{"agent", "--help"},
 		{"summon", "--help"},
 	} {
@@ -126,6 +155,535 @@ func TestCLISummonPrintCommand(t *testing.T) {
 	}
 }
 
+func TestCLIReposListSyncAndRemove(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	srcA := createGitRepo(t, "repo-a")
+	srcB := createGitRepo(t, "repo-b")
+	runCLI(t, "setup")
+	runCLI(t, "repos", "add", "repo-b", srcB)
+	runCLI(t, "repos", "add", "repo-a", srcA)
+
+	listOut := runCLI(t, "repos", "list")
+	if !strings.Contains(listOut, "repo-a\t") || !strings.Contains(listOut, "repo-b\t") || strings.Index(listOut, "repo-a") > strings.Index(listOut, "repo-b") {
+		t.Fatalf("repos list output = %s", listOut)
+	}
+	syncOne := runCLI(t, "repos", "sync", "repo-a")
+	if !strings.Contains(syncOne, "synced repo-a") || strings.Contains(syncOne, "repo-b") {
+		t.Fatalf("single repo sync output = %s", syncOne)
+	}
+	syncAll := runCLI(t, "repos", "sync")
+	if !strings.Contains(syncAll, "synced repo-a") || !strings.Contains(syncAll, "synced repo-b") {
+		t.Fatalf("all repo sync output = %s", syncAll)
+	}
+	removeOut := runCLI(t, "repos", "remove", "repo-a")
+	if !strings.Contains(removeOut, "unregistered repo-a") {
+		t.Fatalf("remove output = %s", removeOut)
+	}
+	listOut = runCLI(t, "repos", "list")
+	if strings.Contains(listOut, "repo-a\t") || !strings.Contains(listOut, "repo-b\t") {
+		t.Fatalf("repos list after remove = %s", listOut)
+	}
+	if out, err := runCLIError(t, nil, "repos", "sync", "missing"); err == nil || !strings.Contains(out, "not registered") {
+		t.Fatalf("expected missing repo sync error, err=%v out=%s", err, out)
+	}
+	if out, err := runCLIError(t, nil, "repos", "remove", "missing"); err == nil || !strings.Contains(out, "not registered") {
+		t.Fatalf("expected missing repo remove error, err=%v out=%s", err, out)
+	}
+}
+
+func TestCLIReposAddDryRunAndDuplicate(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	src := createGitRepo(t, "repo-a")
+	runCLI(t, "setup")
+
+	dryRun := runCLI(t, "repos", "add", "dry", src, "--dry-run")
+	if !strings.Contains(dryRun, "dry-run: create") || !strings.Contains(dryRun, "registered dry") {
+		t.Fatalf("repos add dry-run output = %s", dryRun)
+	}
+	if list := runCLI(t, "repos", "list"); strings.Contains(list, "dry\t") {
+		t.Fatalf("dry-run repo was persisted:\n%s", list)
+	}
+
+	runCLI(t, "repos", "add", "repo-a", src)
+	if out, err := runCLIError(t, nil, "repos", "add", "repo-a", src); err == nil || !strings.Contains(out, "already registered") {
+		t.Fatalf("expected duplicate repo error, err=%v out=%s", err, out)
+	}
+}
+
+func TestCLIPortalContainerStatusAndConfigure(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	runCLI(t, "setup")
+	runCLI(t, "space", "init", "ex-1234")
+
+	out := runCLI(t, "portal", "init", "container", "ex-1234", "--image", "ubuntu:latest", "--container-root", "/workspace/ex-1234")
+	if !strings.Contains(out, "record docker portal default") {
+		t.Fatalf("init output = %s", out)
+	}
+	spacePath := filepath.Join(home, "stave", "agent-work", "ex-1234")
+	manifest, err := portal.LoadManifest(spacePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Portals["default"].Runtime.Image != "ubuntu:latest" {
+		t.Fatalf("portal manifest = %#v", manifest.Portals["default"])
+	}
+
+	statusOut := runCLI(t, "portal", "status", "ex-1234", "--json")
+	var status portal.Status
+	if err := json.Unmarshal([]byte(statusOut), &status); err != nil {
+		t.Fatalf("invalid status JSON:\n%s\n%v", statusOut, err)
+	}
+	if status.SpaceID != "ex-1234" || status.PortalID != "default" || status.Driver != portal.DriverDocker {
+		t.Fatalf("status = %#v", status)
+	}
+
+	runCLI(t, "portal", "configure", "ex-1234", "--agent", "claude", "--auth", "volume")
+	manifest, err = portal.LoadManifest(spacePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Portals["default"].Auth.Mode != portal.AuthVolume {
+		t.Fatalf("auth = %#v", manifest.Portals["default"].Auth)
+	}
+}
+
+func TestCLIPortalReadCommandsTextAndJSON(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	runCLI(t, "setup")
+	runCLI(t, "space", "init", "ex-1234")
+	runCLI(t, "portal", "init", "container", "ex-1234", "--preset", "local-codex")
+
+	runner := &fakePortalRunner{result: portal.RunResult{Stdout: `[{"State":{"Status":"running","Health":{"Status":"healthy"}}}]`}}
+	application := &app{portalRunner: runner}
+
+	drivers := runCLIWithApp(t, application, "portal", "drivers")
+	if !strings.Contains(drivers, "docker\tcreate") || !strings.Contains(drivers, "ssh\tattach-only") {
+		t.Fatalf("drivers output = %s", drivers)
+	}
+
+	listText := runCLIWithApp(t, application, "portal", "list")
+	if !strings.Contains(listText, "ex-1234\tdefault\tdocker") {
+		t.Fatalf("portal list text = %s", listText)
+	}
+	listJSON := runCLIWithApp(t, application, "portal", "list", "ex-1234", "--json")
+	if !strings.Contains(listJSON, `"space_id"`) || strings.Contains(listJSON, `"SpaceID"`) {
+		t.Fatalf("portal list json keys = %s", listJSON)
+	}
+	var entries []portal.ListEntry
+	if err := json.Unmarshal([]byte(listJSON), &entries); err != nil || len(entries) != 1 || entries[0].SpaceID != "ex-1234" {
+		t.Fatalf("portal list json = %s err=%v entries=%#v", listJSON, err, entries)
+	}
+
+	statusText := runCLIWithApp(t, application, "portal", "status", "ex-1234")
+	if !strings.Contains(statusText, "portal default (ok)") || !strings.Contains(statusText, "state: running") {
+		t.Fatalf("portal status text = %s", statusText)
+	}
+	statusJSON := runCLIWithApp(t, application, "portal", "status", "ex-1234", "--json")
+	if !strings.Contains(statusJSON, `"portal_id"`) || strings.Contains(statusJSON, `"PortalID"`) {
+		t.Fatalf("portal status json keys = %s", statusJSON)
+	}
+	var status portal.Status
+	if err := json.Unmarshal([]byte(statusJSON), &status); err != nil || status.Overall != portal.OverallOK || status.Health != "healthy" {
+		t.Fatalf("portal status json = %s err=%v status=%#v", statusJSON, err, status)
+	}
+
+	doctorText := runCLIWithApp(t, application, "portal", "doctor", "ex-1234")
+	if !strings.Contains(doctorText, "portal default doctor (ok)") {
+		t.Fatalf("portal doctor text = %s", doctorText)
+	}
+	doctorJSON := runCLIWithApp(t, application, "portal", "doctor", "ex-1234", "--json")
+	if !strings.Contains(doctorJSON, `"overall"`) || strings.Contains(doctorJSON, `"Overall"`) {
+		t.Fatalf("portal doctor json keys = %s", doctorJSON)
+	}
+	var doctor portal.DoctorReport
+	if err := json.Unmarshal([]byte(doctorJSON), &doctor); err != nil || doctor.Overall != portal.OverallOK {
+		t.Fatalf("portal doctor json = %s err=%v doctor=%#v", doctorJSON, err, doctor)
+	}
+
+	inspectText := runCLIWithApp(t, application, "portal", "inspect", "ex-1234")
+	if !strings.Contains(inspectText, "portal: default") || !strings.Contains(inspectText, "destroy-preview: stop and remove Stave-owned container") {
+		t.Fatalf("portal inspect text = %s", inspectText)
+	}
+	inspectJSON := runCLIWithApp(t, application, "portal", "inspect", "ex-1234", "--json")
+	if !strings.Contains(inspectJSON, `"destroy_dry_run_notes"`) || strings.Contains(inspectJSON, `"DestroyDryRunNotes"`) {
+		t.Fatalf("portal inspect json keys = %s", inspectJSON)
+	}
+	var inspect portal.InspectReport
+	if err := json.Unmarshal([]byte(inspectJSON), &inspect); err != nil || inspect.Portal.ID != "default" || len(inspect.OwnedResources) == 0 {
+		t.Fatalf("portal inspect json = %s err=%v inspect=%#v", inspectJSON, err, inspect)
+	}
+
+	authText := runCLIWithApp(t, application, "portal", "auth", "status", "ex-1234", "--provider", "codex")
+	if !strings.Contains(authText, "codex\tnative\tunknown") {
+		t.Fatalf("portal auth text = %s", authText)
+	}
+	authJSON := runCLIWithApp(t, application, "portal", "auth", "status", "ex-1234", "--json")
+	var auth portal.Auth
+	if err := json.Unmarshal([]byte(authJSON), &auth); err != nil || len(auth.Providers) != 1 || auth.Providers[0].Provider != "codex" {
+		t.Fatalf("portal auth json = %s err=%v auth=%#v", authJSON, err, auth)
+	}
+	if filtered := runCLIWithApp(t, application, "portal", "auth", "status", "ex-1234", "--provider", "cursor"); strings.TrimSpace(filtered) != "" {
+		t.Fatalf("unexpected filtered auth output = %s", filtered)
+	}
+	if _, err := runCLIError(t, application, "portal", "auth", "status", "ex-1234", "--provider", "bad"); err == nil || !strings.Contains(err.Error(), "provider") {
+		t.Fatalf("expected bad auth status provider error, got %v", err)
+	}
+
+	missingRunner := &fakePortalRunner{missing: map[string]bool{"docker": true}}
+	missingDoctor := runCLIWithApp(t, &app{portalRunner: missingRunner}, "portal", "doctor", "ex-1234")
+	if !strings.Contains(missingDoctor, "driver.binary_missing") {
+		t.Fatalf("missing binary doctor output = %s", missingDoctor)
+	}
+}
+
+func TestCLIPortalGuidedInitPromptsPreviewsAndWritesAfterConfirm(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	runCLI(t, "setup")
+	runCLI(t, "space", "init", "ex-1234")
+
+	cmd := newRootCommand(&app{isTerminal: func(cmd *cobra.Command) bool { return true }})
+	cmd.SetArgs([]string{"portal", "init", "ex-1234", "guided"})
+	cmd.SetIn(strings.NewReader("devcontainer\ny\n"))
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("guided init error = %v\n%s", err, out.String())
+	}
+	output := out.String()
+	commandIndex := strings.Index(output, "Equivalent command: stave portal init devcontainer ex-1234 guided")
+	previewIndex := strings.Index(output, "Manifest preview:")
+	proceedIndex := strings.Index(output, "Proceed?")
+	if !strings.Contains(output, "Portal kind") ||
+		commandIndex == -1 ||
+		previewIndex == -1 ||
+		!strings.Contains(output, "driver: devcontainer") ||
+		proceedIndex == -1 {
+		t.Fatalf("guided output = %s", output)
+	}
+	if commandIndex > proceedIndex || previewIndex > proceedIndex {
+		t.Fatalf("guided preview must appear before confirmation:\n%s", output)
+	}
+	manifest, err := portal.LoadManifest(filepath.Join(home, "stave", "agent-work", "ex-1234"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Portals["guided"].Driver != portal.DriverDevcontainer {
+		t.Fatalf("guided portal = %#v", manifest.Portals["guided"])
+	}
+}
+
+func TestCLIPortalGuidedInitCancelDoesNotWrite(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	runCLI(t, "setup")
+	runCLI(t, "space", "init", "ex-1234")
+
+	cmd := newRootCommand(&app{isTerminal: func(cmd *cobra.Command) bool { return true }})
+	cmd.SetArgs([]string{"portal", "init", "ex-1234"})
+	cmd.SetIn(strings.NewReader("\nn\n"))
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("guided init cancel error = %v\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "cancelled") {
+		t.Fatalf("guided output = %s", out.String())
+	}
+	if _, err := os.Stat(filepath.Join(home, "stave", "agent-work", "ex-1234", portal.ManifestName)); !os.IsNotExist(err) {
+		t.Fatalf("cancel wrote portal manifest: %v", err)
+	}
+}
+
+func TestCLIPortalInitDryRunPrintsManifestPreview(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	runCLI(t, "setup")
+	runCLI(t, "space", "init", "ex-1234")
+
+	out := runCLI(t, "portal", "init", "container", "ex-1234", "--image", "alpine:3.20", "--dry-run")
+	if !strings.Contains(out, "Manifest preview:") || !strings.Contains(out, "image: alpine:3.20") || !strings.Contains(out, "manifest.preview") {
+		t.Fatalf("dry-run output = %s", out)
+	}
+	if _, err := os.Stat(filepath.Join(home, "stave", "agent-work", "ex-1234", portal.ManifestName)); !os.IsNotExist(err) {
+		t.Fatalf("dry-run wrote portal manifest: %v", err)
+	}
+}
+
+func TestCLIPortalDevcontainerSSHAndEC2(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	runCLI(t, "setup")
+	runCLI(t, "space", "init", "ex-1234")
+
+	runCLI(t, "portal", "init", "devcontainer", "ex-1234", "dev", "--path", ".devcontainer/devcontainer.json", "--service", "api")
+	runCLI(t, "portal", "attach", "ssh", "ex-1234", "devbox.example", "ssh-dev", "--preset", "ssh-codex")
+	runCLI(t, "portal", "attach", "ec2", "ex-1234", "i-123", "aws", "--region", "us-west-2", "--ssh-user", "ec2-user")
+
+	manifest, err := portal.LoadManifest(filepath.Join(home, "stave", "agent-work", "ex-1234"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Portals["dev"].Driver != portal.DriverDevcontainer || manifest.Portals["dev"].Runtime.Service != "api" {
+		t.Fatalf("devcontainer = %#v", manifest.Portals["dev"])
+	}
+	if manifest.Portals["ssh-dev"].Driver != portal.DriverSSH || manifest.Portals["ssh-dev"].Target.Host != "devbox.example" {
+		t.Fatalf("ssh = %#v", manifest.Portals["ssh-dev"])
+	}
+	if manifest.Portals["aws"].Driver != portal.DriverEC2Attach || manifest.Portals["aws"].Target.Region != "us-west-2" {
+		t.Fatalf("ec2 = %#v", manifest.Portals["aws"])
+	}
+}
+
+func TestCLIPortalDryRunShellSummonAndDetach(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	runCLI(t, "setup")
+	runCLI(t, "space", "init", "ex-1234")
+	runCLI(t, "portal", "attach", "ssh", "ex-1234", "devbox.example")
+
+	shellCmd := newRootCommand(&app{isTerminal: func(cmd *cobra.Command) bool { return false }})
+	shellCmd.SetArgs([]string{"portal", "shell", "ex-1234"})
+	var shellOut bytes.Buffer
+	shellCmd.SetOut(&shellOut)
+	shellCmd.SetErr(&shellOut)
+	if err := shellCmd.Execute(); err != nil {
+		t.Fatalf("portal shell error = %v\n%s", err, shellOut.String())
+	}
+	if !strings.Contains(shellOut.String(), "Non-interactive terminal detected") || !strings.Contains(shellOut.String(), "ssh") {
+		t.Fatalf("shell output = %s", shellOut.String())
+	}
+
+	summonOut := runCLI(t, "portal", "summon", "ex-1234", "--mode", "print", "--with", "codex")
+	if !strings.Contains(summonOut, "codex --cd") || !strings.Contains(summonOut, "portal auth login") {
+		t.Fatalf("summon output = %s", summonOut)
+	}
+	runCLI(t, "portal", "detach", "ex-1234")
+	manifest, err := portal.LoadManifest(filepath.Join(home, "stave", "agent-work", "ex-1234"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Portals) != 0 {
+		t.Fatalf("portal was not detached: %#v", manifest.Portals)
+	}
+}
+
+func TestCLIPortalPlanningCommandsExecuteAndPreview(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	runCLI(t, "setup")
+	runCLI(t, "space", "init", "ex-1234")
+	runCLI(t, "portal", "init", "container", "ex-1234")
+	runner := &fakePortalRunner{}
+	application := &app{portalRunner: runner, isTerminal: func(cmd *cobra.Command) bool { return true }}
+
+	for _, tc := range []struct {
+		name     string
+		args     []string
+		want     string
+		executes bool
+	}{
+		{name: "auth login", args: []string{"portal", "auth", "login", "ex-1234", "--provider", "codex", "--method", "native"}, want: "auth-login for codex", executes: true},
+		{name: "auth inherit", args: []string{"portal", "auth", "inherit", "ex-1234", "--provider", "codex", "--method", "env", "--yes"}, want: "auth-inherit for codex", executes: true},
+		{name: "auth revoke dry-run", args: []string{"portal", "auth", "revoke", "ex-1234", "--provider", "codex", "--target", "all", "--dry-run"}, want: "auth-revoke for codex"},
+		{name: "up executes", args: []string{"portal", "up", "ex-1234"}, want: "start or validate portal default", executes: true},
+		{name: "up print command", args: []string{"portal", "up", "ex-1234", "--print-command"}, want: "docker start"},
+		{name: "up attach shell print command", args: []string{"portal", "up", "ex-1234", "--print-command", "--attach", "shell", "--workdir", "/workspace/ex-1234/references"}, want: "docker exec -it -w /workspace/ex-1234/references"},
+		{name: "exec executes", args: []string{"portal", "exec", "ex-1234", "default", "true"}, want: "run command in portal default", executes: true},
+		{name: "sync dry-run", args: []string{"portal", "sync", "ex-1234", "--dry-run", "--include", "*.go", "--exclude", ".git", "--delete", "--max-delete", "3", "--yes"}, want: "sync portal default"},
+		{name: "sync auto dry-run", args: []string{"portal", "sync", "ex-1234", "--dry-run", "--mode", "auto"}, want: "sync.mount_noop"},
+		{name: "logs preview", args: []string{"portal", "logs", "ex-1234", "--tail", "5", "--follow"}, want: "show logs for portal default"},
+		{name: "down dry-run", args: []string{"portal", "down", "ex-1234", "--timeout", "5", "--force", "--dry-run"}, want: "stop portal default"},
+		{name: "destroy dry-run", args: []string{"portal", "destroy", "ex-1234", "--timeout", "5", "--delete-volumes", "--force", "--dry-run"}, want: "destroy Stave-owned resources for portal default"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := len(runner.runs)
+			out := runCLIWithApp(t, application, tc.args...)
+			if !strings.Contains(out, tc.want) {
+				t.Fatalf("output missing %q:\n%s", tc.want, out)
+			}
+			if tc.executes && len(runner.runs) == before {
+				t.Fatalf("%s did not execute runner; output:\n%s", tc.name, out)
+			}
+			if !tc.executes && len(runner.runs) != before {
+				t.Fatalf("%s unexpectedly executed runner: %#v", tc.name, runner.runs[before:])
+			}
+		})
+	}
+
+	runner.err = errors.New("runner stopped")
+	out, err := runCLIError(t, application, "portal", "up", "ex-1234")
+	if err == nil || !strings.Contains(err.Error(), "runner stopped") || !strings.Contains(out, "docker start") {
+		t.Fatalf("expected portal up runner error, err=%v out=%s", err, out)
+	}
+
+	printSummon := runCLIWithApp(t, &app{portalRunner: &fakePortalRunner{}, isTerminal: func(cmd *cobra.Command) bool { return true }}, "portal", "summon", "ex-1234", "--print-command", "--with", "claude")
+	if !strings.Contains(printSummon, "claude") || !strings.Contains(printSummon, "portal auth login") {
+		t.Fatalf("summon print output = %s", printSummon)
+	}
+	runCLI(t, "portal", "attach", "ssh", "ex-1234", "devbox.example", "remote")
+	detachDryRun := runCLI(t, "portal", "detach", "ex-1234", "remote", "--dry-run")
+	if !strings.Contains(detachDryRun, "remove portal metadata remote") {
+		t.Fatalf("detach dry-run output = %s", detachDryRun)
+	}
+}
+
+func TestCLIRunPortalPlanningCommandRunnerPaths(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	runCLI(t, "setup")
+	runner := &fakePortalRunner{}
+	cmd := &cobra.Command{}
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	application := &app{portalRunner: runner}
+	build := func(portal.Service) (portal.Plan, error) {
+		return portal.Plan{
+			Summary:  "exercise fake portal commands",
+			Commands: []portal.Command{{Program: "portal-one", Args: []string{"ok"}}, {Program: "portal-two", Args: []string{"ok"}}},
+		}, nil
+	}
+
+	if err := application.runPortalPlanningCommand(cmd, build, false, false); err != nil {
+		t.Fatalf("runPortalPlanningCommand error = %v\n%s", err, out.String())
+	}
+	if len(runner.runs) != 2 || !strings.Contains(out.String(), "portal-one ok") {
+		t.Fatalf("runner=%#v out=%s", runner.runs, out.String())
+	}
+
+	out.Reset()
+	if err := application.runPortalPlanningCommand(cmd, build, true, false); err != nil {
+		t.Fatalf("dry-run portal planning error = %v", err)
+	}
+	if len(runner.runs) != 2 {
+		t.Fatalf("dry-run executed commands: %#v", runner.runs)
+	}
+
+	out.Reset()
+	if err := application.runPortalPlanningCommand(cmd, build, false, true); err != nil {
+		t.Fatalf("print-only portal planning error = %v", err)
+	}
+	if len(runner.runs) != 2 {
+		t.Fatalf("print-only executed commands: %#v", runner.runs)
+	}
+
+	runner.err = errors.New("portal runner failed")
+	runner.result = portal.RunResult{Stderr: "runtime details"}
+	out.Reset()
+	if err := application.runPortalPlanningCommand(cmd, build, false, false); err == nil ||
+		!strings.Contains(err.Error(), "portal runner failed") ||
+		!strings.Contains(err.Error(), "runtime details") ||
+		!strings.Contains(err.Error(), "portal-one ok") {
+		t.Fatalf("expected runner error, got %v", err)
+	}
+}
+
+func TestCLIRunPortalPlanningCommandConditionalCommands(t *testing.T) {
+	cmd := &cobra.Command{}
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+
+	createOnMissing := &sequencePortalRunner{errors: []error{errors.New("missing"), nil}}
+	application := &app{portalRunner: createOnMissing}
+	build := func(portal.Service) (portal.Plan, error) {
+		inspect := portal.Command{Program: "docker", Args: []string{"container", "inspect", "name"}, ContinueOnError: true}
+		create := portal.Command{Program: "docker", Args: []string{"run", "name"}, RunIfPreviousFailed: true}
+		return portal.Plan{Summary: "conditional", Commands: []portal.Command{inspect, create}}, nil
+	}
+	if err := application.runPortalPlanningCommand(cmd, build, false, false); err != nil {
+		t.Fatalf("conditional missing path error = %v", err)
+	}
+	if len(createOnMissing.runs) != 2 || !strings.Contains(createOnMissing.runs[1].String(), "docker run name") {
+		t.Fatalf("missing path runs = %#v", createOnMissing.runs)
+	}
+
+	skipCreate := &sequencePortalRunner{}
+	application = &app{portalRunner: skipCreate}
+	if err := application.runPortalPlanningCommand(cmd, build, false, false); err != nil {
+		t.Fatalf("conditional existing path error = %v", err)
+	}
+	if len(skipCreate.runs) != 1 || !strings.Contains(skipCreate.runs[0].String(), "inspect") {
+		t.Fatalf("existing path runs = %#v", skipCreate.runs)
+	}
+}
+
+func TestCLISplitPortalExecArgs(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	runCLI(t, "setup")
+	runCLI(t, "space", "create", "ex-1")
+	cfg, _, err := config.Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := portal.NewService(*cfg, &fakePortalRunner{}, nil)
+	if _, err := svc.InitContainer(context.Background(), portal.InitContainerOptions{SpaceID: "ex-1", PortalID: "dev"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name     string
+		args     []string
+		spaceID  string
+		portalID string
+		argv     []string
+	}{
+		{name: "default portal", args: []string{"ex-1", "echo"}, spaceID: "ex-1", argv: []string{"echo"}},
+		{name: "explicit portal", args: []string{"ex-1", "dev", "echo", "hi"}, spaceID: "ex-1", portalID: "dev", argv: []string{"echo", "hi"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spaceID, portalID, argv := splitPortalExecArgs(svc, tc.args)
+			if spaceID != tc.spaceID || portalID != tc.portalID || strings.Join(argv, "\x00") != strings.Join(tc.argv, "\x00") {
+				t.Fatalf("splitPortalExecArgs(%v) = %q %q %v", tc.args, spaceID, portalID, argv)
+			}
+		})
+	}
+}
+
+func TestCLISpaceAddSyncArchiveAndDestroy(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	src := createGitRepo(t, "repo-a")
+	runCLI(t, "setup")
+	runCLI(t, "repos", "add", "repo-a", src)
+	runCLI(t, "space", "init", "ex-1234")
+
+	if out, err := runCLIError(t, nil, "space", "add", "ex-1234", "repo-a"); err == nil || !strings.Contains(out, "choose exactly one") {
+		t.Fatalf("expected missing mode error, err=%v out=%s", err, out)
+	}
+	dryRunRef := runCLI(t, "space", "add", "ex-1234", "repo-a", "--reference", "--base", "main", "--dry-run")
+	if !strings.Contains(dryRunRef, "dry-run:") {
+		t.Fatalf("reference dry-run output = %s", dryRunRef)
+	}
+	runCLI(t, "space", "add", "ex-1234", "repo-a", "--edit", "--branch", "ex-1234-repo-a", "--base", "main", "--no-fetch")
+	status := runCLI(t, "space", "status", "ex-1234")
+	if !strings.Contains(status, "repo-a [edit]") || !strings.Contains(status, "branch: ex-1234-repo-a") {
+		t.Fatalf("space status after add = %s", status)
+	}
+	runCLI(t, "space", "sync", "ex-1234", "--references-only")
+	runCLI(t, "space", "archive", "ex-1234", "--force")
+	if _, err := os.Stat(filepath.Join(home, "stave", "agent-work", ".archive", "ex-1234", space.ManifestName)); err != nil {
+		t.Fatalf("archive manifest missing: %v", err)
+	}
+
+	runCLI(t, "space", "init", "ex-destroy")
+	dryDestroy := runCLI(t, "space", "destroy", "ex-destroy", "--dry-run")
+	if !strings.Contains(dryDestroy, "dry-run: remove directory") {
+		t.Fatalf("destroy dry-run output = %s", dryDestroy)
+	}
+	runCLI(t, "space", "destroy", "ex-destroy", "--force")
+	if _, err := os.Stat(filepath.Join(home, "stave", "agent-work", "ex-destroy")); !os.IsNotExist(err) {
+		t.Fatalf("destroy left space directory: %v", err)
+	}
+}
+
 func TestCLICreateSummonLaunchesAfterCreate(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -198,6 +756,54 @@ func TestCLIAgentConfigureWithFakeSecretStore(t *testing.T) {
 	text := string(configBytes)
 	if !strings.Contains(text, "model: gpt-test") || !strings.Contains(text, "apiKeyRef: keychain:stave/agent/openai") {
 		t.Fatalf("config missing agent settings:\n%s", text)
+	}
+}
+
+func TestCLIAgentConfigureFlagsWithoutKeychain(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := &fakeSecretStore{available: false}
+	cmd := newRootCommand(&app{secretStore: store})
+	cmd.SetArgs([]string{"agent", "configure", "--provider", "anthropic", "--model", "claude-test"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("agent configure flags error = %v\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "Keychain unavailable") || !strings.Contains(out.String(), "Configured agent provider anthropic") {
+		t.Fatalf("configure output = %s", out.String())
+	}
+	cfg, _, err := config.Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Agent.DefaultProvider != agent.ProviderAnthropic || cfg.Agent.Providers[agent.ProviderAnthropic].APIKeyRef != "env:ANTHROPIC_API_KEY" {
+		t.Fatalf("agent config = %#v", cfg.Agent)
+	}
+}
+
+func TestCLIAgentConfigureRejectsInvalidProviderAndBlankSecret(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	invalid := newRootCommand(&app{secretStore: &fakeSecretStore{available: false}})
+	invalid.SetArgs([]string{"agent", "configure", "--provider", "other", "--model", "model"})
+	var invalidOut bytes.Buffer
+	invalid.SetOut(&invalidOut)
+	invalid.SetErr(&invalidOut)
+	if err := invalid.Execute(); err == nil || !strings.Contains(err.Error(), "provider must be openai or anthropic") {
+		t.Fatalf("expected invalid provider error, err=%v out=%s", err, invalidOut.String())
+	}
+
+	blank := newRootCommand(&app{secretStore: &fakeSecretStore{available: true}})
+	blank.SetArgs([]string{"agent", "configure"})
+	blank.SetIn(strings.NewReader("openai\ngpt-test\n\n"))
+	var blankOut bytes.Buffer
+	blank.SetOut(&blankOut)
+	blank.SetErr(&blankOut)
+	if err := blank.Execute(); err == nil || !strings.Contains(err.Error(), "API key is required") {
+		t.Fatalf("expected blank API key error, err=%v out=%s", err, blankOut.String())
 	}
 }
 
@@ -313,6 +919,246 @@ func TestCLIAgentNoIncantOverridesAutoIncant(t *testing.T) {
 	}
 }
 
+func TestCLIAgentTerminalConfirmExecutesAndDeclines(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		answer   string
+		executed bool
+	}{
+		{name: "confirmed", answer: "yes\n", executed: true},
+		{name: "declined", answer: "no\n", executed: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("OPENAI_API_KEY", "sk-env")
+			runCLI(t, "setup")
+			factory := func(providerName, model, apiKey string) (agent.Provider, error) {
+				return fakeProvider{plan: agent.Plan{Summary: "create space", Operations: []agent.Operation{{Type: agent.OpSpaceCreate, SpaceID: "confirmed-space"}}}}, nil
+			}
+			cmd := newRootCommand(&app{providerFactory: factory, isTerminal: func(cmd *cobra.Command) bool { return true }})
+			cmd.SetArgs([]string{"agent", "create a space"})
+			cmd.SetIn(strings.NewReader(tc.answer))
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			cmd.SetErr(&out)
+			if err := cmd.Execute(); err != nil {
+				t.Fatalf("agent terminal confirm error = %v\n%s", err, out.String())
+			}
+			if strings.Contains(out.String(), "Proceed?") != true {
+				t.Fatalf("expected confirmation prompt:\n%s", out.String())
+			}
+			_, statErr := os.Stat(filepath.Join(home, "stave", "agent-work", "confirmed-space", space.ManifestName))
+			if tc.executed && statErr != nil {
+				t.Fatalf("confirmed plan did not create space: %v\n%s", statErr, out.String())
+			}
+			if !tc.executed && !os.IsNotExist(statErr) {
+				t.Fatalf("declined plan created space, statErr=%v\n%s", statErr, out.String())
+			}
+		})
+	}
+}
+
+func TestCLIAgentNeedsInputJSONDoesNotExecute(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OPENAI_API_KEY", "sk-env")
+	runCLI(t, "setup")
+	factory := func(providerName, model, apiKey string) (agent.Provider, error) {
+		return fakeProvider{result: agent.RunResult{
+			Status:    agent.RunStatusNeedsInput,
+			Message:   "Need portal target.",
+			Questions: []agent.Question{{ID: "driver", Prompt: "Which portal driver?", Type: "select", Options: []string{"docker", "ssh"}}},
+			Plan:      agent.Plan{Operations: []agent.Operation{}},
+		}}, nil
+	}
+	cmd := newRootCommand(&app{providerFactory: factory, isTerminal: func(cmd *cobra.Command) bool { return false }})
+	cmd.SetArgs([]string{"agent", "--incant", "--json", "set up portal"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("agent needs_input json error = %v\n%s", err, out.String())
+	}
+	var result agent.RunResult
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatalf("invalid JSON:\n%s\n%v", out.String(), err)
+	}
+	if result.Status != agent.RunStatusNeedsInput || result.Executed || len(result.Questions) != 1 {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestCLIAgentAutoIncantNeedsInputDoesNotExecute(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OPENAI_API_KEY", "sk-env")
+	runCLI(t, "setup")
+	cfg, path, err := config.Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Agent.AutoIncant = true
+	if err := cfg.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	factory := func(providerName, model, apiKey string) (agent.Provider, error) {
+		return fakeProvider{result: agent.RunResult{
+			Status:    agent.RunStatusNeedsInput,
+			Message:   "Need portal target.",
+			Questions: []agent.Question{{ID: "driver", Prompt: "Which portal driver?", Type: "select", Options: []string{"docker", "ssh"}}},
+			Plan:      agent.Plan{Operations: []agent.Operation{{Type: agent.OpReposList}}},
+		}}, nil
+	}
+	cmd := newRootCommand(&app{providerFactory: factory, isTerminal: func(cmd *cobra.Command) bool { return false }})
+	cmd.SetArgs([]string{"agent", "--json", "set up portal"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("agent autoIncant needs_input json error = %v\n%s", err, out.String())
+	}
+	var result agent.RunResult
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatalf("invalid JSON:\n%s\n%v", out.String(), err)
+	}
+	if result.Status != agent.RunStatusNeedsInput || result.Executed || len(result.Results) != 0 {
+		t.Fatalf("autoIncant executed needs_input result: %#v", result)
+	}
+}
+
+func TestCLIAgentNeedsInputNonTTYPrintsQuestions(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OPENAI_API_KEY", "sk-env")
+	runCLI(t, "setup")
+	factory := func(providerName, model, apiKey string) (agent.Provider, error) {
+		return fakeProvider{result: agent.RunResult{
+			Status:    agent.RunStatusNeedsInput,
+			Message:   "Need portal target.",
+			Questions: []agent.Question{{ID: "driver", Prompt: "Which portal driver?", Type: "select", Options: []string{"docker", "ssh"}}},
+			Plan:      agent.Plan{Operations: []agent.Operation{}},
+		}}, nil
+	}
+	cmd := newRootCommand(&app{providerFactory: factory, isTerminal: func(cmd *cobra.Command) bool { return false }})
+	cmd.SetArgs([]string{"agent", "set up portal"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("agent needs_input non-tty error = %v\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "Status: needs_input") || !strings.Contains(out.String(), "Which portal driver?") {
+		t.Fatalf("output = %s", out.String())
+	}
+	if strings.Contains(out.String(), "no operations were executed") {
+		t.Fatalf("needs_input should not print generic non-execution warning:\n%s", out.String())
+	}
+}
+
+func TestCLIAgentTTYNeedsInputCollectsAnswersAndReplans(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OPENAI_API_KEY", "sk-env")
+	runCLI(t, "setup")
+	provider := &sequenceProvider{results: []agent.RunResult{
+		{
+			Status:    agent.RunStatusNeedsInput,
+			Message:   "Need portal target.",
+			Questions: []agent.Question{{ID: "driver", Prompt: "Which portal driver?", Type: "select", Options: []string{"docker", "ssh"}}},
+			Plan:      agent.Plan{Operations: []agent.Operation{}},
+		},
+		{
+			Status: agent.RunStatusPlanReady,
+			Plan:   agent.Plan{Summary: "list repos", Operations: []agent.Operation{{Type: agent.OpReposList}}},
+		},
+	}}
+	factory := func(providerName, model, apiKey string) (agent.Provider, error) {
+		return provider, nil
+	}
+	cmd := newRootCommand(&app{providerFactory: factory, isTerminal: func(cmd *cobra.Command) bool { return true }})
+	cmd.SetArgs([]string{"agent", "--no-incant", "set up portal"})
+	cmd.SetIn(strings.NewReader("ssh\n"))
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("agent needs_input tty error = %v\n%s", err, out.String())
+	}
+	if provider.calls != 2 {
+		t.Fatalf("provider calls = %d", provider.calls)
+	}
+	if !strings.Contains(provider.queries[1], "- driver: ssh") {
+		t.Fatalf("second query did not include answer: %q", provider.queries[1])
+	}
+	if !strings.Contains(out.String(), "Which portal driver?") || !strings.Contains(out.String(), "Plan: list repos") {
+		t.Fatalf("output = %s", out.String())
+	}
+}
+
+func TestCLIAgentJSONPortalIncantSuppressesExecutionChatter(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OPENAI_API_KEY", "sk-env")
+	runCLI(t, "setup")
+	runCLI(t, "space", "init", "ex-1234")
+	runCLI(t, "portal", "init", "container", "ex-1234")
+	runner := &fakePortalRunner{result: portal.RunResult{Stdout: "docker chatter that must stay off stdout"}}
+	factory := func(providerName, model, apiKey string) (agent.Provider, error) {
+		return fakeProvider{plan: agent.Plan{Summary: "start portal", Operations: []agent.Operation{{Type: agent.OpPortalUp, SpaceID: "ex-1234"}}}}, nil
+	}
+	cmd := newRootCommand(&app{providerFactory: factory, portalRunner: runner, isTerminal: func(cmd *cobra.Command) bool { return false }})
+	cmd.SetArgs([]string{"agent", "--incant", "--json", "start the portal"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("agent portal --incant --json error = %v\n%s", err, out.String())
+	}
+	if strings.Contains(out.String(), "docker chatter") || strings.Contains(out.String(), "Plan:") || strings.Contains(out.String(), "Commands:") {
+		t.Fatalf("--json emitted execution chatter:\n%s", out.String())
+	}
+	var result agent.RunResult
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatalf("invalid JSON:\n%s\n%v", out.String(), err)
+	}
+	if !result.Executed || len(result.Results) != 1 || len(runner.runs) == 0 {
+		t.Fatalf("result=%#v runner=%#v", result, runner.runs)
+	}
+}
+
+func TestCLIAgentRunAndValidationErrors(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OPENAI_API_KEY", "sk-secret-value")
+	runCLI(t, "setup")
+	runErrFactory := func(providerName, model, apiKey string) (agent.Provider, error) {
+		return errorProvider{err: errors.New("provider saw sk-secret-value")}, nil
+	}
+	cmd := newRootCommand(&app{providerFactory: runErrFactory, isTerminal: func(cmd *cobra.Command) bool { return false }})
+	cmd.SetArgs([]string{"agent", "fail"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	err := cmd.Execute()
+	if err == nil || strings.Contains(err.Error(), "sk-secret-value") {
+		t.Fatalf("expected redacted provider error, err=%v out=%s", err, out.String())
+	}
+
+	validationFactory := func(providerName, model, apiKey string) (agent.Provider, error) {
+		return fakeProvider{plan: agent.Plan{Summary: "invalid", Operations: []agent.Operation{{Type: agent.OpSpaceStatus}}}}, nil
+	}
+	cmd = newRootCommand(&app{providerFactory: validationFactory, isTerminal: func(cmd *cobra.Command) bool { return false }})
+	cmd.SetArgs([]string{"agent", "invalid"})
+	out.Reset()
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	err = cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "space \"\" does not exist") {
+		t.Fatalf("expected validation error, err=%v out=%s", err, out.String())
+	}
+}
+
 func TestCLIAgentJSONDoesNotPromptOnTTY(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -339,6 +1185,151 @@ func TestCLIAgentJSONDoesNotPromptOnTTY(t *testing.T) {
 	}
 	if result.Executed {
 		t.Fatalf("--json without --incant executed unexpectedly: %#v", result)
+	}
+}
+
+func TestCLIAgentJSONDoesNotEchoPlannerSecret(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OPENAI_API_KEY", "sk-secret-value")
+	runCLI(t, "setup")
+	factory := func(providerName, model, apiKey string) (agent.Provider, error) {
+		if apiKey != "sk-secret-value" {
+			t.Fatalf("apiKey = %q", apiKey)
+		}
+		return fakeProvider{plan: agent.Plan{Summary: "list repos", Operations: []agent.Operation{{Type: agent.OpReposList}}}}, nil
+	}
+	cmd := newRootCommand(&app{providerFactory: factory, isTerminal: func(cmd *cobra.Command) bool { return false }})
+	cmd.SetArgs([]string{"agent", "--json", "list repos"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("agent --json error = %v\n%s", err, out.String())
+	}
+	if strings.Contains(out.String(), "sk-secret-value") {
+		t.Fatalf("--json leaked planner secret:\n%s", out.String())
+	}
+	var result agent.RunResult
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatalf("invalid JSON:\n%s\n%v", out.String(), err)
+	}
+}
+
+func TestCLIQuestionAndProviderHelperBranches(t *testing.T) {
+	var out bytes.Buffer
+	answers, err := collectQuestionAnswers(strings.NewReader("\n\ncustom\n"), &out, agent.RunResult{
+		Message: "Need details.",
+		Questions: []agent.Question{
+			{ID: "driver", Prompt: "Which portal driver?", Options: []string{"docker", "ssh"}},
+			{ID: "host", Prompt: "Host", Required: true},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(answers, "- driver: docker") || !strings.Contains(answers, "- host: custom") || !strings.Contains(out.String(), "A value is required.") {
+		t.Fatalf("answers=%q out=%s", answers, out.String())
+	}
+	ok, err := confirm(strings.NewReader("yes\n"), &out)
+	if err != nil || !ok {
+		t.Fatalf("confirm yes = %v %v", ok, err)
+	}
+	ok, err = confirm(strings.NewReader("no\n"), &out)
+	if err != nil || ok {
+		t.Fatalf("confirm no = %v %v", ok, err)
+	}
+
+	cfg, err := config.Default()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Agent = config.DefaultAgentConfig()
+	name, providerCfg, err := resolveAgentProvider(*cfg, agent.ProviderAnthropic, "override-model")
+	if err != nil || name != agent.ProviderAnthropic || providerCfg.Model != "override-model" || providerCfg.APIKeyRef != "env:ANTHROPIC_API_KEY" {
+		t.Fatalf("resolve anthropic = %q %#v %v", name, providerCfg, err)
+	}
+	if _, _, err := resolveAgentProvider(*cfg, "bogus", ""); err == nil {
+		t.Fatal("expected invalid provider error")
+	}
+	if defaultModelForProvider(agent.ProviderAnthropic) != config.DefaultAgentModelAnthropic || defaultModelForProvider(agent.ProviderOpenAI) != config.DefaultAgentModelOpenAI {
+		t.Fatal("default model helper mismatch")
+	}
+	if guidedPortalKind("claude-devcontainer") != "devcontainer" || guidedPortalKind("") != "container" {
+		t.Fatal("guided portal kind mismatch")
+	}
+	if command := guidedPortalCommand("ex-1", "dev", "container", "local-codex"); !strings.Contains(command, "--preset local-codex") {
+		t.Fatalf("guided command = %s", command)
+	}
+	if firstNonEmpty("", "", "value") != "value" || firstNonEmpty("", "") != "" {
+		t.Fatal("firstNonEmpty mismatch")
+	}
+
+	var planOut bytes.Buffer
+	printAgentPlan(&planOut, agent.RunResult{
+		Status:   agent.RunStatusUnsupported,
+		Message:  "Cannot do that.",
+		Executed: true,
+		Plan: agent.Plan{
+			Summary:    "helper plan",
+			Operations: []agent.Operation{{Type: agent.OpReposList}},
+			Notes:      []string{"note"},
+			Warnings:   []string{"warning"},
+		},
+		Commands: []string{"stave repos list"},
+	})
+	if !strings.Contains(planOut.String(), "Status: unsupported") || !strings.Contains(planOut.String(), "Notes:") || !strings.Contains(planOut.String(), "Executed.") {
+		t.Fatalf("printAgentPlan output = %s", planOut.String())
+	}
+
+	oldArgs := os.Args
+	t.Cleanup(func() { os.Args = oldArgs })
+	os.Args = []string{"stave", "--help"}
+	if err := ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("ExecuteContext help error = %v", err)
+	}
+}
+
+func TestCLICommandsSurfaceConfigLoadErrors(t *testing.T) {
+	badConfig := t.TempDir()
+	for _, args := range [][]string{
+		{"setup"},
+		{"repos", "list"},
+		{"repos", "sync"},
+		{"repos", "remove", "repo-a"},
+		{"space", "status", "ex-1"},
+		{"space", "sync", "ex-1"},
+		{"space", "archive", "ex-1"},
+		{"space", "destroy", "ex-1"},
+		{"summon", "ex-1"},
+		{"portal", "drivers"},
+		{"portal", "doctor", "ex-1"},
+		{"portal", "list"},
+		{"portal", "status", "ex-1"},
+		{"portal", "inspect", "ex-1"},
+		{"portal", "auth", "status", "ex-1"},
+		{"portal", "auth", "login", "ex-1"},
+		{"portal", "auth", "inherit", "ex-1", "--method", "env"},
+		{"portal", "auth", "revoke", "ex-1"},
+		{"portal", "up", "ex-1"},
+		{"portal", "sync", "ex-1"},
+		{"portal", "shell", "ex-1", "--print-command"},
+		{"portal", "exec", "ex-1", "true"},
+		{"portal", "summon", "ex-1", "--print-command"},
+		{"portal", "logs", "ex-1"},
+		{"portal", "down", "ex-1"},
+		{"portal", "detach", "ex-1"},
+		{"portal", "destroy", "ex-1"},
+		{"agent", "plan"},
+		{"agent", "configure"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			argsWithConfig := append([]string{"--config", badConfig}, args...)
+			out, err := runCLIError(t, nil, argsWithConfig...)
+			if err == nil || !strings.Contains(err.Error(), "read config") {
+				t.Fatalf("expected config load error for %v, err=%v out=%s", args, err, out)
+			}
+		})
 	}
 }
 
@@ -411,11 +1402,46 @@ func TestCLITicketFlagIsRemoved(t *testing.T) {
 }
 
 type fakeProvider struct {
-	plan agent.Plan
+	plan   agent.Plan
+	result agent.RunResult
 }
 
 func (f fakeProvider) Run(ctx context.Context, request agent.ProviderRequest) (agent.RunResult, error) {
+	if f.result.Status != "" || f.result.Message != "" || len(f.result.Questions) > 0 || len(f.result.Plan.Operations) > 0 {
+		if f.result.Commands == nil {
+			f.result.Commands = f.result.Plan.Commands()
+		}
+		return f.result, nil
+	}
 	return agent.RunResult{Plan: f.plan, Commands: f.plan.Commands()}, nil
+}
+
+type sequenceProvider struct {
+	results []agent.RunResult
+	queries []string
+	calls   int
+}
+
+func (f *sequenceProvider) Run(ctx context.Context, request agent.ProviderRequest) (agent.RunResult, error) {
+	f.queries = append(f.queries, request.Query)
+	index := f.calls
+	f.calls++
+	if index >= len(f.results) {
+		index = len(f.results) - 1
+	}
+	result := f.results[index]
+	if result.Commands == nil {
+		result.Commands = result.Plan.Commands()
+	}
+	return result, nil
+}
+
+type errorProvider struct {
+	err error
+}
+
+func (f errorProvider) Run(ctx context.Context, request agent.ProviderRequest) (agent.RunResult, error) {
+	return agent.RunResult{}, f.err
 }
 
 type fakeSecretStore struct {
@@ -428,10 +1454,58 @@ type fakeSummonLauncher struct {
 	invocation summon.Invocation
 }
 
+type fakePortalRunner struct {
+	runs    []portal.Command
+	result  portal.RunResult
+	err     error
+	missing map[string]bool
+}
+
+type sequencePortalRunner struct {
+	runs    []portal.Command
+	results []portal.RunResult
+	errors  []error
+}
+
 func (f *fakeSummonLauncher) Launch(ctx context.Context, invocation summon.Invocation) error {
 	f.called = true
 	f.invocation = invocation
 	return nil
+}
+
+func (f *fakePortalRunner) LookPath(name string) (string, error) {
+	if f.missing != nil && f.missing[name] {
+		return "", os.ErrNotExist
+	}
+	return "/bin/" + name, nil
+}
+
+func (f *fakePortalRunner) Run(ctx context.Context, command portal.Command) (portal.RunResult, error) {
+	_ = ctx
+	f.runs = append(f.runs, command)
+	if f.err != nil {
+		return f.result, f.err
+	}
+	return f.result, nil
+}
+
+func (f *sequencePortalRunner) LookPath(name string) (string, error) {
+	return "/bin/" + name, nil
+}
+
+func (f *sequencePortalRunner) Run(ctx context.Context, command portal.Command) (portal.RunResult, error) {
+	_ = ctx
+	f.runs = append(f.runs, command)
+	index := len(f.runs) - 1
+	var result portal.RunResult
+	if index < len(f.results) {
+		result = f.results[index]
+	}
+	var err error
+	if index < len(f.errors) {
+		err = f.errors[index]
+	}
+	return result, err
 }
 
 func (f *fakeSecretStore) Available() bool {
@@ -468,15 +1542,32 @@ func TestCLISpaceCommandsAreNotTopLevel(t *testing.T) {
 
 func runCLI(t *testing.T, args ...string) string {
 	t.Helper()
-	cmd := NewRootCommand()
+	return runCLIWithApp(t, nil, args...)
+}
+
+func runCLIWithApp(t *testing.T, application *app, args ...string) string {
+	t.Helper()
+	out, err := runCLIError(t, application, args...)
+	if err != nil {
+		t.Fatalf("stave %v error = %v\n%s", args, err, out)
+	}
+	return out
+}
+
+func runCLIError(t *testing.T, application *app, args ...string) (string, error) {
+	t.Helper()
+	var cmd *cobra.Command
+	if application == nil {
+		cmd = NewRootCommand()
+	} else {
+		cmd = newRootCommand(application)
+	}
 	cmd.SetArgs(args)
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 	cmd.SetErr(&out)
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("stave %v error = %v\n%s", args, err, out.String())
-	}
-	return out.String()
+	err := cmd.Execute()
+	return out.String(), err
 }
 
 func createGitRepo(t *testing.T, name string) string {

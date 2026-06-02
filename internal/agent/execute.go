@@ -9,6 +9,7 @@ import (
 
 	"github.com/Nurozen/stave/internal/config"
 	"github.com/Nurozen/stave/internal/git"
+	"github.com/Nurozen/stave/internal/portal"
 	"github.com/Nurozen/stave/internal/space"
 	"github.com/Nurozen/stave/internal/summon"
 )
@@ -18,6 +19,7 @@ type Executor struct {
 	Git              *git.Client
 	Out              io.Writer
 	SummonLauncher   summon.Launcher
+	PortalRunner     portal.Runner
 	AllowInteractive bool
 }
 
@@ -33,11 +35,16 @@ func (e Executor) ExecutePlan(ctx context.Context, plan Plan) ([]ExecutionResult
 			results = append(results, result)
 			continue
 		}
+		if op.Type == OpPortalSummon && !e.AllowInteractive {
+			result.Message = "portal summon skipped because interactive launch is disabled"
+			results = append(results, result)
+			continue
+		}
 		if err := e.executeOperation(ctx, op); err != nil {
 			result.Executed = true
-			result.Message = err.Error()
+			result.Message = RedactText(err.Error())
 			results = append(results, result)
-			return results, err
+			return results, fmt.Errorf("%s", RedactText(err.Error()))
 		}
 		result.Executed = true
 		results = append(results, result)
@@ -118,9 +125,88 @@ func (e Executor) executeOperation(ctx context.Context, op Operation) error {
 		svc := summon.NewService(e.Config, e.SummonLauncher, out)
 		svc.Interactive = true
 		return svc.Summon(ctx, summon.Options{SpaceID: op.SpaceID, Summoner: summoner})
+	case OpPortalInit:
+		svc := portal.NewService(e.Config, e.PortalRunner, nil)
+		if op.Driver == string(portal.DriverDevcontainer) {
+			_, err := svc.InitDevcontainer(ctx, portal.InitDevcontainerOptions{SpaceID: op.SpaceID, PortalID: op.PortalID, DevcontainerPath: op.DevcontainerPath, ComposeFiles: op.ComposeFiles, Service: op.Service, ContainerRoot: op.ContainerRoot, Preset: op.Preset})
+			return err
+		}
+		driver := portal.Driver(op.Driver)
+		if driver == "" {
+			driver = portal.DriverDocker
+		}
+		_, err := svc.InitContainer(ctx, portal.InitContainerOptions{SpaceID: op.SpaceID, PortalID: op.PortalID, Engine: driver, Image: op.Image, ContainerRoot: op.ContainerRoot, Preset: op.Preset})
+		return err
+	case OpPortalAttach:
+		svc := portal.NewService(e.Config, e.PortalRunner, nil)
+		if op.Driver == string(portal.DriverEC2Attach) || op.Driver == "ec2" {
+			_, err := svc.AttachEC2(ctx, portal.AttachEC2Options{SpaceID: op.SpaceID, PortalID: op.PortalID, InstanceID: op.InstanceID, Region: op.Region, Profile: op.Profile, SSHUser: op.SSHUser, IdentityPath: op.IdentityPath, RemoteRoot: op.RemoteRoot, SyncMode: portal.SyncMode(op.SyncMode), Preset: op.Preset})
+			return err
+		}
+		_, err := svc.AttachSSH(ctx, portal.AttachSSHOptions{SpaceID: op.SpaceID, PortalID: op.PortalID, Host: op.Host, Port: op.Port, IdentityPath: op.IdentityPath, RemoteRoot: op.RemoteRoot, SyncMode: portal.SyncMode(op.SyncMode), Preset: op.Preset})
+		return err
+	case OpPortalConfigure:
+		svc := portal.NewService(e.Config, e.PortalRunner, nil)
+		_, err := svc.Configure(portal.ConfigureOptions{SpaceID: op.SpaceID, PortalID: op.PortalID, SyncMode: portal.SyncMode(op.SyncMode), ContainerRoot: op.ContainerRoot, RemoteRoot: op.RemoteRoot, Agent: op.Agent, AuthMode: portal.AuthMode(op.Method)})
+		return err
+	case OpPortalAuthLogin:
+		return e.executePortalPlan(ctx, out, func(svc portal.Service) (portal.Plan, error) {
+			return svc.PlanAuthLogin(ctx, portal.AuthCommandOptions{SpaceID: op.SpaceID, PortalID: op.PortalID, Provider: op.Provider, Method: portal.AuthMode(op.Method)})
+		})
+	case OpPortalAuthInherit:
+		return e.executePortalPlan(ctx, out, func(svc portal.Service) (portal.Plan, error) {
+			return svc.PlanAuthInherit(ctx, portal.AuthCommandOptions{SpaceID: op.SpaceID, PortalID: op.PortalID, Provider: op.Provider, Method: portal.AuthMode(op.Method), Yes: true})
+		})
+	case OpPortalAuthRevoke:
+		return e.executePortalPlan(ctx, out, func(svc portal.Service) (portal.Plan, error) {
+			return svc.PlanAuthRevoke(ctx, portal.AuthCommandOptions{SpaceID: op.SpaceID, PortalID: op.PortalID, Provider: op.Provider, Target: op.Target, Yes: true})
+		})
+	case OpPortalUp:
+		return e.executePortalPlan(ctx, out, func(svc portal.Service) (portal.Plan, error) {
+			return svc.PlanUp(ctx, portal.UpOptions{SpaceID: op.SpaceID, PortalID: op.PortalID})
+		})
+	case OpPortalSync:
+		return e.executePortalPlan(ctx, out, func(svc portal.Service) (portal.Plan, error) {
+			return svc.PlanSync(ctx, portal.SyncOptions{SpaceID: op.SpaceID, PortalID: op.PortalID, Direction: portal.SyncDirection(op.Direction), Mode: portal.SyncMode(op.SyncMode), ReferencesOnly: op.ReferencesOnly, Include: op.Include, Exclude: op.Exclude, Delete: op.Delete, MaxDelete: op.MaxDelete, AllowDirty: op.AllowDirty, Yes: op.Delete})
+		})
+	case OpPortalSummon:
+		return e.executePortalPlan(ctx, out, func(svc portal.Service) (portal.Plan, error) {
+			return svc.PlanSummon(ctx, portal.SummonOptions{SpaceID: op.SpaceID, PortalID: op.PortalID, With: op.Summoner, Mode: op.Mode, Permission: op.Permission, Prompt: op.HandoffPrompt})
+		})
+	case OpPortalDown:
+		return e.executePortalPlan(ctx, out, func(svc portal.Service) (portal.Plan, error) {
+			return svc.PlanDown(ctx, portal.DownOptions{SpaceID: op.SpaceID, PortalID: op.PortalID, Timeout: op.Timeout, Force: op.Force})
+		})
+	case OpPortalDetach:
+		svc := portal.NewService(e.Config, e.PortalRunner, nil)
+		_, err := svc.Detach(portal.DetachOptions{SpaceID: op.SpaceID, PortalID: op.PortalID})
+		return err
 	default:
+		if op.Type == OpPortalDestroyPreview {
+			return nil
+		}
+		if isPortalOperation(op) {
+			return fmt.Errorf("portal operation %q is read-only or unsupported for execution", op.Type)
+		}
 		return fmt.Errorf("unsupported operation %q", op.Type)
 	}
+}
+
+func (e Executor) executePortalPlan(ctx context.Context, out io.Writer, build func(portal.Service) (portal.Plan, error)) error {
+	svc := portal.NewService(e.Config, e.PortalRunner, nil)
+	plan, err := build(svc)
+	if err != nil {
+		return err
+	}
+	for _, command := range plan.Commands {
+		fmt.Fprintf(out, "%s\n", command.String())
+		if e.PortalRunner != nil {
+			if _, err := e.PortalRunner.Run(ctx, command); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func firstNonEmpty(values ...string) string {
