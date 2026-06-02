@@ -238,6 +238,9 @@ Local login credentials are never copied silently. Use `stave portal auth
 login` to authenticate inside the portal target, or explicit `auth inherit`
 methods when you really want inherited auth behavior.
 
+See [`docs/portal.md`](docs/portal.md) for a practical portal quickstart and
+command guide.
+
 ## Configuration
 
 Example `~/.config/stave/config.yaml`:
