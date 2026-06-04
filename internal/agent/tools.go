@@ -322,19 +322,21 @@ func portalToolDefinitions() []ToolDefinition {
 			Category:    ToolCategoryMutate,
 			Description: "Queue attaching an existing external SSH or EC2 resource to a Stave space. This never provisions, starts, stops, terminates, or deletes the resource.",
 			Parameters: objectSchema(map[string]any{
-				"space_id":      stringSchema("Existing Stave space id, or a space id created earlier in this same plan."),
-				"portal_id":     stringSchema("Optional portal id. Defaults to default."),
-				"driver":        enumSchema("Attach target type.", []string{"ssh", "ec2-attach"}),
-				"host":          stringSchema("SSH host for ssh attach."),
-				"port":          intSchema("Optional SSH port."),
-				"instance_id":   stringSchema("EC2 instance id for ec2-attach."),
-				"region":        stringSchema("Optional AWS region."),
-				"profile":       stringSchema("Optional AWS profile."),
-				"ssh_user":      stringSchema("Optional SSH user."),
-				"identity_path": stringSchema("Optional identity file path."),
-				"remote_root":   stringSchema("Remote Stave workspace root."),
-				"sync_mode":     enumSchema("Remote sync mode.", []string{"rsync", "reconstruct"}),
-				"preset":        stringSchema("Optional portal preset."),
+				"space_id":         stringSchema("Existing Stave space id, or a space id created earlier in this same plan."),
+				"portal_id":        stringSchema("Optional portal id. Defaults to default."),
+				"driver":           enumSchema("Attach target type.", []string{"ssh", "ec2-attach"}),
+				"host":             stringSchema("SSH host for ssh attach, or SSH DNS name/IP override for ec2-attach."),
+				"port":             intSchema("Optional SSH port."),
+				"instance_id":      stringSchema("EC2 instance id for ec2-attach."),
+				"region":           stringSchema("Optional AWS region."),
+				"profile":          stringSchema("Optional AWS profile."),
+				"ssh_user":         stringSchema("Optional SSH user."),
+				"identity_path":    stringSchema("Optional identity file path."),
+				"known_hosts_path": stringSchema("Optional SSH known_hosts file path."),
+				"strict_host_key":  stringSchema("Optional SSH StrictHostKeyChecking value."),
+				"remote_root":      stringSchema("Remote Stave workspace root."),
+				"sync_mode":        enumSchema("Remote sync mode.", []string{"rsync", "reconstruct"}),
+				"preset":           stringSchema("Optional portal preset."),
 			}, []string{"space_id", "driver"}),
 		},
 		{
@@ -347,6 +349,7 @@ func portalToolDefinitions() []ToolDefinition {
 				"sync_mode":      enumSchema("Optional sync mode.", []string{"mount", "rsync", "reconstruct"}),
 				"container_root": stringSchema("Optional container workspace root."),
 				"remote_root":    stringSchema("Optional remote workspace root."),
+				"host":           stringSchema("Optional SSH host, DNS name, or IP address for remote portals."),
 				"agent":          enumSchema("Optional default portal agent.", []string{"codex", "claude", "cursor"}),
 				"auth":           enumSchema("Optional auth mode.", []string{"native", "env", "volume", "ssh-forward"}),
 			}, []string{"space_id"}),
@@ -570,13 +573,13 @@ func (d *ToolDispatcher) dispatch(ctx context.Context, call ToolCall) ToolResult
 		if err := decodeToolArgs(call.Arguments, &args); err != nil {
 			return toolError(call, err)
 		}
-		return d.queueOperation(call, Operation{Type: OpPortalAttach, SpaceID: args.SpaceID, PortalID: args.PortalID, Driver: args.Driver, Host: args.Host, Port: args.Port, InstanceID: args.InstanceID, Region: args.Region, Profile: args.Profile, SSHUser: args.SSHUser, IdentityPath: args.IdentityPath, RemoteRoot: args.RemoteRoot, SyncMode: args.SyncMode, Preset: args.Preset})
+		return d.queueOperation(call, Operation{Type: OpPortalAttach, SpaceID: args.SpaceID, PortalID: args.PortalID, Driver: args.Driver, Host: args.Host, Port: args.Port, InstanceID: args.InstanceID, Region: args.Region, Profile: args.Profile, SSHUser: args.SSHUser, IdentityPath: args.IdentityPath, KnownHostsPath: args.KnownHostsPath, StrictHostKey: args.StrictHostKey, RemoteRoot: args.RemoteRoot, SyncMode: args.SyncMode, Preset: args.Preset})
 	case ToolPortalConfigure:
 		var args portalConfigureArgs
 		if err := decodeToolArgs(call.Arguments, &args); err != nil {
 			return toolError(call, err)
 		}
-		return d.queueOperation(call, Operation{Type: OpPortalConfigure, SpaceID: args.SpaceID, PortalID: args.PortalID, SyncMode: args.SyncMode, ContainerRoot: args.ContainerRoot, RemoteRoot: args.RemoteRoot, Agent: args.Agent, Method: args.Auth})
+		return d.queueOperation(call, Operation{Type: OpPortalConfigure, SpaceID: args.SpaceID, PortalID: args.PortalID, SyncMode: args.SyncMode, ContainerRoot: args.ContainerRoot, RemoteRoot: args.RemoteRoot, Host: args.Host, Agent: args.Agent, Method: args.Auth})
 	case ToolPortalAuthLogin:
 		var args portalAuthLoginArgs
 		if err := decodeToolArgs(call.Arguments, &args); err != nil {
@@ -923,19 +926,21 @@ type portalInitArgs struct {
 }
 
 type portalAttachArgs struct {
-	SpaceID      string `json:"space_id"`
-	PortalID     string `json:"portal_id"`
-	Driver       string `json:"driver"`
-	Host         string `json:"host"`
-	Port         int    `json:"port"`
-	InstanceID   string `json:"instance_id"`
-	Region       string `json:"region"`
-	Profile      string `json:"profile"`
-	SSHUser      string `json:"ssh_user"`
-	IdentityPath string `json:"identity_path"`
-	RemoteRoot   string `json:"remote_root"`
-	SyncMode     string `json:"sync_mode"`
-	Preset       string `json:"preset"`
+	SpaceID        string `json:"space_id"`
+	PortalID       string `json:"portal_id"`
+	Driver         string `json:"driver"`
+	Host           string `json:"host"`
+	Port           int    `json:"port"`
+	InstanceID     string `json:"instance_id"`
+	Region         string `json:"region"`
+	Profile        string `json:"profile"`
+	SSHUser        string `json:"ssh_user"`
+	IdentityPath   string `json:"identity_path"`
+	KnownHostsPath string `json:"known_hosts_path"`
+	StrictHostKey  string `json:"strict_host_key"`
+	RemoteRoot     string `json:"remote_root"`
+	SyncMode       string `json:"sync_mode"`
+	Preset         string `json:"preset"`
 }
 
 type portalConfigureArgs struct {
@@ -944,6 +949,7 @@ type portalConfigureArgs struct {
 	SyncMode      string `json:"sync_mode"`
 	ContainerRoot string `json:"container_root"`
 	RemoteRoot    string `json:"remote_root"`
+	Host          string `json:"host"`
 	Agent         string `json:"agent"`
 	Auth          string `json:"auth"`
 }

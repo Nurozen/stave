@@ -78,7 +78,7 @@ type SyncOptions struct {
 }
 
 func (s Service) PlanUp(ctx context.Context, opts UpOptions) (Plan, error) {
-	portal, _, err := s.LoadPortal(SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID})
+	portal, _, err := s.LoadPortalForRuntime(ctx, SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID})
 	if err != nil {
 		return Plan{}, err
 	}
@@ -107,9 +107,10 @@ func (s Service) PlanUp(ctx context.Context, opts UpOptions) (Plan, error) {
 	case DriverDevcontainer:
 		plan.Commands = append(plan.Commands, devcontainerCommand(portal, "up"))
 	case DriverSSH:
-		plan.Commands = append(plan.Commands, sshCommand(portal, "mkdir -p "+quoteRemote(portal.Workspace.RemoteRoot)))
+		plan.Commands = append(plan.Commands, remotePrepareCommands(portal, false)...)
 	case DriverEC2Attach:
 		plan.Commands = append(plan.Commands, ec2DescribeCommand(portal))
+		plan.Commands = append(plan.Commands, remotePrepareCommands(portal, false)...)
 	}
 	if attach == "shell" {
 		plan.Commands = append(plan.Commands, portalExecCommand(portal, []string{DefaultShell}, portalCWD(portal, opts.Workdir), "", TTYAuto, true))
@@ -118,7 +119,7 @@ func (s Service) PlanUp(ctx context.Context, opts UpOptions) (Plan, error) {
 }
 
 func (s Service) PlanShell(ctx context.Context, opts ShellOptions) (Plan, error) {
-	portal, _, err := s.LoadPortal(SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID})
+	portal, _, err := s.LoadPortalForRuntime(ctx, SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID})
 	if err != nil {
 		return Plan{}, err
 	}
@@ -137,7 +138,7 @@ func (s Service) PlanExec(ctx context.Context, opts ExecOptions) (Plan, error) {
 	if len(opts.Command) == 0 {
 		return Plan{}, fmt.Errorf("exec command is required")
 	}
-	portal, _, err := s.LoadPortal(SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID})
+	portal, _, err := s.LoadPortalForRuntime(ctx, SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID})
 	if err != nil {
 		return Plan{}, err
 	}
@@ -149,7 +150,7 @@ func (s Service) PlanExec(ctx context.Context, opts ExecOptions) (Plan, error) {
 }
 
 func (s Service) PlanSummon(ctx context.Context, opts SummonOptions) (Plan, error) {
-	portal, _, err := s.LoadPortal(SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID})
+	portal, _, err := s.LoadPortalForRuntime(ctx, SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID})
 	if err != nil {
 		return Plan{}, err
 	}
@@ -174,7 +175,7 @@ func (s Service) PlanSummon(ctx context.Context, opts SummonOptions) (Plan, erro
 }
 
 func (s Service) PlanSync(ctx context.Context, opts SyncOptions) (Plan, error) {
-	portal, spacePath, err := s.LoadPortal(SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID})
+	portal, spacePath, err := s.LoadPortalForRuntime(ctx, SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID})
 	if err != nil {
 		return Plan{}, err
 	}
@@ -227,11 +228,15 @@ func (s Service) PlanSync(ctx context.Context, opts SyncOptions) (Plan, error) {
 }
 
 func portalExecCommand(portal Portal, argv []string, cwd, user string, tty TTYMode, interactive bool) Command {
+	providerEnv := inheritedEnvNames(portal, argv)
 	switch portal.Driver {
 	case DriverDocker:
 		args := []string{"exec"}
 		if tty == TTYAlways || (tty == TTYAuto && interactive) {
 			args = append(args, "-it")
+		}
+		for _, name := range providerEnv {
+			args = append(args, "-e", name)
 		}
 		if user != "" {
 			args = append(args, "-u", user)
@@ -241,17 +246,23 @@ func portalExecCommand(portal Portal, argv []string, cwd, user string, tty TTYMo
 		}
 		args = append(args, portal.Runtime.ContainerName)
 		args = append(args, argv...)
-		return command(portal.Runtime.Engine, args...)
+		cmd := command(portal.Runtime.Engine, args...)
+		cmd.Interactive = interactive
+		return cmd
 	case DriverDevcontainer:
 		args := []string{"exec", "--workspace-folder", portal.Workspace.LocalPath}
 		if portal.Runtime.DevcontainerPath != "" {
 			args = append(args, "--config", portal.Runtime.DevcontainerPath)
 		}
 		args = append(args, argv...)
-		return command("devcontainer", args...)
+		cmd := command("devcontainer", args...)
+		cmd.Interactive = interactive
+		return cmd
 	case DriverSSH, DriverEC2Attach:
 		remote := "cd " + quoteRemote(cwd) + " && exec " + joinRemote(argv)
-		return sshCommand(portal, remote)
+		cmd := sshCommandWithEnv(portal, providerEnv, remote)
+		cmd.Interactive = interactive
+		return cmd
 	default:
 		return Command{}
 	}
@@ -266,7 +277,14 @@ func devcontainerCommand(portal Portal, action string) Command {
 }
 
 func sshCommand(portal Portal, remoteCommand string) Command {
+	return sshCommandWithEnv(portal, nil, remoteCommand)
+}
+
+func sshCommandWithEnv(portal Portal, envNames []string, remoteCommand string) Command {
 	args := sshArgs(portal)
+	for _, name := range envNames {
+		args = append(args, "-o", "SendEnv="+name)
+	}
 	args = append(args, sshDestination(portal), remoteCommand)
 	return command("ssh", args...)
 }
@@ -311,6 +329,27 @@ func rsyncCommands(portal Portal, opts SyncOptions, direction SyncDirection) ([]
 		commands = append(commands, rsyncCommand(portal, opts, remoteEndpoint(portal)+"/", portal.Workspace.LocalPath+"/"))
 	}
 	return commands, nil
+}
+
+func remotePrepareCommands(portal Portal, sync bool) []Command {
+	if !isRemoteDriver(portal.Driver) || portal.Workspace.RemoteRoot == "" || strings.TrimSpace(portal.Target.Host) == "" {
+		return nil
+	}
+	commands := []Command{sshCommand(portal, "mkdir -p "+quoteRemote(portal.Workspace.RemoteRoot))}
+	if sync {
+		var syncCommands []Command
+		var err error
+		switch portal.Workspace.SyncMode {
+		case SyncReconstruct:
+			syncCommands, err = reconstructCommands(portal, SyncOptions{})
+		default:
+			syncCommands, err = rsyncCommands(portal, SyncOptions{}, SyncTo)
+		}
+		if err == nil {
+			commands = append(commands, syncCommands...)
+		}
+	}
+	return commands
 }
 
 func reconstructCommands(portal Portal, opts SyncOptions) ([]Command, error) {
@@ -487,13 +526,52 @@ func sortedLabels(labels map[string]string) []string {
 
 func sshDestination(portal Portal) string {
 	host := portal.Target.Host
-	if host == "" && portal.Driver == DriverEC2Attach {
-		host = portal.Target.InstanceID
-	}
 	if portal.Target.SSHUser != "" {
 		return portal.Target.SSHUser + "@" + host
 	}
 	return host
+}
+
+func inheritedEnvNames(portal Portal, argv []string) []string {
+	if len(argv) == 0 {
+		return nil
+	}
+	provider := commandProvider(argv[0])
+	if provider == "" {
+		return nil
+	}
+	for _, current := range portal.Auth.Providers {
+		if current.Provider == provider && current.Mode == AuthEnv && current.Status == AuthOK {
+			return providerEnvNames(provider)
+		}
+	}
+	return nil
+}
+
+func commandProvider(program string) string {
+	switch filepath.Base(program) {
+	case "codex":
+		return "codex"
+	case "claude":
+		return "claude"
+	case "cursor-agent":
+		return "cursor"
+	default:
+		return ""
+	}
+}
+
+func providerEnvNames(provider string) []string {
+	switch provider {
+	case "codex":
+		return []string{"OPENAI_API_KEY", "CODEX_HOME"}
+	case "claude":
+		return []string{"ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR"}
+	case "cursor":
+		return []string{"CURSOR_API_KEY"}
+	default:
+		return nil
+	}
 }
 
 func remoteEndpoint(portal Portal) string {

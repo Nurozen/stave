@@ -9,6 +9,8 @@ type Command struct {
 	Args                []string
 	Dir                 string
 	Env                 []string
+	Stream              bool
+	Interactive         bool
 	ContinueOnError     bool
 	RunIfPreviousFailed bool
 }

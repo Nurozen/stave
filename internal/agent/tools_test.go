@@ -328,8 +328,8 @@ func TestToolDispatcherQueuesPortalMutationTools(t *testing.T) {
 		op   string
 	}{
 		{ToolPortalAttach, map[string]any{"space_id": "ex-1", "portal_id": "new-ssh", "driver": "ssh", "host": "host.test", "remote_root": "~/stave/ex-1"}, OpPortalAttach},
-		{ToolPortalAttach, map[string]any{"space_id": "ex-1", "portal_id": "new-ec2", "driver": "ec2-attach", "instance_id": "i-123", "region": "us-west-2", "ssh_user": "ec2-user"}, OpPortalAttach},
-		{ToolPortalConfigure, map[string]any{"space_id": "ex-1", "portal_id": "local", "agent": "cursor", "auth": "volume"}, OpPortalConfigure},
+		{ToolPortalAttach, map[string]any{"space_id": "ex-1", "portal_id": "new-ec2", "driver": "ec2-attach", "instance_id": "i-123", "host": "203.0.113.10", "region": "us-west-2", "ssh_user": "ec2-user"}, OpPortalAttach},
+		{ToolPortalConfigure, map[string]any{"space_id": "ex-1", "portal_id": "local", "host": "203.0.113.10", "agent": "cursor", "auth": "volume"}, OpPortalConfigure},
 		{ToolPortalAuthLogin, map[string]any{"space_id": "ex-1", "portal_id": "local", "provider": "codex", "method": "device"}, OpPortalAuthLogin},
 		{ToolPortalAuthInherit, map[string]any{"space_id": "ex-1", "portal_id": "local", "provider": "codex", "method": "env"}, OpPortalAuthInherit},
 		{ToolPortalAuthRevoke, map[string]any{"space_id": "ex-1", "portal_id": "local", "provider": "codex", "target": "portal"}, OpPortalAuthRevoke},
@@ -354,6 +354,9 @@ func TestToolDispatcherQueuesPortalMutationTools(t *testing.T) {
 		last := dispatcher.Session.Plan.Operations[len(dispatcher.Session.Plan.Operations)-1]
 		if last.Type != tc.op {
 			t.Fatalf("%s operations = %#v", tc.name, dispatcher.Session.Plan.Operations)
+		}
+		if host, ok := tc.args["host"].(string); ok && last.Host != host {
+			t.Fatalf("%s host = %q, want %q", tc.name, last.Host, host)
 		}
 		if !strings.Contains(result.Summary, tc.op) {
 			t.Fatalf("%s summary = %q", tc.name, result.Summary)

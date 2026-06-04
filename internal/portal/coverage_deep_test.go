@@ -261,8 +261,8 @@ func TestManageBranches(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !strings.Contains(inherit.EquivalentCommands()[0], "true") {
-			t.Fatalf("inherit = %v", inherit.EquivalentCommands())
+		if len(inherit.Commands) != 0 || len(inherit.Diagnostics) == 0 || !strings.Contains(inherit.Diagnostics[0].Code, "inherit") {
+			t.Fatalf("inherit = %#v commands=%v", inherit, inherit.EquivalentCommands())
 		}
 		if _, err := svc.PlanAuthInherit(ctx, AuthCommandOptions{SpaceID: "ex-1", Provider: "codex"}); err == nil || !strings.Contains(err.Error(), "method is required") {
 			t.Fatalf("expected missing method error, got %v", err)
@@ -292,6 +292,19 @@ func TestManageBranches(t *testing.T) {
 		}
 		if _, err := svc.PlanAuthInherit(ctx, AuthCommandOptions{SpaceID: "ex-1", Provider: "codex", Method: AuthEnv}); err == nil || !strings.Contains(err.Error(), "--yes") {
 			t.Fatalf("expected inherit confirmation error, got %v", err)
+		}
+		if _, err := svc.PlanAuthInherit(ctx, AuthCommandOptions{SpaceID: "ex-1", Provider: "codex", Method: AuthEnv, Yes: true}); err != nil {
+			t.Fatal(err)
+		}
+		summon, err := svc.PlanSummon(ctx, SummonOptions{SpaceID: "ex-1", With: "codex", Mode: "print"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(summon.EquivalentCommands()[0], "-e OPENAI_API_KEY") {
+			t.Fatalf("inherited env summon = %v", summon.EquivalentCommands())
+		}
+		if len(providerEnvNames("claude")) == 0 || len(providerEnvNames("cursor")) == 0 || len(providerEnvNames("unknown")) != 0 {
+			t.Fatalf("provider env names not covered")
 		}
 		revoke, err := svc.PlanAuthRevoke(ctx, AuthCommandOptions{SpaceID: "ex-1", Provider: "codex", Target: "all", DryRun: true})
 		if err != nil {

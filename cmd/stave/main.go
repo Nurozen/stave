@@ -9,8 +9,19 @@ import (
 
 func main() {
 	if err := run(); err != nil {
+		code := 1
+		if exitErr, ok := err.(interface {
+			ExitCode() int
+			Silent() bool
+		}); ok {
+			code = exitErr.ExitCode()
+			if !exitErr.Silent() {
+				fmt.Fprintln(os.Stderr, err)
+			}
+			os.Exit(code)
+		}
 		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		os.Exit(code)
 	}
 }
 

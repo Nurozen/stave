@@ -19,7 +19,7 @@ func TestConfigureAuthLogsExecAndDriverBranches(t *testing.T) {
 	if _, err := svc.InitDevcontainer(context.Background(), InitDevcontainerOptions{SpaceID: "ex-1", PortalID: "dev", Service: "api"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.AttachEC2(context.Background(), AttachEC2Options{SpaceID: "ex-1", PortalID: "aws", InstanceID: "i-123", Region: "us-west-2", SSHUser: "ec2-user"}); err != nil {
+	if _, err := svc.AttachEC2(context.Background(), AttachEC2Options{SpaceID: "ex-1", PortalID: "aws", InstanceID: "i-123", Host: "203.0.113.10", Region: "us-west-2", SSHUser: "ec2-user"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := svc.Configure(ConfigureOptions{SpaceID: "ex-1", PortalID: "dev", Agent: "cursor", AuthMode: AuthVolume, ContainerRoot: "/workspace/dev"}); err != nil {

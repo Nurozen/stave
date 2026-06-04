@@ -421,10 +421,11 @@ func TestCLIPortalDevcontainerSSHAndEC2(t *testing.T) {
 	t.Setenv("HOME", home)
 	runCLI(t, "setup")
 	runCLI(t, "space", "init", "ex-1234")
+	application := &app{portalRunner: &fakePortalRunner{}}
 
 	runCLI(t, "portal", "init", "devcontainer", "ex-1234", "dev", "--path", ".devcontainer/devcontainer.json", "--service", "api")
-	runCLI(t, "portal", "attach", "ssh", "ex-1234", "devbox.example", "ssh-dev", "--preset", "ssh-codex")
-	runCLI(t, "portal", "attach", "ec2", "ex-1234", "i-123", "aws", "--region", "us-west-2", "--ssh-user", "ec2-user")
+	runCLIWithApp(t, application, "portal", "attach", "ssh", "ex-1234", "devbox.example", "ssh-dev", "--preset", "ssh-codex")
+	runCLIWithApp(t, application, "portal", "attach", "ec2", "ex-1234", "i-123", "aws", "--region", "us-west-2", "--ssh-user", "ec2-user", "--host", "203.0.113.10")
 
 	manifest, err := portal.LoadManifest(filepath.Join(home, "stave", "agent-work", "ex-1234"))
 	if err != nil {
@@ -436,7 +437,7 @@ func TestCLIPortalDevcontainerSSHAndEC2(t *testing.T) {
 	if manifest.Portals["ssh-dev"].Driver != portal.DriverSSH || manifest.Portals["ssh-dev"].Target.Host != "devbox.example" {
 		t.Fatalf("ssh = %#v", manifest.Portals["ssh-dev"])
 	}
-	if manifest.Portals["aws"].Driver != portal.DriverEC2Attach || manifest.Portals["aws"].Target.Region != "us-west-2" {
+	if manifest.Portals["aws"].Driver != portal.DriverEC2Attach || manifest.Portals["aws"].Target.Region != "us-west-2" || manifest.Portals["aws"].Target.Host != "203.0.113.10" {
 		t.Fatalf("ec2 = %#v", manifest.Portals["aws"])
 	}
 }
@@ -446,7 +447,7 @@ func TestCLIPortalDryRunShellSummonAndDetach(t *testing.T) {
 	t.Setenv("HOME", home)
 	runCLI(t, "setup")
 	runCLI(t, "space", "init", "ex-1234")
-	runCLI(t, "portal", "attach", "ssh", "ex-1234", "devbox.example")
+	runCLIWithApp(t, &app{portalRunner: &fakePortalRunner{}}, "portal", "attach", "ssh", "ex-1234", "devbox.example")
 
 	shellCmd := newRootCommand(&app{isTerminal: func(cmd *cobra.Command) bool { return false }})
 	shellCmd.SetArgs([]string{"portal", "shell", "ex-1234"})
@@ -480,7 +481,7 @@ func TestCLIPortalPlanningCommandsExecuteAndPreview(t *testing.T) {
 	runCLI(t, "setup")
 	runCLI(t, "space", "init", "ex-1234")
 	runCLI(t, "portal", "init", "container", "ex-1234")
-	runner := &fakePortalRunner{}
+	runner := &fakePortalRunner{result: portal.RunResult{Stdout: "portal stdout\n", Stderr: "portal stderr\n"}}
 	application := &app{portalRunner: runner, isTerminal: func(cmd *cobra.Command) bool { return true }}
 
 	for _, tc := range []struct {
@@ -489,13 +490,13 @@ func TestCLIPortalPlanningCommandsExecuteAndPreview(t *testing.T) {
 		want     string
 		executes bool
 	}{
-		{name: "auth login", args: []string{"portal", "auth", "login", "ex-1234", "--provider", "codex", "--method", "native"}, want: "auth-login for codex", executes: true},
-		{name: "auth inherit", args: []string{"portal", "auth", "inherit", "ex-1234", "--provider", "codex", "--method", "env", "--yes"}, want: "auth-inherit for codex", executes: true},
+		{name: "auth login", args: []string{"portal", "auth", "login", "ex-1234", "--provider", "codex", "--method", "native"}, want: "portal stdout", executes: true},
+		{name: "auth inherit", args: []string{"portal", "auth", "inherit", "ex-1234", "--provider", "codex", "--method", "env", "--yes"}, want: "auth-inherit for codex"},
 		{name: "auth revoke dry-run", args: []string{"portal", "auth", "revoke", "ex-1234", "--provider", "codex", "--target", "all", "--dry-run"}, want: "auth-revoke for codex"},
-		{name: "up executes", args: []string{"portal", "up", "ex-1234"}, want: "start or validate portal default", executes: true},
+		{name: "up executes", args: []string{"portal", "up", "ex-1234"}, want: "portal stdout", executes: true},
 		{name: "up print command", args: []string{"portal", "up", "ex-1234", "--print-command"}, want: "docker start"},
 		{name: "up attach shell print command", args: []string{"portal", "up", "ex-1234", "--print-command", "--attach", "shell", "--workdir", "/workspace/ex-1234/references"}, want: "docker exec -it -w /workspace/ex-1234/references"},
-		{name: "exec executes", args: []string{"portal", "exec", "ex-1234", "default", "true"}, want: "run command in portal default", executes: true},
+		{name: "exec executes", args: []string{"portal", "exec", "ex-1234", "default", "true"}, want: "portal stdout", executes: true},
 		{name: "sync dry-run", args: []string{"portal", "sync", "ex-1234", "--dry-run", "--include", "*.go", "--exclude", ".git", "--delete", "--max-delete", "3", "--yes"}, want: "sync portal default"},
 		{name: "sync auto dry-run", args: []string{"portal", "sync", "ex-1234", "--dry-run", "--mode", "auto"}, want: "sync.mount_noop"},
 		{name: "logs preview", args: []string{"portal", "logs", "ex-1234", "--tail", "5", "--follow"}, want: "show logs for portal default"},
@@ -519,7 +520,7 @@ func TestCLIPortalPlanningCommandsExecuteAndPreview(t *testing.T) {
 
 	runner.err = errors.New("runner stopped")
 	out, err := runCLIError(t, application, "portal", "up", "ex-1234")
-	if err == nil || !strings.Contains(err.Error(), "runner stopped") || !strings.Contains(out, "docker start") {
+	if err == nil || !strings.Contains(err.Error(), "runner stopped") || out != "" {
 		t.Fatalf("expected portal up runner error, err=%v out=%s", err, out)
 	}
 
@@ -527,7 +528,8 @@ func TestCLIPortalPlanningCommandsExecuteAndPreview(t *testing.T) {
 	if !strings.Contains(printSummon, "claude") || !strings.Contains(printSummon, "portal auth login") {
 		t.Fatalf("summon print output = %s", printSummon)
 	}
-	runCLI(t, "portal", "attach", "ssh", "ex-1234", "devbox.example", "remote")
+	runner.err = nil
+	runCLIWithApp(t, application, "portal", "attach", "ssh", "ex-1234", "devbox.example", "remote")
 	detachDryRun := runCLI(t, "portal", "detach", "ex-1234", "remote", "--dry-run")
 	if !strings.Contains(detachDryRun, "remove portal metadata remote") {
 		t.Fatalf("detach dry-run output = %s", detachDryRun)
@@ -538,7 +540,7 @@ func TestCLIRunPortalPlanningCommandRunnerPaths(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	runCLI(t, "setup")
-	runner := &fakePortalRunner{}
+	runner := &fakePortalRunner{result: portal.RunResult{Stdout: "portal stdout\n", Stderr: "portal stderr\n"}}
 	cmd := &cobra.Command{}
 	var out bytes.Buffer
 	cmd.SetOut(&out)
@@ -554,13 +556,16 @@ func TestCLIRunPortalPlanningCommandRunnerPaths(t *testing.T) {
 	if err := application.runPortalPlanningCommand(cmd, build, false, false); err != nil {
 		t.Fatalf("runPortalPlanningCommand error = %v\n%s", err, out.String())
 	}
-	if len(runner.runs) != 2 || !strings.Contains(out.String(), "portal-one ok") {
+	if len(runner.runs) != 2 || strings.Contains(out.String(), "portal-one ok") || !strings.Contains(out.String(), "portal stdout") || !strings.Contains(out.String(), "portal stderr") {
 		t.Fatalf("runner=%#v out=%s", runner.runs, out.String())
 	}
 
 	out.Reset()
 	if err := application.runPortalPlanningCommand(cmd, build, true, false); err != nil {
 		t.Fatalf("dry-run portal planning error = %v", err)
+	}
+	if !strings.Contains(out.String(), "portal-one ok") {
+		t.Fatalf("dry-run did not print plan: %s", out.String())
 	}
 	if len(runner.runs) != 2 {
 		t.Fatalf("dry-run executed commands: %#v", runner.runs)
@@ -569,6 +574,9 @@ func TestCLIRunPortalPlanningCommandRunnerPaths(t *testing.T) {
 	out.Reset()
 	if err := application.runPortalPlanningCommand(cmd, build, false, true); err != nil {
 		t.Fatalf("print-only portal planning error = %v", err)
+	}
+	if !strings.Contains(out.String(), "portal-one ok") {
+		t.Fatalf("print-only did not print plan: %s", out.String())
 	}
 	if len(runner.runs) != 2 {
 		t.Fatalf("print-only executed commands: %#v", runner.runs)
@@ -579,8 +587,7 @@ func TestCLIRunPortalPlanningCommandRunnerPaths(t *testing.T) {
 	out.Reset()
 	if err := application.runPortalPlanningCommand(cmd, build, false, false); err == nil ||
 		!strings.Contains(err.Error(), "portal runner failed") ||
-		!strings.Contains(err.Error(), "runtime details") ||
-		!strings.Contains(err.Error(), "portal-one ok") {
+		!strings.Contains(err.Error(), "runtime details") {
 		t.Fatalf("expected runner error, got %v", err)
 	}
 }

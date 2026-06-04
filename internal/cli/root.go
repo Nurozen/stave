@@ -694,20 +694,13 @@ func (a *app) portalAttachSSHCommand() *cobra.Command {
 		Short: "Attach an existing SSH host",
 		Args:  cobra.RangeArgs(2, 3),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			svc, err := a.portalService(cmd)
-			if err != nil {
-				return err
-			}
 			portalID := ""
 			if len(args) == 3 {
 				portalID = args[2]
 			}
-			plan, err := svc.AttachSSH(cmd.Context(), portal.AttachSSHOptions{SpaceID: args[0], Host: args[1], PortalID: portalID, Port: port, IdentityPath: identity, KnownHostsPath: knownHosts, StrictHostKey: strictHostKey, RemoteRoot: remoteRoot, SyncMode: portal.SyncMode(syncMode), Preset: preset, DryRun: dryRun})
-			if err != nil {
-				return err
-			}
-			printPortalPlan(cmd.OutOrStdout(), plan)
-			return nil
+			return a.runPortalPlanningCommand(cmd, func(svc portal.Service) (portal.Plan, error) {
+				return svc.AttachSSH(cmd.Context(), portal.AttachSSHOptions{SpaceID: args[0], Host: args[1], PortalID: portalID, Port: port, IdentityPath: identity, KnownHostsPath: knownHosts, StrictHostKey: strictHostKey, RemoteRoot: remoteRoot, SyncMode: portal.SyncMode(syncMode), Preset: preset, DryRun: dryRun})
+			}, dryRun, false)
 		},
 	}
 	cmd.Flags().StringVar(&remoteRoot, "remote-root", "", "remote space root")
@@ -722,33 +715,31 @@ func (a *app) portalAttachSSHCommand() *cobra.Command {
 }
 
 func (a *app) portalAttachEC2Command() *cobra.Command {
-	var region, profile, sshUser, identity, remoteRoot, syncMode, preset string
+	var region, profile, sshUser, identity, knownHosts, strictHostKey, remoteRoot, syncMode, preset, host string
+	var port int
 	var dryRun bool
 	cmd := &cobra.Command{
 		Use:   "ec2 <space-id> <instance-id> [portal-id]",
 		Short: "Attach an existing EC2 instance",
 		Args:  cobra.RangeArgs(2, 3),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			svc, err := a.portalService(cmd)
-			if err != nil {
-				return err
-			}
 			portalID := ""
 			if len(args) == 3 {
 				portalID = args[2]
 			}
-			plan, err := svc.AttachEC2(cmd.Context(), portal.AttachEC2Options{SpaceID: args[0], InstanceID: args[1], PortalID: portalID, Region: region, Profile: profile, SSHUser: sshUser, IdentityPath: identity, RemoteRoot: remoteRoot, SyncMode: portal.SyncMode(syncMode), Preset: preset, DryRun: dryRun})
-			if err != nil {
-				return err
-			}
-			printPortalPlan(cmd.OutOrStdout(), plan)
-			return nil
+			return a.runPortalPlanningCommand(cmd, func(svc portal.Service) (portal.Plan, error) {
+				return svc.AttachEC2(cmd.Context(), portal.AttachEC2Options{SpaceID: args[0], InstanceID: args[1], Host: host, Port: port, PortalID: portalID, Region: region, Profile: profile, SSHUser: sshUser, IdentityPath: identity, KnownHostsPath: knownHosts, StrictHostKey: strictHostKey, RemoteRoot: remoteRoot, SyncMode: portal.SyncMode(syncMode), Preset: preset, DryRun: dryRun})
+			}, dryRun, false)
 		},
 	}
 	cmd.Flags().StringVar(&region, "region", "", "AWS region")
 	cmd.Flags().StringVar(&profile, "profile", "", "AWS profile")
+	cmd.Flags().StringVar(&host, "host", "", "SSH host, DNS name, or IP address; resolved from EC2 metadata when omitted")
+	cmd.Flags().IntVar(&port, "port", 22, "ssh port")
 	cmd.Flags().StringVar(&sshUser, "ssh-user", "", "SSH username")
 	cmd.Flags().StringVar(&identity, "identity", "", "ssh identity path")
+	cmd.Flags().StringVar(&knownHosts, "known-hosts", "", "ssh known_hosts file")
+	cmd.Flags().StringVar(&strictHostKey, "strict-host-key", "", "ssh StrictHostKeyChecking value")
 	cmd.Flags().StringVar(&remoteRoot, "remote-root", "", "remote space root")
 	cmd.Flags().StringVar(&syncMode, "sync", "", "sync mode: rsync or reconstruct")
 	cmd.Flags().StringVar(&preset, "preset", "", "preset such as ssh-codex or ssh-claude")
@@ -757,7 +748,7 @@ func (a *app) portalAttachEC2Command() *cobra.Command {
 }
 
 func (a *app) portalConfigureCommand() *cobra.Command {
-	var syncMode, containerRoot, remoteRoot, agentName, authMode string
+	var syncMode, containerRoot, remoteRoot, host, agentName, authMode string
 	var dryRun bool
 	cmd := &cobra.Command{
 		Use:   "configure <space-id> [portal-id]",
@@ -768,7 +759,7 @@ func (a *app) portalConfigureCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			plan, err := svc.Configure(portal.ConfigureOptions{SpaceID: args[0], PortalID: optionalPortalID(args), SyncMode: portal.SyncMode(syncMode), ContainerRoot: containerRoot, RemoteRoot: remoteRoot, Agent: agentName, AuthMode: portal.AuthMode(authMode), DryRun: dryRun})
+			plan, err := svc.Configure(portal.ConfigureOptions{SpaceID: args[0], PortalID: optionalPortalID(args), SyncMode: portal.SyncMode(syncMode), ContainerRoot: containerRoot, RemoteRoot: remoteRoot, Host: host, Agent: agentName, AuthMode: portal.AuthMode(authMode), DryRun: dryRun})
 			if err != nil {
 				return err
 			}
@@ -779,6 +770,7 @@ func (a *app) portalConfigureCommand() *cobra.Command {
 	cmd.Flags().StringVar(&syncMode, "sync", "", "sync mode")
 	cmd.Flags().StringVar(&containerRoot, "container-root", "", "container root")
 	cmd.Flags().StringVar(&remoteRoot, "remote-root", "", "remote root")
+	cmd.Flags().StringVar(&host, "host", "", "SSH host, DNS name, or IP address for remote portals")
 	cmd.Flags().StringVar(&agentName, "agent", "", "agent provider: codex, claude, or cursor")
 	cmd.Flags().StringVar(&authMode, "auth", "", "auth mode")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview without writing")
@@ -1408,7 +1400,9 @@ func (a *app) runPortalPlanningCommand(cmd *cobra.Command, build func(portal.Ser
 	if err != nil {
 		return err
 	}
-	printPortalPlan(cmd.OutOrStdout(), plan)
+	if dryRun || printOnly || len(plan.Commands) == 0 {
+		printPortalPlan(cmd.OutOrStdout(), plan)
+	}
 	if dryRun || printOnly || len(plan.Commands) == 0 {
 		return nil
 	}
@@ -1417,25 +1411,79 @@ func (a *app) runPortalPlanningCommand(cmd *cobra.Command, build func(portal.Ser
 		if command.RunIfPreviousFailed && !previousFailed {
 			continue
 		}
+		command.Stream = !command.ContinueOnError
 		result, err := svc.Runner.Run(cmd.Context(), command)
 		if err != nil {
 			previousFailed = true
 			if command.ContinueOnError {
 				continue
 			}
-			return portalCommandError(command, result, err)
+			printed := command.Stream || printPortalRunResult(cmd, result)
+			cmd.SilenceUsage = true
+			cmd.SilenceErrors = true
+			return portalCommandError(command, result, err, printed)
 		}
+		printPortalRunResult(cmd, result)
 		previousFailed = false
 	}
 	return nil
 }
 
-func portalCommandError(command portal.Command, result portal.RunResult, err error) error {
-	output := strings.TrimSpace(firstNonEmpty(result.Stderr, result.Stdout))
-	if output == "" {
-		return fmt.Errorf("%s failed: %w", command.String(), err)
+type portalRunError struct {
+	command  portal.Command
+	err      error
+	exitCode int
+	silent   bool
+}
+
+func (e portalRunError) Error() string {
+	return fmt.Sprintf("portal command failed: %s\n%v", e.command.String(), e.err)
+}
+
+func (e portalRunError) Unwrap() error {
+	return e.err
+}
+
+func (e portalRunError) ExitCode() int {
+	if e.exitCode > 0 {
+		return e.exitCode
 	}
-	return fmt.Errorf("%s failed: %w: %s", command.String(), err, output)
+	return 1
+}
+
+func (e portalRunError) Silent() bool {
+	return e.silent
+}
+
+func portalCommandError(command portal.Command, result portal.RunResult, err error, printed bool) error {
+	output := strings.TrimSpace(strings.Join(nonEmptyStrings(result.Stderr, result.Stdout), "\n"))
+	if output == "" {
+		return portalRunError{command: command, err: err, exitCode: result.ExitCode, silent: printed}
+	}
+	return portalRunError{command: command, err: fmt.Errorf("%w\n%s", err, output), exitCode: result.ExitCode, silent: printed}
+}
+
+func printPortalRunResult(cmd *cobra.Command, result portal.RunResult) bool {
+	printed := false
+	if result.Stdout != "" {
+		_, _ = fmt.Fprint(cmd.OutOrStdout(), result.Stdout)
+		printed = true
+	}
+	if result.Stderr != "" {
+		_, _ = fmt.Fprint(cmd.ErrOrStderr(), result.Stderr)
+		printed = true
+	}
+	return printed
+}
+
+func nonEmptyStrings(values ...string) []string {
+	var out []string
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			out = append(out, strings.TrimSpace(value))
+		}
+	}
+	return out
 }
 
 func printPortalPlan(out io.Writer, plan portal.Plan) {

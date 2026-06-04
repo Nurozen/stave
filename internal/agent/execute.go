@@ -138,16 +138,17 @@ func (e Executor) executeOperation(ctx context.Context, op Operation) error {
 		_, err := svc.InitContainer(ctx, portal.InitContainerOptions{SpaceID: op.SpaceID, PortalID: op.PortalID, Engine: driver, Image: op.Image, ContainerRoot: op.ContainerRoot, Preset: op.Preset})
 		return err
 	case OpPortalAttach:
-		svc := portal.NewService(e.Config, e.PortalRunner, nil)
 		if op.Driver == string(portal.DriverEC2Attach) || op.Driver == "ec2" {
-			_, err := svc.AttachEC2(ctx, portal.AttachEC2Options{SpaceID: op.SpaceID, PortalID: op.PortalID, InstanceID: op.InstanceID, Region: op.Region, Profile: op.Profile, SSHUser: op.SSHUser, IdentityPath: op.IdentityPath, RemoteRoot: op.RemoteRoot, SyncMode: portal.SyncMode(op.SyncMode), Preset: op.Preset})
-			return err
+			return e.executePortalPlan(ctx, out, func(svc portal.Service) (portal.Plan, error) {
+				return svc.AttachEC2(ctx, portal.AttachEC2Options{SpaceID: op.SpaceID, PortalID: op.PortalID, InstanceID: op.InstanceID, Host: op.Host, Port: op.Port, Region: op.Region, Profile: op.Profile, SSHUser: op.SSHUser, IdentityPath: op.IdentityPath, KnownHostsPath: op.KnownHostsPath, StrictHostKey: op.StrictHostKey, RemoteRoot: op.RemoteRoot, SyncMode: portal.SyncMode(op.SyncMode), Preset: op.Preset})
+			})
 		}
-		_, err := svc.AttachSSH(ctx, portal.AttachSSHOptions{SpaceID: op.SpaceID, PortalID: op.PortalID, Host: op.Host, Port: op.Port, IdentityPath: op.IdentityPath, RemoteRoot: op.RemoteRoot, SyncMode: portal.SyncMode(op.SyncMode), Preset: op.Preset})
-		return err
+		return e.executePortalPlan(ctx, out, func(svc portal.Service) (portal.Plan, error) {
+			return svc.AttachSSH(ctx, portal.AttachSSHOptions{SpaceID: op.SpaceID, PortalID: op.PortalID, Host: op.Host, Port: op.Port, IdentityPath: op.IdentityPath, KnownHostsPath: op.KnownHostsPath, StrictHostKey: op.StrictHostKey, RemoteRoot: op.RemoteRoot, SyncMode: portal.SyncMode(op.SyncMode), Preset: op.Preset})
+		})
 	case OpPortalConfigure:
 		svc := portal.NewService(e.Config, e.PortalRunner, nil)
-		_, err := svc.Configure(portal.ConfigureOptions{SpaceID: op.SpaceID, PortalID: op.PortalID, SyncMode: portal.SyncMode(op.SyncMode), ContainerRoot: op.ContainerRoot, RemoteRoot: op.RemoteRoot, Agent: op.Agent, AuthMode: portal.AuthMode(op.Method)})
+		_, err := svc.Configure(portal.ConfigureOptions{SpaceID: op.SpaceID, PortalID: op.PortalID, SyncMode: portal.SyncMode(op.SyncMode), ContainerRoot: op.ContainerRoot, RemoteRoot: op.RemoteRoot, Host: op.Host, Agent: op.Agent, AuthMode: portal.AuthMode(op.Method)})
 		return err
 	case OpPortalAuthLogin:
 		return e.executePortalPlan(ctx, out, func(svc portal.Service) (portal.Plan, error) {
@@ -201,7 +202,15 @@ func (e Executor) executePortalPlan(ctx context.Context, out io.Writer, build fu
 	for _, command := range plan.Commands {
 		fmt.Fprintf(out, "%s\n", command.String())
 		if e.PortalRunner != nil {
-			if _, err := e.PortalRunner.Run(ctx, command); err != nil {
+			command.Stream = true
+			result, err := e.PortalRunner.Run(ctx, command)
+			if result.Stdout != "" {
+				fmt.Fprint(out, result.Stdout)
+			}
+			if result.Stderr != "" {
+				fmt.Fprint(out, result.Stderr)
+			}
+			if err != nil {
 				return err
 			}
 		}

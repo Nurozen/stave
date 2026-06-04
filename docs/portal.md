@@ -198,13 +198,21 @@ Attach an existing EC2 instance:
 stave portal attach ec2 example i-0123456789abcdef0 ec2 \
   --region us-west-2 \
   --ssh-user ec2-user \
+  --host ec2-203-0-113-10.us-west-2.compute.amazonaws.com \
+  --port 22 \
   --identity ~/.ssh/id_ed25519 \
+  --known-hosts ~/.ssh/known_hosts \
+  --strict-host-key yes \
   --remote-root /home/ec2-user/stave/example \
   --sync rsync
 ```
 
 Portal v1 does not create, start, stop, or terminate EC2 instances. It records
 how to reach an existing instance and plans commands against that attachment.
+The `instance-id` remains the AWS id used for EC2 metadata lookups. SSH and
+rsync use `target.host`, which you can pass with `--host`; when omitted, Stave
+tries to resolve a public DNS name, public IP address, or private IP address
+from `aws ec2 describe-instances`.
 
 Use dry-run when you want to check the plan without contacting or mutating the
 target:
@@ -403,6 +411,9 @@ Other useful fields:
 ```sh
 stave portal configure example remote \
   --remote-root /home/user/stave/example
+
+stave portal configure example ec2 \
+  --host 10.0.0.9
 
 stave portal configure example dev \
   --container-root /workspace/example

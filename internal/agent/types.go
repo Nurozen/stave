@@ -99,6 +99,8 @@ type Operation struct {
 	Profile          string    `json:"profile,omitempty"`
 	SSHUser          string    `json:"ssh_user,omitempty"`
 	IdentityPath     string    `json:"identity_path,omitempty"`
+	KnownHostsPath   string    `json:"known_hosts_path,omitempty"`
+	StrictHostKey    string    `json:"strict_host_key,omitempty"`
 	RemoteRoot       string    `json:"remote_root,omitempty"`
 	ContainerRoot    string    `json:"container_root,omitempty"`
 	DevcontainerPath string    `json:"devcontainer_path,omitempty"`
@@ -344,8 +346,13 @@ func EquivalentCommand(op Operation) string {
 		appendFlagValue(&parts, "--remote-root", op.RemoteRoot)
 		appendIntFlag(&parts, "--port", op.Port)
 		appendFlagValue(&parts, "--identity", op.IdentityPath)
+		appendFlagValue(&parts, "--known-hosts", op.KnownHostsPath)
+		appendFlagValue(&parts, "--strict-host-key", op.StrictHostKey)
 		appendFlagValue(&parts, "--sync", op.SyncMode)
 		appendFlagValue(&parts, "--preset", op.Preset)
+		if op.Driver == string(portal.DriverEC2Attach) || op.Driver == "ec2" {
+			appendFlagValue(&parts, "--host", op.Host)
+		}
 		appendFlagValue(&parts, "--region", op.Region)
 		appendFlagValue(&parts, "--profile", op.Profile)
 		appendFlagValue(&parts, "--ssh-user", op.SSHUser)
@@ -356,6 +363,7 @@ func EquivalentCommand(op Operation) string {
 		appendFlagValue(&parts, "--sync", op.SyncMode)
 		appendFlagValue(&parts, "--container-root", op.ContainerRoot)
 		appendFlagValue(&parts, "--remote-root", op.RemoteRoot)
+		appendFlagValue(&parts, "--host", op.Host)
 		appendFlagValue(&parts, "--agent", op.Agent)
 		appendFlagValue(&parts, "--auth", op.Method)
 		return strings.Join(parts, " ")

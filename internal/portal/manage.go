@@ -13,6 +13,7 @@ type ConfigureOptions struct {
 	SyncMode      SyncMode
 	ContainerRoot string
 	RemoteRoot    string
+	Host          string
 	Agent         string
 	AuthMode      AuthMode
 	DryRun        bool
@@ -79,6 +80,9 @@ func (s Service) Configure(opts ConfigureOptions) (Plan, error) {
 	if opts.RemoteRoot != "" {
 		portal.Workspace.RemoteRoot = opts.RemoteRoot
 	}
+	if opts.Host != "" {
+		portal.Target.Host = opts.Host
+	}
 	if opts.AuthMode != "" {
 		portal.Auth.Mode = opts.AuthMode
 		for i := range portal.Auth.Providers {
@@ -126,11 +130,25 @@ func (s Service) PlanAuthInherit(ctx context.Context, opts AuthCommandOptions) (
 	if !opts.DryRun && !opts.Yes {
 		return Plan{}, fmt.Errorf("auth inherit requires --yes unless --dry-run is used")
 	}
-	return s.planAuthCommand(ctx, "auth-inherit", opts, []string{"true"})
+	portal, spacePath, err := s.LoadPortalForRuntime(ctx, SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID})
+	if err != nil {
+		return Plan{}, err
+	}
+	if err := validateProviderName(opts.Provider); err != nil {
+		return Plan{}, err
+	}
+	plan := Plan{Operation: "auth-inherit", DryRun: opts.DryRun, Mutates: true, Summary: fmt.Sprintf("auth-inherit for %s in portal %s", opts.Provider, portal.ID)}
+	plan.Diagnostics = append(plan.Diagnostics, Diagnostic{Component: "auth", Severity: SeverityInfo, Code: "auth.inherit_configured", Message: fmt.Sprintf("portal will use explicit %s auth inheritance for %s", opts.Method, opts.Provider)})
+	if opts.DryRun {
+		return plan, nil
+	}
+	if err := s.updateAuthProvider(spacePath, portal.ID, opts.Provider, opts.Method, AuthOK); err != nil {
+		return Plan{}, err
+	}
+	return plan, nil
 }
 
 func (s Service) PlanAuthRevoke(ctx context.Context, opts AuthCommandOptions) (Plan, error) {
-	_ = ctx
 	target := firstString(opts.Target, "portal")
 	if err := validateAuthTarget(target); err != nil {
 		return Plan{}, err
@@ -138,7 +156,7 @@ func (s Service) PlanAuthRevoke(ctx context.Context, opts AuthCommandOptions) (P
 	if !opts.DryRun && !opts.Yes {
 		return Plan{}, fmt.Errorf("auth revoke requires --yes unless --dry-run is used")
 	}
-	portal, _, err := s.LoadPortal(SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID})
+	portal, _, err := s.LoadPortalForRuntime(ctx, SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID})
 	if err != nil {
 		return Plan{}, err
 	}
@@ -156,8 +174,7 @@ func (s Service) PlanAuthRevoke(ctx context.Context, opts AuthCommandOptions) (P
 }
 
 func (s Service) planAuthCommand(ctx context.Context, operation string, opts AuthCommandOptions, argv []string) (Plan, error) {
-	_ = ctx
-	portal, _, err := s.LoadPortal(SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID})
+	portal, _, err := s.LoadPortalForRuntime(ctx, SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID})
 	if err != nil {
 		return Plan{}, err
 	}
@@ -170,8 +187,7 @@ func (s Service) planAuthCommand(ctx context.Context, operation string, opts Aut
 }
 
 func (s Service) PlanLogs(ctx context.Context, opts LogsOptions) (Plan, error) {
-	_ = ctx
-	portal, _, err := s.LoadPortal(SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID})
+	portal, _, err := s.LoadPortalForRuntime(ctx, SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID})
 	if err != nil {
 		return Plan{}, err
 	}
@@ -321,6 +337,30 @@ func commandFromArgv(argv []string) Command {
 		return Command{}
 	}
 	return command(argv[0], argv[1:]...)
+}
+
+func (s Service) updateAuthProvider(spacePath, portalID, provider string, mode AuthMode, status AuthStatus) error {
+	manifest, err := LoadManifest(spacePath)
+	if err != nil {
+		return err
+	}
+	portal := manifest.Portals[portalID]
+	portal.Auth.Mode = mode
+	found := false
+	for i := range portal.Auth.Providers {
+		if portal.Auth.Providers[i].Provider == provider {
+			portal.Auth.Providers[i].Mode = mode
+			portal.Auth.Providers[i].Status = status
+			portal.Auth.Providers[i].Target = "portal"
+			found = true
+			break
+		}
+	}
+	if !found {
+		portal.Auth.Providers = append(portal.Auth.Providers, AuthProvider{Provider: provider, Mode: mode, Target: "portal", Status: status})
+	}
+	manifest.Portals[portalID] = portal
+	return SaveManifest(spacePath, manifest)
 }
 
 func validateProviderName(provider string) error {

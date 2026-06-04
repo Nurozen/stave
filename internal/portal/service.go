@@ -1,6 +1,7 @@
 package portal
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -80,17 +81,21 @@ type AttachSSHOptions struct {
 }
 
 type AttachEC2Options struct {
-	SpaceID      string
-	PortalID     string
-	InstanceID   string
-	Region       string
-	Profile      string
-	SSHUser      string
-	IdentityPath string
-	RemoteRoot   string
-	SyncMode     SyncMode
-	Preset       string
-	DryRun       bool
+	SpaceID        string
+	PortalID       string
+	InstanceID     string
+	Host           string
+	Port           int
+	Region         string
+	Profile        string
+	SSHUser        string
+	IdentityPath   string
+	KnownHostsPath string
+	StrictHostKey  string
+	RemoteRoot     string
+	SyncMode       SyncMode
+	Preset         string
+	DryRun         bool
 }
 
 type SelectOptions struct {
@@ -236,6 +241,7 @@ func (s Service) AttachSSH(ctx context.Context, opts AttachSSHOptions) (Plan, er
 	if err := setManifestPreview(&plan, spacePath, manifest); err != nil {
 		return Plan{}, err
 	}
+	plan.Commands = append(plan.Commands, remotePrepareCommands(portal, opts.SyncMode != "")...)
 	if opts.DryRun {
 		plan.Diagnostics = append(plan.Diagnostics, Diagnostic{Component: "manifest", Severity: SeverityInfo, Code: "manifest.preview", Message: "dry-run only; manifest was not written", Evidence: filepath.Join(spacePath, ManifestName)})
 		return plan, nil
@@ -264,7 +270,7 @@ func (s Service) AttachEC2(ctx context.Context, opts AttachEC2Options) (Plan, er
 			RemoteRoot: opts.RemoteRoot,
 			SyncMode:   firstSyncMode(opts.SyncMode, SyncRsync),
 		},
-		Target: Target{InstanceID: opts.InstanceID, Region: opts.Region, Profile: opts.Profile, SSHUser: opts.SSHUser, IdentityPath: opts.IdentityPath},
+		Target: Target{Host: opts.Host, Port: opts.Port, InstanceID: opts.InstanceID, Region: opts.Region, Profile: opts.Profile, SSHUser: opts.SSHUser, IdentityPath: opts.IdentityPath, KnownHostsPath: opts.KnownHostsPath, StrictHostKey: opts.StrictHostKey},
 	}
 	applyPreset(opts.Preset, &portal)
 	portal.Driver = DriverEC2Attach
@@ -277,9 +283,19 @@ func (s Service) AttachEC2(ctx context.Context, opts AttachEC2Options) (Plan, er
 	}
 	manifest.Portals[portalID] = portal
 	plan := Plan{Operation: "attach-ec2", DryRun: opts.DryRun, Mutates: true, Summary: fmt.Sprintf("record ec2 attach portal %s for space %s", portalID, opts.SpaceID)}
+	if portal.Target.Host == "" && !opts.DryRun {
+		resolved, err := s.resolveEC2Host(ctx, portal)
+		if err != nil {
+			plan.Diagnostics = append(plan.Diagnostics, Diagnostic{Component: "ec2", Severity: SeverityWarn, Code: "ec2.host_unresolved", Message: "EC2 SSH host could not be resolved from instance metadata", Evidence: err.Error(), NextAction: "pass --host with a reachable DNS name or IP address"})
+		} else {
+			portal.Target.Host = resolved
+			manifest.Portals[portalID] = portal
+		}
+	}
 	if err := setManifestPreview(&plan, spacePath, manifest); err != nil {
 		return Plan{}, err
 	}
+	plan.Commands = append(plan.Commands, remotePrepareCommands(portal, opts.SyncMode != "")...)
 	if opts.DryRun {
 		plan.Diagnostics = append(plan.Diagnostics, Diagnostic{Component: "manifest", Severity: SeverityInfo, Code: "manifest.preview", Message: "dry-run only; manifest was not written", Evidence: filepath.Join(spacePath, ManifestName)})
 		return plan, nil
@@ -306,6 +322,30 @@ func (s Service) LoadPortal(opts SelectOptions) (Portal, string, error) {
 	portal, ok := manifest.Portals[portalID]
 	if !ok {
 		return Portal{}, "", fmt.Errorf("portal %q is not registered for space %q", portalID, opts.SpaceID)
+	}
+	return portal, spacePath, nil
+}
+
+func (s Service) LoadPortalForRuntime(ctx context.Context, opts SelectOptions) (Portal, string, error) {
+	portal, spacePath, err := s.LoadPortal(opts)
+	if err != nil {
+		return Portal{}, "", err
+	}
+	if portal.Driver != DriverEC2Attach || portal.Target.Host != "" {
+		return portal, spacePath, nil
+	}
+	host, err := s.resolveEC2Host(ctx, portal)
+	if err != nil {
+		return Portal{}, "", fmt.Errorf("ec2 ssh host is not recorded and could not be resolved: %w; pass --host on attach or configure", err)
+	}
+	manifest, err := LoadManifest(spacePath)
+	if err != nil {
+		return Portal{}, "", err
+	}
+	portal.Target.Host = host
+	manifest.Portals[portal.ID] = portal
+	if err := SaveManifest(spacePath, manifest); err != nil {
+		return Portal{}, "", err
 	}
 	return portal, spacePath, nil
 }
@@ -575,14 +615,32 @@ func (localRunner) Run(ctx context.Context, cmd Command) (RunResult, error) {
 	execCmd := exec.CommandContext(ctx, cmd.Program, cmd.Args...)
 	execCmd.Dir = cmd.Dir
 	execCmd.Env = append(os.Environ(), cmd.Env...)
-	stdout, err := execCmd.Output()
-	result := RunResult{Stdout: string(stdout)}
+	if cmd.Interactive || cmd.Stream {
+		execCmd.Stdin = os.Stdin
+		execCmd.Stdout = os.Stdout
+		execCmd.Stderr = os.Stderr
+		err := execCmd.Run()
+		result := RunResult{}
+		if err == nil {
+			return result, nil
+		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			result.ExitCode = exitErr.ExitCode()
+		}
+		return result, err
+	}
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	execCmd.Stdout = &stdout
+	execCmd.Stderr = &stderr
+	err := execCmd.Run()
+	result := RunResult{Stdout: stdout.String(), Stderr: stderr.String()}
 	if err == nil {
 		return result, nil
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
-		result.Stderr = string(exitErr.Stderr)
 		result.ExitCode = exitErr.ExitCode()
 	}
 	return result, err
@@ -726,6 +784,43 @@ func parseEC2State(output string) string {
 		for _, instance := range reservation.Instances {
 			if state := strings.ToLower(strings.TrimSpace(instance.State.Name)); state != "" {
 				return state
+			}
+		}
+	}
+	return ""
+}
+
+func (s Service) resolveEC2Host(ctx context.Context, portal Portal) (string, error) {
+	result, err := s.Runner.Run(ctx, ec2DescribeCommand(portal))
+	if err != nil {
+		return "", fmt.Errorf("%w: %s", err, strings.TrimSpace(firstString(result.Stderr, result.Stdout)))
+	}
+	host := parseEC2SSHHost(result.Stdout)
+	if host == "" {
+		return "", fmt.Errorf("describe-instances did not include PublicDnsName, PublicIpAddress, or PrivateIpAddress")
+	}
+	return host, nil
+}
+
+func parseEC2SSHHost(output string) string {
+	var payload struct {
+		Reservations []struct {
+			Instances []struct {
+				PublicDNSName    string `json:"PublicDnsName"`
+				PublicIPAddress  string `json:"PublicIpAddress"`
+				PrivateIPAddress string `json:"PrivateIpAddress"`
+			} `json:"Instances"`
+		} `json:"Reservations"`
+	}
+	if err := json.Unmarshal([]byte(output), &payload); err != nil {
+		return ""
+	}
+	for _, reservation := range payload.Reservations {
+		for _, instance := range reservation.Instances {
+			for _, candidate := range []string{instance.PublicDNSName, instance.PublicIPAddress, instance.PrivateIPAddress} {
+				if candidate = strings.TrimSpace(candidate); candidate != "" {
+					return candidate
+				}
 			}
 		}
 	}

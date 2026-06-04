@@ -87,7 +87,7 @@ func TestAttachSSHAndEC2AreAttachOnly(t *testing.T) {
 	if _, err := svc.AttachSSH(context.Background(), AttachSSHOptions{SpaceID: "ex-1", Host: "devbox.example", Preset: "ssh-codex"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.AttachEC2(context.Background(), AttachEC2Options{SpaceID: "ex-1", PortalID: "aws", InstanceID: "i-123", Region: "us-west-2", SSHUser: "ec2-user"}); err != nil {
+	if _, err := svc.AttachEC2(context.Background(), AttachEC2Options{SpaceID: "ex-1", PortalID: "aws", InstanceID: "i-123", Host: "203.0.113.10", Port: 2222, Region: "us-west-2", SSHUser: "ec2-user", IdentityPath: "~/.ssh/aws", KnownHostsPath: "/tmp/aws_known_hosts", StrictHostKey: "yes"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := svc.AttachEC2(context.Background(), AttachEC2Options{SpaceID: "ex-1", PortalID: "aws-claude", InstanceID: "i-456", Preset: "ssh-claude", SyncMode: SyncReconstruct}); err != nil {
@@ -103,11 +103,129 @@ func TestAttachSSHAndEC2AreAttachOnly(t *testing.T) {
 	if manifest.Portals["default"].Workspace.SyncMode != SyncRsync {
 		t.Fatalf("ssh sync = %q", manifest.Portals["default"].Workspace.SyncMode)
 	}
-	if manifest.Portals["aws"].Driver != DriverEC2Attach || manifest.Portals["aws"].Target.Region != "us-west-2" {
+	if manifest.Portals["aws"].Driver != DriverEC2Attach ||
+		manifest.Portals["aws"].Target.Region != "us-west-2" ||
+		manifest.Portals["aws"].Target.Port != 2222 ||
+		manifest.Portals["aws"].Target.KnownHostsPath != "/tmp/aws_known_hosts" ||
+		manifest.Portals["aws"].Target.StrictHostKey != "yes" {
 		t.Fatalf("ec2 portal = %#v", manifest.Portals["aws"])
 	}
 	if manifest.Portals["aws-claude"].Driver != DriverEC2Attach || manifest.Portals["aws-claude"].Workspace.SyncMode != SyncReconstruct || manifest.Portals["aws-claude"].Auth.Providers[0].Provider != "claude" {
 		t.Fatalf("ec2 preset portal = %#v", manifest.Portals["aws-claude"])
+	}
+}
+
+func TestEC2HostResolutionAndConfigureHost(t *testing.T) {
+	cfg := testConfig(t)
+	writeSpace(t, cfg, "ex-1")
+	runner := fakeRunner{outputs: map[string]RunResult{
+		"aws ec2 describe-instances --instance-ids i-123 --region us-west-2": {Stdout: `{"Reservations":[{"Instances":[{"State":{"Name":"running"},"PublicDnsName":"ec2.example.com","PublicIpAddress":"203.0.113.9","PrivateIpAddress":"10.0.0.9"}]}]}`},
+	}}
+	svc := NewService(cfg, runner, nil)
+	if _, err := svc.AttachEC2(context.Background(), AttachEC2Options{SpaceID: "ex-1", PortalID: "aws", InstanceID: "i-123", Region: "us-west-2", SSHUser: "ubuntu"}); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := LoadManifest(filepath.Join(cfg.AgentWorkDir, "ex-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Portals["aws"].Target.Host != "ec2.example.com" {
+		t.Fatalf("resolved host = %#v", manifest.Portals["aws"].Target)
+	}
+	execPlan, err := svc.PlanExec(context.Background(), ExecOptions{SpaceID: "ex-1", PortalID: "aws", Command: []string{"hostname"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(execPlan.EquivalentCommands()[0], "i-123") || !strings.Contains(execPlan.EquivalentCommands()[0], "ubuntu@ec2.example.com") {
+		t.Fatalf("ec2 exec command = %v", execPlan.EquivalentCommands())
+	}
+	if _, err := svc.Configure(ConfigureOptions{SpaceID: "ex-1", PortalID: "aws", Host: "10.0.0.9"}); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err = LoadManifest(filepath.Join(cfg.AgentWorkDir, "ex-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Portals["aws"].Target.Host != "10.0.0.9" {
+		t.Fatalf("configured host = %#v", manifest.Portals["aws"].Target)
+	}
+}
+
+func TestLoadPortalForRuntimeResolvesExistingEC2Host(t *testing.T) {
+	cfg := testConfig(t)
+	writeSpace(t, cfg, "ex-1")
+	spacePath := filepath.Join(cfg.AgentWorkDir, "ex-1")
+	manifest := Manifest{Version: 1, SpaceID: "ex-1", Portals: map[string]Portal{
+		"aws": {
+			ID:        "aws",
+			Driver:    DriverEC2Attach,
+			CreatedAt: time.Now().UTC(),
+			Workspace: Workspace{LocalPath: spacePath, RemoteRoot: "/home/ubuntu/stave/ex-1", SyncMode: SyncRsync},
+			Target:    Target{InstanceID: "i-123", Region: "us-west-2", SSHUser: "ubuntu"},
+			Runtime:   Runtime{Engine: string(DriverEC2Attach)},
+			Auth:      Auth{Mode: AuthNative, Providers: []AuthProvider{defaultAuthProvider("codex", AuthNative)}},
+		},
+	}}
+	if err := SaveManifest(spacePath, manifest); err != nil {
+		t.Fatal(err)
+	}
+	runner := fakeRunner{outputs: map[string]RunResult{
+		"aws ec2 describe-instances --instance-ids i-123 --region us-west-2": {Stdout: `{"Reservations":[{"Instances":[{"PrivateIpAddress":"10.0.0.9"}]}]}`},
+	}}
+	svc := NewService(cfg, runner, nil)
+	plan, err := svc.PlanExec(context.Background(), ExecOptions{SpaceID: "ex-1", PortalID: "aws", Command: []string{"pwd"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(plan.EquivalentCommands()[0], "ubuntu@10.0.0.9") {
+		t.Fatalf("resolved exec = %v", plan.EquivalentCommands())
+	}
+	loaded, err := LoadManifest(spacePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Portals["aws"].Target.Host != "10.0.0.9" {
+		t.Fatalf("persisted host = %#v", loaded.Portals["aws"].Target)
+	}
+
+	runner = fakeRunner{outputs: map[string]RunResult{
+		"aws ec2 describe-instances --instance-ids i-123 --region us-west-2": {Stdout: `{"Reservations":[{"Instances":[{}]}]}`},
+	}}
+	loaded.Portals["aws"] = manifest.Portals["aws"]
+	if err := SaveManifest(spacePath, loaded); err != nil {
+		t.Fatal(err)
+	}
+	svc = NewService(cfg, runner, nil)
+	if _, err := svc.PlanExec(context.Background(), ExecOptions{SpaceID: "ex-1", PortalID: "aws", Command: []string{"pwd"}}); err == nil || !strings.Contains(err.Error(), "--host") {
+		t.Fatalf("expected unresolved host guidance, got %v", err)
+	}
+}
+
+func TestLocalRunnerCapturesStdoutStderrAndExitCode(t *testing.T) {
+	runner := localRunner{}
+	result, err := runner.Run(context.Background(), command("sh", "-c", "echo out; echo err >&2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(result.Stdout) != "out" || strings.TrimSpace(result.Stderr) != "err" {
+		t.Fatalf("captured result = %#v", result)
+	}
+	result, err = runner.Run(context.Background(), command("sh", "-c", "echo bad >&2; exit 7"))
+	if err == nil {
+		t.Fatal("expected command error")
+	}
+	if result.ExitCode != 7 || !strings.Contains(result.Stderr, "bad") {
+		t.Fatalf("error result = %#v err=%v", result, err)
+	}
+	interactive := command("sh", "-c", "exit 0")
+	interactive.Interactive = true
+	if result, err := runner.Run(context.Background(), interactive); err != nil || result.ExitCode != 0 {
+		t.Fatalf("interactive success result = %#v err=%v", result, err)
+	}
+	interactive = command("sh", "-c", "exit 9")
+	interactive.Interactive = true
+	if result, err := runner.Run(context.Background(), interactive); err == nil || result.ExitCode != 9 {
+		t.Fatalf("interactive error result = %#v err=%v", result, err)
 	}
 }
 

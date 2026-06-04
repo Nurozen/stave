@@ -175,6 +175,8 @@ func TestExecutorExecuteOperationMatrix(t *testing.T) {
 		{Type: OpReposSync, Repo: "api"},
 		{Type: OpSpaceStatus, SpaceID: "ex-1"},
 		{Type: OpSpaceSync, SpaceID: "ex-1"},
+		{Type: OpPortalAttach, SpaceID: "ex-1", PortalID: "agent-ssh", Driver: string(portal.DriverSSH), Host: "devbox.example", KnownHostsPath: "/tmp/known_hosts", StrictHostKey: "yes", RemoteRoot: "/home/ubuntu/stave/ex-1", SyncMode: string(portal.SyncRsync)},
+		{Type: OpPortalAttach, SpaceID: "ex-1", PortalID: "agent-ec2", Driver: string(portal.DriverEC2Attach), InstanceID: "i-123", Host: "203.0.113.10", Port: 2222, SSHUser: "ubuntu", IdentityPath: "~/.ssh/aws", KnownHostsPath: "/tmp/aws_known_hosts", StrictHostKey: "yes", RemoteRoot: "/home/ubuntu/stave/ex-1", SyncMode: string(portal.SyncRsync)},
 		{Type: OpPortalConfigure, SpaceID: "ex-1", PortalID: "local", Agent: "claude", Method: string(portal.AuthVolume)},
 		{Type: OpPortalAuthLogin, SpaceID: "ex-1", PortalID: "local", Provider: "codex", Method: string(portal.AuthNative)},
 		{Type: OpPortalAuthInherit, SpaceID: "ex-1", PortalID: "local", Provider: "codex", Method: string(portal.AuthEnv)},
@@ -192,7 +194,7 @@ func TestExecutorExecuteOperationMatrix(t *testing.T) {
 	}
 
 	got := out.String()
-	for _, needle := range []string{"api\thttps://example.test/api.git", "space ex-1", "docker exec", "docker stop"} {
+	for _, needle := range []string{"api\thttps://example.test/api.git", "space ex-1", "ssh -p 22 -o UserKnownHostsFile=/tmp/known_hosts -o StrictHostKeyChecking=yes devbox.example", "ssh -p 2222", "UserKnownHostsFile=/tmp/aws_known_hosts", "StrictHostKeyChecking=yes ubuntu@203.0.113.10", "portal runner stdout", "portal runner stderr", "docker exec", "docker stop"} {
 		if !strings.Contains(got, needle) {
 			t.Fatalf("executor output missing %q:\n%s", needle, got)
 		}
@@ -200,13 +202,16 @@ func TestExecutorExecuteOperationMatrix(t *testing.T) {
 	if len(gitRunner.calls) < 4 {
 		t.Fatalf("git calls = %#v", gitRunner.calls)
 	}
-	if len(runner.commands) < 5 {
+	if len(runner.commands) < 4 {
 		t.Fatalf("portal runner commands = %#v", runner.commands)
 	}
 	if _, err := portal.LoadManifest(filepath.Join(cfg.AgentWorkDir, "ex-1")); err == nil {
 		manifest, loadErr := portal.LoadManifest(filepath.Join(cfg.AgentWorkDir, "ex-1"))
 		if loadErr != nil {
 			t.Fatal(loadErr)
+		}
+		if manifest.Portals["local"].Auth.Mode != portal.AuthEnv || manifest.Portals["local"].Auth.Providers[0].Status != portal.AuthOK {
+			t.Fatalf("local portal auth was not inherited: %#v", manifest.Portals["local"].Auth)
 		}
 		if _, ok := manifest.Portals["remote"]; ok {
 			t.Fatalf("remote portal was not detached: %#v", manifest.Portals)
@@ -241,7 +246,7 @@ func (r *executorPortalRunner) LookPath(name string) (string, error) {
 
 func (r *executorPortalRunner) Run(ctx context.Context, command portal.Command) (portal.RunResult, error) {
 	r.commands = append(r.commands, command)
-	return portal.RunResult{}, nil
+	return portal.RunResult{Stdout: "portal runner stdout\n", Stderr: "portal runner stderr\n"}, nil
 }
 
 type executorGitRunner struct {
