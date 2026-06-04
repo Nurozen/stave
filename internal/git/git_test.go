@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -57,7 +60,7 @@ func TestCommands(t *testing.T) {
 		{"clone", "--bare", "https://example.test/repo.git", "/tmp/repo.git"},
 		{"--git-dir", "/tmp/repo.git", "fetch", "--all", "--prune"},
 		{"--git-dir", "/tmp/repo.git", "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"},
-		{"--git-dir", "/tmp/repo.git", "worktree", "add", "-b", "stave/x/repo", "/tmp/wt", "origin/main"},
+		{"--git-dir", "/tmp/repo.git", "worktree", "add", "--no-track", "-b", "stave/x/repo", "/tmp/wt", "origin/main"},
 		{"--git-dir", "/tmp/repo.git", "worktree", "add", "/tmp/wt-existing", "stave/x/existing"},
 		{"--git-dir", "/tmp/repo.git", "worktree", "add", "--detach", "/tmp/ref", "origin/main"},
 		{"--git-dir", "/tmp/repo.git", "worktree", "remove", "--force", "/tmp/wt"},
@@ -76,6 +79,54 @@ func TestCommands(t *testing.T) {
 	}
 	if out != "" {
 		t.Fatalf("Output() = %q", out)
+	}
+}
+
+func TestWorktreeAddBranchDoesNotTrackStartPoint(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	source := filepath.Join(tmp, "source")
+	bare := filepath.Join(tmp, "repo.git")
+	worktree := filepath.Join(tmp, "worktree")
+
+	runGitTestCommand(t, "", "init", "--initial-branch=main", source)
+	runGitTestCommand(t, source, "config", "user.email", "test@example.invalid")
+	runGitTestCommand(t, source, "config", "user.name", "Stave Test")
+	if err := os.WriteFile(filepath.Join(source, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitTestCommand(t, source, "add", "README.md")
+	runGitTestCommand(t, source, "commit", "-m", "initial")
+
+	client := New()
+	if err := client.CloneBare(ctx, source, bare); err != nil {
+		t.Fatalf("CloneBare() error = %v", err)
+	}
+	if err := client.ConfigureBareRemoteTracking(ctx, bare); err != nil {
+		t.Fatalf("ConfigureBareRemoteTracking() error = %v", err)
+	}
+	runGitTestCommand(t, "", "--git-dir", bare, "config", "branch.autoSetupMerge", "true")
+	if err := client.FetchAllPrune(ctx, bare); err != nil {
+		t.Fatalf("FetchAllPrune() error = %v", err)
+	}
+	if err := client.WorktreeAddBranch(ctx, bare, worktree, "stave/test/repo", "origin/main"); err != nil {
+		t.Fatalf("WorktreeAddBranch() error = %v", err)
+	}
+
+	cmd := exec.CommandContext(ctx, "git", "-C", worktree, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("new worktree branch unexpectedly tracks %q", strings.TrimSpace(string(out)))
+	}
+}
+
+func runGitTestCommand(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, out)
 	}
 }
 

@@ -93,7 +93,7 @@ func (c *Client) FetchAllPrune(ctx context.Context, bareRepo string) error {
 }
 
 func (c *Client) WorktreeAddBranch(ctx context.Context, bareRepo, path, branch, startPoint string) error {
-	_, err := c.run(ctx, "--git-dir", bareRepo, "worktree", "add", "-b", branch, path, startPoint)
+	_, err := c.run(ctx, "--git-dir", bareRepo, "worktree", "add", "--no-track", "-b", branch, path, startPoint)
 	return err
 }
 
