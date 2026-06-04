@@ -205,10 +205,10 @@ func (e Executor) executePortalPlan(ctx context.Context, out io.Writer, build fu
 			command.Stream = true
 			result, err := e.PortalRunner.Run(ctx, command)
 			if result.Stdout != "" {
-				fmt.Fprint(out, result.Stdout)
+				_, _ = fmt.Fprint(out, result.Stdout)
 			}
 			if result.Stderr != "" {
-				fmt.Fprint(out, result.Stderr)
+				_, _ = fmt.Fprint(out, result.Stderr)
 			}
 			if err != nil {
 				return err
