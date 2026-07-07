@@ -1,0 +1,79 @@
+version: 2
+
+project_name: stave
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: stave
+    main: ./cmd/stave
+    binary: stave
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.ShortCommit}}
+      - -X main.date={{.Date}}
+    hooks:
+      post:
+        - cmd: >-
+            {{ if eq .Os "darwin" }}./scripts/sign-darwin.sh "{{ .Path }}"{{ else }}true{{ end }}
+
+archives:
+  - id: default
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+      - goos: darwin
+        formats:
+          - zip
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+
+release:
+  github:
+    owner: Nurozen
+    name: stave
+  draft: false
+  prerelease: auto
+  name_template: "v{{.Version}}"
+  header: |
+    ## Installation
+
+    **macOS** (signed and notarized when release secrets are configured):
+    ```bash
+    unzip stave_*.zip
+    chmod +x stave
+    sudo mv stave /usr/local/bin/
+    ```
+
+    **Linux:**
+    ```bash
+    tar xzf stave_*.tar.gz
+    chmod +x stave
+    sudo mv stave /usr/local/bin/
+    ```

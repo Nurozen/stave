@@ -1,0 +1,6 @@
+{
+  "name": "stave-portal-fixture",
+  "image": "node:22-alpine",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace/portal-e2e,type=bind",
+  "workspaceFolder": "/workspace/portal-e2e"
+}
