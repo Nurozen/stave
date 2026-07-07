@@ -301,4 +301,4 @@ This repository uses **`weirwood`** as its default branch (the staff base), not 
 
 ## License
 
-License not yet specified. See repository settings or add a `LICENSE` file before distributing.
+Released under the [MIT License](LICENSE). Copyright (c) 2026 Cloud Gatherer Labs LLC.
