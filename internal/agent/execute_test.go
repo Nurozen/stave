@@ -3,6 +3,7 @@ package agent
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/Nurozen/stave/internal/git"
 	"github.com/Nurozen/stave/internal/portal"
 	"github.com/Nurozen/stave/internal/space"
+	"github.com/Nurozen/stave/internal/summon"
 )
 
 func TestExecutorRunsPortalInitAndLifecyclePlan(t *testing.T) {
@@ -194,7 +196,7 @@ func TestExecutorExecuteOperationMatrix(t *testing.T) {
 	}
 
 	got := out.String()
-	for _, needle := range []string{"api\thttps://example.test/api.git", "space ex-1", "ssh -p 22 -o UserKnownHostsFile=/tmp/known_hosts -o StrictHostKeyChecking=yes devbox.example", "ssh -p 2222", "UserKnownHostsFile=/tmp/aws_known_hosts", "StrictHostKeyChecking=yes ubuntu@203.0.113.10", "portal runner stdout", "portal runner stderr", "docker exec", "docker stop"} {
+	for _, needle := range []string{"api\thttps://example.test/api.git", "space ex-1", "ssh -n -o BatchMode=yes -o ConnectTimeout=10 -p 22 -o UserKnownHostsFile=/tmp/known_hosts -o StrictHostKeyChecking=yes devbox.example", "ssh -n -o BatchMode=yes -o ConnectTimeout=10 -p 2222", "UserKnownHostsFile=/tmp/aws_known_hosts", "StrictHostKeyChecking=yes ubuntu@203.0.113.10", "portal runner stdout", "portal runner stderr", "docker exec", "docker stop"} {
 		if !strings.Contains(got, needle) {
 			t.Fatalf("executor output missing %q:\n%s", needle, got)
 		}
@@ -234,6 +236,219 @@ func TestExecutorExecuteOperationErrors(t *testing.T) {
 			t.Fatalf("executeOperation(%s) succeeded unexpectedly", op.Type)
 		}
 	}
+}
+
+func TestExecutePlanReportsErrorAndStops(t *testing.T) {
+	cfg := executorConfig(t)
+	executor := Executor{Config: cfg}
+
+	results, err := executor.ExecutePlan(context.Background(), Plan{Operations: []Operation{
+		{Type: "not_real"},
+		{Type: OpReposList},
+	}})
+	if err == nil {
+		t.Fatal("expected ExecutePlan to return an error")
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected execution to stop after first op, got %#v", results)
+	}
+	if !results[0].Executed || results[0].Message == "" {
+		t.Fatalf("failed op should be marked executed with a message: %#v", results[0])
+	}
+	if !strings.Contains(results[0].Message, "unsupported operation") {
+		t.Fatalf("message = %q", results[0].Message)
+	}
+}
+
+func TestExecuteOperationSummonLaunchesInteractively(t *testing.T) {
+	cfg := executorConfig(t)
+	writeExecutorSpace(t, cfg, "ex-1")
+	launcher := &fakeSummonLauncher{}
+	var out bytes.Buffer
+	executor := Executor{Config: cfg, SummonLauncher: launcher, AllowInteractive: true, Out: &out}
+
+	err := executor.executeOperation(context.Background(), Operation{
+		Type:     OpSummon,
+		SpaceID:  "ex-1",
+		Summoner: "codex",
+	})
+	if err != nil {
+		t.Fatalf("executeOperation(summon) error = %v", err)
+	}
+	if launcher.calls != 1 {
+		t.Fatalf("expected launcher to be invoked once, got %d", launcher.calls)
+	}
+	if launcher.lastSummoner != "codex" {
+		t.Fatalf("summoner = %q", launcher.lastSummoner)
+	}
+}
+
+func TestExecuteOperationSpaceAddReferenceMode(t *testing.T) {
+	cfg := executorConfig(t)
+	cfg.Repos["api"] = config.Repository{Name: "api", URL: "https://example.test/api.git", BareRepoPath: filepath.Join(cfg.BareReposDir, "api.git"), DefaultBranch: "main"}
+	writeExecutorSpace(t, cfg, "ex-1")
+	gitRunner := &executorGitRunner{}
+	executor := Executor{Config: cfg, Git: git.New(git.WithRunner(gitRunner))}
+
+	err := executor.executeOperation(context.Background(), Operation{
+		Type:    OpSpaceAdd,
+		SpaceID: "ex-1",
+		Repo:    "api",
+		Mode:    string(space.ModeReference),
+		Ref:     "origin/main",
+	})
+	if err != nil {
+		t.Fatalf("executeOperation(space_add reference) error = %v", err)
+	}
+	manifest, err := space.LoadManifest(filepath.Join(cfg.AgentWorkDir, "ex-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Repos) != 1 || manifest.Repos[0].Mode != space.ModeReference {
+		t.Fatalf("repo was not added in reference mode: %#v", manifest.Repos)
+	}
+}
+
+func TestExecuteOperationSpaceStatusErrorsForMissingSpace(t *testing.T) {
+	cfg := executorConfig(t)
+	executor := Executor{Config: cfg}
+	err := executor.executeOperation(context.Background(), Operation{Type: OpSpaceStatus, SpaceID: "does-not-exist"})
+	if err == nil {
+		t.Fatal("expected status of a missing space to error")
+	}
+}
+
+func TestExecuteOperationReposSyncAllPropagatesFetchError(t *testing.T) {
+	cfg := executorConfig(t)
+	cfg.Repos["api"] = config.Repository{Name: "api", BareRepoPath: filepath.Join(cfg.BareReposDir, "api.git")}
+	cfg.Repos["web"] = config.Repository{Name: "web", BareRepoPath: filepath.Join(cfg.BareReposDir, "web.git")}
+	executor := Executor{Config: cfg, Git: git.New(git.WithRunner(&failingFetchRunner{}))}
+
+	err := executor.executeOperation(context.Background(), Operation{Type: OpReposSync})
+	if err == nil {
+		t.Fatal("expected repos_sync to propagate the fetch error")
+	}
+}
+
+func TestExecuteOperationPortalInitDevcontainerAndDefaultDriver(t *testing.T) {
+	cfg := executorConfig(t)
+	writeExecutorSpace(t, cfg, "dc-1")
+	writeExecutorSpace(t, cfg, "def-1")
+	executor := Executor{Config: cfg}
+
+	// Devcontainer driver path records a devcontainer portal.
+	if err := executor.executeOperation(context.Background(), Operation{
+		Type:          OpPortalInit,
+		SpaceID:       "dc-1",
+		PortalID:      "dev",
+		Driver:        string(portal.DriverDevcontainer),
+		ContainerRoot: "/workspaces/dc-1",
+	}); err != nil {
+		t.Fatalf("executeOperation(devcontainer init) error = %v", err)
+	}
+	dcManifest, err := portal.LoadManifest(filepath.Join(cfg.AgentWorkDir, "dc-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dcManifest.Portals["dev"].Driver != portal.DriverDevcontainer {
+		t.Fatalf("devcontainer portal not recorded: %#v", dcManifest.Portals)
+	}
+
+	// Empty driver defaults to docker.
+	if err := executor.executeOperation(context.Background(), Operation{
+		Type:          OpPortalInit,
+		SpaceID:       "def-1",
+		PortalID:      "dev",
+		Driver:        "",
+		Image:         "ubuntu:latest",
+		ContainerRoot: "/workspace/def-1",
+	}); err != nil {
+		t.Fatalf("executeOperation(default driver init) error = %v", err)
+	}
+	defManifest, err := portal.LoadManifest(filepath.Join(cfg.AgentWorkDir, "def-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defManifest.Portals["dev"].Driver != portal.DriverDocker {
+		t.Fatalf("empty driver did not default to docker: %#v", defManifest.Portals)
+	}
+}
+
+func TestExecutePortalPlanPropagatesBuildError(t *testing.T) {
+	cfg := executorConfig(t)
+	writeExecutorSpace(t, cfg, "ex-1")
+	// No portal named "ghost" exists, so PlanUp's build func returns an error.
+	executor := Executor{Config: cfg, PortalRunner: &executorPortalRunner{}}
+	err := executor.executeOperation(context.Background(), Operation{Type: OpPortalUp, SpaceID: "ex-1", PortalID: "ghost"})
+	if err == nil {
+		t.Fatal("expected portal up on a missing portal to error")
+	}
+}
+
+func TestExecutePortalPlanPropagatesRunnerError(t *testing.T) {
+	cfg := executorConfig(t)
+	writeExecutorSpace(t, cfg, "ex-1")
+	saveExecutorPortal(t, cfg, "ex-1", "local", portal.DriverDocker)
+	var out bytes.Buffer
+	executor := Executor{Config: cfg, PortalRunner: &failingPortalRunner{}, Out: &out}
+
+	err := executor.executeOperation(context.Background(), Operation{Type: OpPortalUp, SpaceID: "ex-1", PortalID: "local"})
+	if err == nil {
+		t.Fatal("expected runner failure to propagate from executePortalPlan")
+	}
+	if !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestWriteStatusRendersSpecDirtyAndMissingRepos(t *testing.T) {
+	var out bytes.Buffer
+	status := space.Status{
+		Manifest: space.Manifest{ID: "ex-1", Kind: "ticket", SpecPath: "spec.md"},
+		Repos: []space.RepoStatus{
+			{Repo: space.RepoManifest{Name: "api", Mode: space.ModeEdit}, Exists: true, Dirty: true},
+			{Repo: space.RepoManifest{Name: "web", Mode: space.ModeReference}, Exists: false, Dirty: false},
+		},
+	}
+	writeStatus(&out, "/work/ex-1", status)
+
+	got := out.String()
+	for _, needle := range []string{
+		"space ex-1 (ticket)",
+		"path: /work/ex-1",
+		"spec: /work/ex-1/spec.md",
+		"api [edit] present dirty",
+		"web [reference] missing clean",
+	} {
+		if !strings.Contains(got, needle) {
+			t.Fatalf("status output missing %q:\n%s", needle, got)
+		}
+	}
+}
+
+type fakeSummonLauncher struct {
+	calls        int
+	lastSummoner string
+}
+
+func (l *fakeSummonLauncher) Launch(ctx context.Context, invocation summon.Invocation) error {
+	l.calls++
+	l.lastSummoner = invocation.Summoner
+	return nil
+}
+
+type failingFetchRunner struct{}
+
+func (r *failingFetchRunner) Run(ctx context.Context, bin string, args []string, opts git.RunOptions) (git.Result, error) {
+	return git.Result{}, &git.GitError{Args: args, ExitCode: 1}
+}
+
+type failingPortalRunner struct{}
+
+func (r *failingPortalRunner) LookPath(name string) (string, error) { return "/bin/" + name, nil }
+
+func (r *failingPortalRunner) Run(ctx context.Context, command portal.Command) (portal.RunResult, error) {
+	return portal.RunResult{}, fmt.Errorf("boom")
 }
 
 type executorPortalRunner struct {

@@ -3,6 +3,7 @@ package portal
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -129,8 +130,8 @@ func TestEC2HostResolutionAndConfigureHost(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if manifest.Portals["aws"].Target.Host != "ec2.example.com" {
-		t.Fatalf("resolved host = %#v", manifest.Portals["aws"].Target)
+	if manifest.Portals["aws"].Target.Host != "" {
+		t.Fatalf("attach must not persist the resolved host (it goes stale across stop/start), got %#v", manifest.Portals["aws"].Target)
 	}
 	execPlan, err := svc.PlanExec(context.Background(), ExecOptions{SpaceID: "ex-1", PortalID: "aws", Command: []string{"hostname"}})
 	if err != nil {
@@ -184,8 +185,8 @@ func TestLoadPortalForRuntimeResolvesExistingEC2Host(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.Portals["aws"].Target.Host != "10.0.0.9" {
-		t.Fatalf("persisted host = %#v", loaded.Portals["aws"].Target)
+	if loaded.Portals["aws"].Target.Host != "" {
+		t.Fatalf("resolved host must stay ephemeral (never persisted), got %#v", loaded.Portals["aws"].Target)
 	}
 
 	runner = fakeRunner{outputs: map[string]RunResult{
@@ -409,6 +410,7 @@ func TestPlanningCommandsAndSafeguards(t *testing.T) {
 	cfg := testConfig(t)
 	writeSpace(t, cfg, "ex-1")
 	svc := NewService(cfg, fakeRunner{}, nil)
+	svc.IsTerminal = func() bool { return true }
 	if _, err := svc.InitContainer(context.Background(), InitContainerOptions{SpaceID: "ex-1"}); err != nil {
 		t.Fatal(err)
 	}
@@ -480,7 +482,7 @@ func TestRemoteSyncAndAttachOnlySafeguards(t *testing.T) {
 		t.Fatal(err)
 	}
 	command := syncPlan.EquivalentCommands()[0]
-	for _, needle := range []string{"rsync", "--dry-run", "--delete-delay", "--exclude=.git", "-e 'ssh -p 2222 -i ~/.ssh/id_ed25519 -o UserKnownHostsFile=/tmp/known_hosts -o StrictHostKeyChecking=yes'", "--include=src/**", "devbox.example:~/stave/agent-work/ex-1/"} {
+	for _, needle := range []string{"rsync", "--dry-run", "--delete-delay", "--exclude=.git", "-e 'ssh -o ConnectTimeout=10 -p 2222 -i ~/.ssh/id_ed25519 -o UserKnownHostsFile=/tmp/known_hosts -o StrictHostKeyChecking=yes'", "--include=src/**", "devbox.example:~/stave/agent-work/ex-1/"} {
 		if !strings.Contains(command, needle) {
 			t.Fatalf("sync command missing %q: %s", needle, command)
 		}
@@ -529,6 +531,11 @@ type fakeRunner struct {
 	missing map[string]bool
 	outputs map[string]RunResult
 	errors  map[string]error
+	// strict makes Run return an error for any command whose String() is not
+	// present in outputs or errors, instead of silently succeeding with an
+	// empty result. This surfaces unexpected/misquoted probe commands in
+	// regression tests rather than masking them.
+	strict bool
 }
 
 func (r fakeRunner) LookPath(name string) (string, error) {
@@ -545,6 +552,9 @@ func (r fakeRunner) Run(_ context.Context, cmd Command) (RunResult, error) {
 	}
 	if result, ok := r.outputs[key]; ok {
 		return result, nil
+	}
+	if r.strict {
+		return RunResult{}, fmt.Errorf("fakeRunner: unexpected command %q", key)
 	}
 	return RunResult{}, nil
 }

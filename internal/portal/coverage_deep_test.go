@@ -196,8 +196,8 @@ func TestStatusBranchesForRunnerAndDrivers(t *testing.T) {
 		cfg := testConfig(t)
 		writeSpace(t, cfg, "ex-1")
 		svc := NewService(cfg, fakeRunner{
-			errors:  map[string]error{"ssh -p 22 devbox true": errors.New("network down")},
-			outputs: map[string]RunResult{"ssh -p 22 devbox true": {Stdout: "no route"}},
+			errors:  map[string]error{"ssh -n -o BatchMode=yes -o ConnectTimeout=10 -p 22 devbox true": errors.New("network down")},
+			outputs: map[string]RunResult{"ssh -n -o BatchMode=yes -o ConnectTimeout=10 -p 22 devbox true": {Stdout: "no route"}},
 		}, nil)
 		if _, err := svc.AttachSSH(ctx, AttachSSHOptions{SpaceID: "ex-1", Host: "devbox"}); err != nil {
 			t.Fatal(err)
@@ -719,7 +719,8 @@ func TestPlanSyncAndHelperBranches(t *testing.T) {
 	if firstSyncMode(SyncReconstruct, SyncRsync) != SyncReconstruct || firstSyncMode("", SyncRsync) != SyncRsync {
 		t.Fatal("firstSyncMode mismatch")
 	}
-	sshCmd := portalExecCommand(remotePortal, []string{"echo", "hello world"}, "", "ignored", TTYAuto, true).String()
+	ttySvc := Service{IsTerminal: func() bool { return true }}
+	sshCmd := ttySvc.portalExecCommand(remotePortal, []string{"echo", "hello world"}, "", "ignored", TTYAuto, true).String()
 	if !strings.Contains(sshCmd, "cd") || !strings.Contains(sshCmd, "'hello world'") {
 		t.Fatalf("remote exec command = %s", sshCmd)
 	}
@@ -753,15 +754,30 @@ func TestDoctorStatusAuthAndLocalRunnerBranches(t *testing.T) {
 		t.Fatal("expected status load error")
 	}
 
-	doctor, err := svc.Doctor(ctx, SelectOptions{SpaceID: "ex-1"})
+	healthySvc := svc
+	healthySvc.Runner = fakeRunner{outputs: map[string]RunResult{
+		"docker container inspect stave-ex-1-default": {Stdout: `[{"State":{"Status":"running","Running":true,"Health":{"Status":"healthy"}}}]`},
+	}}
+	doctor, err := healthySvc.Doctor(ctx, SelectOptions{SpaceID: "ex-1"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if doctor.Overall != OverallOK {
 		t.Fatalf("doctor = %#v", doctor)
 	}
+	unreachableSvc := svc
+	unreachableSvc.Runner = fakeRunner{errors: map[string]error{
+		"docker container inspect stave-ex-1-default": errors.New("cannot connect to the docker daemon"),
+	}}
+	doctor, err = unreachableSvc.Doctor(ctx, SelectOptions{SpaceID: "ex-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if doctor.Overall != OverallWarn {
+		t.Fatalf("doctor must flag an unreachable runtime like status does, got %#v", doctor)
+	}
 	os.Remove(filepath.Join(spacePath, ".stave.yaml"))
-	doctor, err = svc.Doctor(ctx, SelectOptions{SpaceID: "ex-1"})
+	doctor, err = healthySvc.Doctor(ctx, SelectOptions{SpaceID: "ex-1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -786,6 +802,120 @@ func TestDoctorStatusAuthAndLocalRunnerBranches(t *testing.T) {
 	if err == nil || result.ExitCode != 7 || result.Stderr != "err" {
 		t.Fatalf("local runner failure result=%#v err=%v", result, err)
 	}
+}
+
+func TestManageRemainingBranches(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("validate provider and login method helpers", func(t *testing.T) {
+		if err := ValidateProviderName("codex"); err != nil {
+			t.Fatalf("ValidateProviderName(codex) = %v", err)
+		}
+		if err := ValidateProviderName("nope"); err == nil || !strings.Contains(err.Error(), "provider") {
+			t.Fatalf("ValidateProviderName(nope) = %v", err)
+		}
+		// device login is only valid for codex; any other provider is rejected.
+		if err := validateAuthLoginMethod("claude", "device"); err == nil || !strings.Contains(err.Error(), "only supported for codex") {
+			t.Fatalf("device login for claude = %v", err)
+		}
+		if cmd := commandFromArgv(nil); cmd.Program != "" || len(cmd.Args) != 0 {
+			t.Fatalf("commandFromArgv(nil) = %#v", cmd)
+		}
+	})
+
+	t.Run("configure updates remote root", func(t *testing.T) {
+		cfg := testConfig(t)
+		writeSpace(t, cfg, "ex-1")
+		svc := NewService(cfg, fakeRunner{}, nil)
+		if _, err := svc.AttachSSH(ctx, AttachSSHOptions{SpaceID: "ex-1", Host: "devbox", PortalID: "ssh"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := svc.Configure(ConfigureOptions{SpaceID: "ex-1", PortalID: "ssh", RemoteRoot: "/srv/custom"}); err != nil {
+			t.Fatal(err)
+		}
+		manifest, err := LoadManifest(filepath.Join(cfg.AgentWorkDir, "ex-1"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := manifest.Portals["ssh"].Workspace.RemoteRoot; got != "/srv/custom" {
+			t.Fatalf("RemoteRoot not applied: %q", got)
+		}
+	})
+
+	t.Run("down docker honors timeout", func(t *testing.T) {
+		_, svc := serviceWithContainer(t, fakeRunner{})
+		down, err := svc.PlanDown(ctx, DownOptions{SpaceID: "ex-1", Timeout: 12})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := down.EquivalentCommands()[0]; !strings.Contains(got, "docker stop --time 12") {
+			t.Fatalf("down with timeout = %s", got)
+		}
+	})
+
+	t.Run("devcontainer command includes config file filter", func(t *testing.T) {
+		portal := Portal{
+			Workspace: Workspace{LocalPath: "/host/work"},
+			Runtime:   Runtime{DevcontainerPath: ".devcontainer/devcontainer.json"},
+		}
+		cmd := devcontainerDockerContainerCommand(portal, "stop").String()
+		if !strings.Contains(cmd, "devcontainer.config_file") || !strings.Contains(cmd, "docker ps -q") {
+			t.Fatalf("devcontainer stop command = %s", cmd)
+		}
+	})
+
+	t.Run("auth inherit rejects invalid provider after load", func(t *testing.T) {
+		_, svc := serviceWithContainer(t, fakeRunner{})
+		if _, err := svc.PlanAuthInherit(ctx, AuthCommandOptions{SpaceID: "ex-1", Provider: "nope", Method: AuthEnv, Yes: true}); err == nil || !strings.Contains(err.Error(), "provider") {
+			t.Fatalf("expected provider error after load, got %v", err)
+		}
+	})
+
+	t.Run("auth inherit appends new provider entry", func(t *testing.T) {
+		cfg, svc := serviceWithContainer(t, fakeRunner{})
+		spacePath := filepath.Join(cfg.AgentWorkDir, "ex-1")
+		before, err := LoadManifest(spacePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if hasProvider(before.Portals["default"].Auth.Providers, "claude") {
+			t.Skip("default portal already has a claude provider")
+		}
+		if _, err := svc.PlanAuthInherit(ctx, AuthCommandOptions{SpaceID: "ex-1", Provider: "claude", Method: AuthEnv, Yes: true}); err != nil {
+			t.Fatal(err)
+		}
+		after, err := LoadManifest(spacePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var provider *AuthProvider
+		for i := range after.Portals["default"].Auth.Providers {
+			if after.Portals["default"].Auth.Providers[i].Provider == "claude" {
+				provider = &after.Portals["default"].Auth.Providers[i]
+			}
+		}
+		if provider == nil || provider.Status != AuthOK || provider.Target != "portal" {
+			t.Fatalf("claude provider not appended correctly: %#v", after.Portals["default"].Auth.Providers)
+		}
+	})
+
+	t.Run("update auth provider load and missing portal errors", func(t *testing.T) {
+		cfg, svc := serviceWithContainer(t, fakeRunner{})
+		spacePath := filepath.Join(cfg.AgentWorkDir, "ex-1")
+		// Unknown portal id inside an existing manifest is rejected.
+		if err := svc.updateAuthProvider(spacePath, "ghost", "codex", AuthEnv, AuthOK); err == nil || !strings.Contains(err.Error(), "not registered") {
+			t.Fatalf("expected missing-portal error, got %v", err)
+		}
+		// A directory that exists but holds no manifest fails inside the lock,
+		// exercising the LoadManifest error path in updateAuthProviderLocked.
+		empty := filepath.Join(cfg.AgentWorkDir, "no-manifest")
+		if err := os.MkdirAll(empty, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := svc.updateAuthProvider(empty, "default", "codex", AuthEnv, AuthOK); err == nil {
+			t.Fatal("expected manifest load error for missing manifest")
+		}
+	})
 }
 
 func serviceWithContainer(t *testing.T, runner fakeRunner) (config.Config, Service) {

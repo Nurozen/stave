@@ -641,12 +641,15 @@ func TestCLISplitPortalExecArgs(t *testing.T) {
 		spaceID  string
 		portalID string
 		argv     []string
+		dash     int
 	}{
-		{name: "default portal", args: []string{"ex-1", "echo"}, spaceID: "ex-1", argv: []string{"echo"}},
-		{name: "explicit portal", args: []string{"ex-1", "dev", "echo", "hi"}, spaceID: "ex-1", portalID: "dev", argv: []string{"echo", "hi"}},
+		{name: "default portal", args: []string{"ex-1", "echo"}, spaceID: "ex-1", argv: []string{"echo"}, dash: -1},
+		{name: "explicit portal", args: []string{"ex-1", "dev", "echo", "hi"}, spaceID: "ex-1", portalID: "dev", argv: []string{"echo", "hi"}, dash: -1},
+		{name: "dash separates command", args: []string{"ex-1", "dev", "echo", "hi"}, spaceID: "ex-1", portalID: "dev", argv: []string{"echo", "hi"}, dash: 2},
+		{name: "dash with default portal", args: []string{"ex-1", "dev", "echo"}, spaceID: "ex-1", argv: []string{"dev", "echo"}, dash: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			spaceID, portalID, argv := splitPortalExecArgs(svc, tc.args)
+			spaceID, portalID, argv := splitPortalExecArgs(svc, tc.args, tc.dash)
 			if spaceID != tc.spaceID || portalID != tc.portalID || strings.Join(argv, "\x00") != strings.Join(tc.argv, "\x00") {
 				t.Fatalf("splitPortalExecArgs(%v) = %q %q %v", tc.args, spaceID, portalID, argv)
 			}

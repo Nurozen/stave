@@ -22,6 +22,11 @@ type fakeGit struct {
 	branchErr    error
 	dirtyErr     error
 	driftErr     error
+	addErr       error
+	detachErr    error
+	removeErr    error
+	pruneErr     error
+	checkoutErr  error
 }
 
 func (f *fakeGit) record(parts ...string) {
@@ -35,32 +40,41 @@ func (f *fakeGit) FetchAllPrune(ctx context.Context, bare string) error {
 
 func (f *fakeGit) WorktreeAddBranch(ctx context.Context, bare, path, branch, start string) error {
 	f.record("add-branch", bare, path, branch, start)
+	if f.addErr != nil {
+		return f.addErr
+	}
 	return os.MkdirAll(path, 0o755)
 }
 
 func (f *fakeGit) WorktreeAddExisting(ctx context.Context, bare, path, branch string) error {
 	f.record("add-existing", bare, path, branch)
+	if f.addErr != nil {
+		return f.addErr
+	}
 	return os.MkdirAll(path, 0o755)
 }
 
 func (f *fakeGit) WorktreeAddDetached(ctx context.Context, bare, path, ref string) error {
 	f.record("add-detached", bare, path, ref)
+	if f.detachErr != nil {
+		return f.detachErr
+	}
 	return os.MkdirAll(path, 0o755)
 }
 
 func (f *fakeGit) WorktreeRemove(ctx context.Context, bare, path string, force bool) error {
 	f.record("remove", bare, path)
-	return nil
+	return f.removeErr
 }
 
 func (f *fakeGit) WorktreePrune(ctx context.Context, bare string) error {
 	f.record("prune", bare)
-	return nil
+	return f.pruneErr
 }
 
 func (f *fakeGit) CheckoutDetached(ctx context.Context, path, ref string) error {
 	f.record("checkout-detached", path, ref)
-	return nil
+	return f.checkoutErr
 }
 
 func (f *fakeGit) BranchExists(ctx context.Context, bare, branch string) (bool, error) {
@@ -599,6 +613,259 @@ func TestDestroyDryRunKeepsSpaceAndPrintsPlan(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "dry-run: remove worktree") || !strings.Contains(out.String(), "dry-run: remove directory") {
 		t.Fatalf("unexpected dry-run output:\n%s", out.String())
+	}
+}
+
+func TestNewServiceDefaultsGitAndClock(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Config{AgentWorkDir: filepath.Join(root, "agent-work")}
+	svc := NewService(cfg, nil, nil)
+	if svc.Git == nil {
+		t.Fatal("NewService left Git nil instead of installing default client")
+	}
+	// now() must fall back to the real clock when Now is unset.
+	before := time.Now().UTC().Add(-time.Second)
+	got := svc.now()
+	if got.Before(before) || got.Location() != time.UTC {
+		t.Fatalf("now() fallback = %v", got)
+	}
+}
+
+func TestFirstNonEmptyAllBlank(t *testing.T) {
+	if got := firstNonEmpty("", " ", "\t"); got != "" {
+		t.Fatalf("firstNonEmpty(all blank) = %q", got)
+	}
+}
+
+func TestCreatePropagatesInitAndAddErrors(t *testing.T) {
+	svc, _, _ := testService(t)
+	// InitSpace fails on an invalid id, so Create returns before touching repos.
+	if err := svc.Create(context.Background(), CreateOptions{ID: "../bad"}); err == nil {
+		t.Fatal("Create accepted invalid space id")
+	}
+	// An unregistered edit repo makes the AddRepo pass fail.
+	if err := svc.Create(context.Background(), CreateOptions{ID: "prop-edit", Edits: []RepoSpec{{Name: "ghost"}}}); err == nil {
+		t.Fatal("Create accepted unregistered edit repo")
+	}
+	// An unregistered reference repo fails the reference pass after edits succeed.
+	err := svc.Create(context.Background(), CreateOptions{
+		ID:         "prop-ref",
+		Edits:      []RepoSpec{{Name: "repo-a"}},
+		References: []RepoSpec{{Name: "ghost"}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "not registered") {
+		t.Fatalf("Create reference propagation = %v", err)
+	}
+}
+
+func TestCreateDryRunRejectsUnknownReposAndMissingSpec(t *testing.T) {
+	svc, _, _ := testService(t)
+	svc.Out = &strings.Builder{}
+	if err := svc.Create(context.Background(), CreateOptions{ID: "dry", Edits: []RepoSpec{{Name: "ghost"}}, DryRun: true}); err == nil || !strings.Contains(err.Error(), "not registered") {
+		t.Fatalf("dry-run edit unknown repo = %v", err)
+	}
+	if err := svc.Create(context.Background(), CreateOptions{ID: "dry", References: []RepoSpec{{Name: "ghost"}}, DryRun: true}); err == nil || !strings.Contains(err.Error(), "not registered") {
+		t.Fatalf("dry-run reference unknown repo = %v", err)
+	}
+	if err := svc.Create(context.Background(), CreateOptions{ID: "dry", SpecPath: filepath.Join(t.TempDir(), "nope.md"), DryRun: true}); err == nil {
+		t.Fatal("dry-run accepted missing spec path")
+	}
+}
+
+func TestAddRepoGitErrorPaths(t *testing.T) {
+	// LoadManifest failure: the space was never initialized.
+	svc, _, _ := testService(t)
+	if err := svc.AddRepo(context.Background(), AddOptions{SpaceID: "no-space", RepoName: "repo-a", Mode: ModeEdit}); err == nil {
+		t.Fatal("AddRepo accepted a space with no manifest")
+	}
+
+	// Fetch failure aborts before any worktree work.
+	fetchSvc, fetchGit, _ := testService(t)
+	if err := fetchSvc.InitSpace(context.Background(), InitOptions{ID: "fetchy"}); err != nil {
+		t.Fatal(err)
+	}
+	fetchGit.fetchErr = os.ErrDeadlineExceeded
+	if err := fetchSvc.AddRepo(context.Background(), AddOptions{SpaceID: "fetchy", RepoName: "repo-a", Mode: ModeEdit}); err == nil {
+		t.Fatal("AddRepo ignored fetch failure")
+	}
+
+	// Branch lookup failure on an edit repo.
+	branchSvc, branchGit, _ := testService(t)
+	if err := branchSvc.InitSpace(context.Background(), InitOptions{ID: "branchy"}); err != nil {
+		t.Fatal(err)
+	}
+	branchGit.branchErr = os.ErrPermission
+	if err := branchSvc.AddRepo(context.Background(), AddOptions{SpaceID: "branchy", RepoName: "repo-a", Mode: ModeEdit, NoFetch: true}); err == nil {
+		t.Fatal("AddRepo ignored branch lookup failure")
+	}
+
+	// Worktree creation failure on a fresh branch leaves the manifest unwritten.
+	addSvc, addGit, cfg := testService(t)
+	if err := addSvc.InitSpace(context.Background(), InitOptions{ID: "addy"}); err != nil {
+		t.Fatal(err)
+	}
+	addGit.addErr = os.ErrInvalid
+	if err := addSvc.AddRepo(context.Background(), AddOptions{SpaceID: "addy", RepoName: "repo-a", Mode: ModeEdit, NoFetch: true}); err == nil {
+		t.Fatal("AddRepo ignored worktree add failure")
+	}
+	manifest, err := LoadManifest(filepath.Join(cfg.AgentWorkDir, "addy"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Repos) != 0 {
+		t.Fatalf("failed edit add still recorded a repo: %#v", manifest.Repos)
+	}
+
+	// Detached worktree failure on a reference repo.
+	refSvc, refGit, _ := testService(t)
+	if err := refSvc.InitSpace(context.Background(), InitOptions{ID: "refy"}); err != nil {
+		t.Fatal(err)
+	}
+	refGit.detachErr = os.ErrInvalid
+	if err := refSvc.AddRepo(context.Background(), AddOptions{SpaceID: "refy", RepoName: "repo-a", Mode: ModeReference, NoFetch: true}); err == nil {
+		t.Fatal("AddRepo ignored detached worktree failure")
+	}
+}
+
+func TestSyncErrorPaths(t *testing.T) {
+	// LoadManifest failure on a missing space.
+	svc, _, _ := testService(t)
+	if err := svc.Sync(context.Background(), SyncOptions{SpaceID: "ghost"}); err == nil {
+		t.Fatal("Sync accepted a missing space")
+	}
+
+	// Fetch failure surfaces from the sync loop.
+	fetchSvc, fetchGit, _ := testService(t)
+	if err := fetchSvc.Create(context.Background(), CreateOptions{ID: "sync-fetch", References: []RepoSpec{{Name: "repo-b"}}}); err != nil {
+		t.Fatal(err)
+	}
+	fetchGit.fetchErr = os.ErrDeadlineExceeded
+	if err := fetchSvc.Sync(context.Background(), SyncOptions{SpaceID: "sync-fetch"}); err == nil {
+		t.Fatal("Sync ignored fetch failure")
+	}
+
+	// IsDirty failure on a reference worktree.
+	dirtySvc, dirtyGit, _ := testService(t)
+	if err := dirtySvc.Create(context.Background(), CreateOptions{ID: "sync-dirty", References: []RepoSpec{{Name: "repo-b"}}}); err != nil {
+		t.Fatal(err)
+	}
+	dirtyGit.dirtyErr = os.ErrPermission
+	if err := dirtySvc.Sync(context.Background(), SyncOptions{SpaceID: "sync-dirty"}); err == nil {
+		t.Fatal("Sync ignored reference IsDirty failure")
+	}
+
+	// Checkout failure on a clean reference worktree.
+	checkoutSvc, checkoutGit, _ := testService(t)
+	if err := checkoutSvc.Create(context.Background(), CreateOptions{ID: "sync-checkout", References: []RepoSpec{{Name: "repo-b"}}}); err != nil {
+		t.Fatal(err)
+	}
+	checkoutGit.checkoutErr = os.ErrInvalid
+	if err := checkoutSvc.Sync(context.Background(), SyncOptions{SpaceID: "sync-checkout"}); err == nil {
+		t.Fatal("Sync ignored checkout failure")
+	}
+}
+
+func TestStatusErrorPaths(t *testing.T) {
+	// LoadManifest failure on a missing space.
+	svc, _, _ := testService(t)
+	if _, err := svc.Status(context.Background(), "ghost"); err == nil {
+		t.Fatal("Status accepted a missing space")
+	}
+
+	// IsDirty failure on an existing worktree aborts the status walk.
+	dirtySvc, dirtyGit, _ := testService(t)
+	if err := dirtySvc.Create(context.Background(), CreateOptions{ID: "status-dirty", Edits: []RepoSpec{{Name: "repo-a"}}}); err != nil {
+		t.Fatal(err)
+	}
+	dirtyGit.dirtyErr = os.ErrPermission
+	if _, err := dirtySvc.Status(context.Background(), "status-dirty"); err == nil {
+		t.Fatal("Status ignored IsDirty failure")
+	}
+}
+
+func TestArchiveAndDestroyGitErrorPaths(t *testing.T) {
+	// Archive: worktree removal failure.
+	archiveSvc, archiveGit, _ := testService(t)
+	if err := archiveSvc.Create(context.Background(), CreateOptions{ID: "arch-rm", Edits: []RepoSpec{{Name: "repo-a"}}}); err != nil {
+		t.Fatal(err)
+	}
+	archiveGit.removeErr = os.ErrInvalid
+	if err := archiveSvc.Archive(context.Background(), ArchiveOptions{SpaceID: "arch-rm"}); err == nil {
+		t.Fatal("Archive ignored worktree removal failure")
+	}
+
+	// Archive: prune failure after a successful removal.
+	pruneSvc, pruneGit, _ := testService(t)
+	if err := pruneSvc.Create(context.Background(), CreateOptions{ID: "arch-prune", Edits: []RepoSpec{{Name: "repo-a"}}}); err != nil {
+		t.Fatal(err)
+	}
+	pruneGit.pruneErr = os.ErrInvalid
+	if err := pruneSvc.Archive(context.Background(), ArchiveOptions{SpaceID: "arch-prune"}); err == nil {
+		t.Fatal("Archive ignored prune failure")
+	}
+
+	// Archive: ensureNoDirtyEdits surfaces an IsDirty error.
+	edSvc, edGit, _ := testService(t)
+	if err := edSvc.Create(context.Background(), CreateOptions{ID: "arch-dirty", Edits: []RepoSpec{{Name: "repo-a"}}}); err != nil {
+		t.Fatal(err)
+	}
+	edGit.dirtyErr = os.ErrPermission
+	if err := edSvc.Archive(context.Background(), ArchiveOptions{SpaceID: "arch-dirty"}); err == nil {
+		t.Fatal("Archive ignored dirty-check failure")
+	}
+
+	// Destroy: LoadManifest failure on a missing space.
+	missSvc, _, _ := testService(t)
+	if err := missSvc.Destroy(context.Background(), DestroyOptions{SpaceID: "ghost"}); err == nil {
+		t.Fatal("Destroy accepted a missing space")
+	}
+
+	// Destroy: worktree removal failure.
+	destSvc, destGit, _ := testService(t)
+	if err := destSvc.Create(context.Background(), CreateOptions{ID: "dest-rm", Edits: []RepoSpec{{Name: "repo-a"}}}); err != nil {
+		t.Fatal(err)
+	}
+	destGit.removeErr = os.ErrInvalid
+	if err := destSvc.Destroy(context.Background(), DestroyOptions{SpaceID: "dest-rm", Force: true}); err == nil {
+		t.Fatal("Destroy ignored worktree removal failure")
+	}
+
+	// Destroy: prune failure after removal.
+	dpSvc, dpGit, _ := testService(t)
+	if err := dpSvc.Create(context.Background(), CreateOptions{ID: "dest-prune", Edits: []RepoSpec{{Name: "repo-a"}}}); err != nil {
+		t.Fatal(err)
+	}
+	dpGit.pruneErr = os.ErrInvalid
+	if err := dpSvc.Destroy(context.Background(), DestroyOptions{SpaceID: "dest-prune", Force: true}); err == nil {
+		t.Fatal("Destroy ignored prune failure")
+	}
+}
+
+func TestCopyFileErrorPaths(t *testing.T) {
+	dir := t.TempDir()
+
+	// ReadFile fails when the source is a directory, not a file.
+	if err := copyFile(dir, filepath.Join(dir, "out")); err == nil {
+		t.Fatal("copyFile read a directory as a file")
+	}
+
+	// MkdirAll fails when a parent of the destination is an existing file.
+	src := filepath.Join(dir, "src.txt")
+	if err := os.WriteFile(src, []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	blocker := filepath.Join(dir, "blocker")
+	if err := os.WriteFile(blocker, []byte("file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyFile(src, filepath.Join(blocker, "child", "out.txt")); err == nil {
+		t.Fatal("copyFile created a directory under an existing file")
+	}
+}
+
+func TestCopySpecMissingSourceFails(t *testing.T) {
+	if err := copySpec(filepath.Join(t.TempDir(), "missing"), filepath.Join(t.TempDir(), "dest")); err == nil {
+		t.Fatal("copySpec accepted a missing source")
 	}
 }
 
