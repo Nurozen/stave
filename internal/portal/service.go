@@ -14,8 +14,10 @@ import (
 	"time"
 
 	"github.com/Nurozen/stave/internal/config"
+	"github.com/Nurozen/stave/internal/fsio"
 	"github.com/Nurozen/stave/internal/git"
 	"github.com/Nurozen/stave/internal/space"
+	"golang.org/x/term"
 )
 
 type Runner interface {
@@ -43,6 +45,10 @@ type Service struct {
 	Launcher Launcher
 	Git      Git
 	Now      func() time.Time
+	// IsTerminal reports whether stdio is a real terminal; overridable for
+	// tests. TTYAuto only requests a TTY (docker -t / ssh -t) when it is,
+	// so piped invocations no longer fail with "input device is not a TTY".
+	IsTerminal func() bool
 }
 
 type InitContainerOptions struct {
@@ -110,7 +116,30 @@ func NewService(cfg config.Config, runner Runner, launcher Launcher) Service {
 	return Service{Config: cfg, Runner: runner, Launcher: launcher, Git: git.New()}
 }
 
+// withManifestLock serializes load-modify-save cycles on a space's portal
+// manifest across concurrent stave processes. When the space directory does
+// not exist yet, fn runs unlocked so it can surface its own load error.
+func (s Service) withManifestLock(spaceID string, fn func() (Plan, error)) (Plan, error) {
+	spacePath := s.SpacePath(spaceID)
+	if _, err := os.Stat(spacePath); err != nil {
+		return fn()
+	}
+	var plan Plan
+	err := fsio.WithLock(filepath.Join(spacePath, ManifestName+".lock"), func() error {
+		var innerErr error
+		plan, innerErr = fn()
+		return innerErr
+	})
+	return plan, err
+}
+
 func (s Service) InitContainer(ctx context.Context, opts InitContainerOptions) (Plan, error) {
+	return s.withManifestLock(opts.SpaceID, func() (Plan, error) {
+		return s.initContainerLocked(ctx, opts)
+	})
+}
+
+func (s Service) initContainerLocked(ctx context.Context, opts InitContainerOptions) (Plan, error) {
 	if opts.Engine == "" {
 		opts.Engine = DriverDocker
 	}
@@ -162,6 +191,12 @@ func (s Service) InitContainer(ctx context.Context, opts InitContainerOptions) (
 }
 
 func (s Service) InitDevcontainer(ctx context.Context, opts InitDevcontainerOptions) (Plan, error) {
+	return s.withManifestLock(opts.SpaceID, func() (Plan, error) {
+		return s.initDevcontainerLocked(ctx, opts)
+	})
+}
+
+func (s Service) initDevcontainerLocked(ctx context.Context, opts InitDevcontainerOptions) (Plan, error) {
 	manifest, spacePath, err := s.loadOrCreateManifest(opts.SpaceID)
 	if err != nil {
 		return Plan{}, err
@@ -208,6 +243,12 @@ func (s Service) InitDevcontainer(ctx context.Context, opts InitDevcontainerOpti
 }
 
 func (s Service) AttachSSH(ctx context.Context, opts AttachSSHOptions) (Plan, error) {
+	return s.withManifestLock(opts.SpaceID, func() (Plan, error) {
+		return s.attachSSHLocked(ctx, opts)
+	})
+}
+
+func (s Service) attachSSHLocked(ctx context.Context, opts AttachSSHOptions) (Plan, error) {
 	manifest, spacePath, err := s.loadOrCreateManifest(opts.SpaceID)
 	if err != nil {
 		return Plan{}, err
@@ -253,6 +294,12 @@ func (s Service) AttachSSH(ctx context.Context, opts AttachSSHOptions) (Plan, er
 }
 
 func (s Service) AttachEC2(ctx context.Context, opts AttachEC2Options) (Plan, error) {
+	return s.withManifestLock(opts.SpaceID, func() (Plan, error) {
+		return s.attachEC2Locked(ctx, opts)
+	})
+}
+
+func (s Service) attachEC2Locked(ctx context.Context, opts AttachEC2Options) (Plan, error) {
 	manifest, spacePath, err := s.loadOrCreateManifest(opts.SpaceID)
 	if err != nil {
 		return Plan{}, err
@@ -288,8 +335,10 @@ func (s Service) AttachEC2(ctx context.Context, opts AttachEC2Options) (Plan, er
 		if err != nil {
 			plan.Diagnostics = append(plan.Diagnostics, Diagnostic{Component: "ec2", Severity: SeverityWarn, Code: "ec2.host_unresolved", Message: "EC2 SSH host could not be resolved from instance metadata", Evidence: err.Error(), NextAction: "pass --host with a reachable DNS name or IP address"})
 		} else {
+			// Used for this plan's prepare commands only; the manifest keeps
+			// an empty host so future commands re-resolve a fresh address
+			// (public DNS/IP changes across instance stop/start).
 			portal.Target.Host = resolved
-			manifest.Portals[portalID] = portal
 		}
 	}
 	if err := setManifestPreview(&plan, spacePath, manifest); err != nil {
@@ -338,14 +387,32 @@ func (s Service) LoadPortalForRuntime(ctx context.Context, opts SelectOptions) (
 	if err != nil {
 		return Portal{}, "", fmt.Errorf("ec2 ssh host is not recorded and could not be resolved: %w; pass --host on attach or configure", err)
 	}
-	manifest, err := LoadManifest(spacePath)
+	// The resolved address is ephemeral runtime data: EC2 public DNS/IP
+	// changes across stop/start cycles, so it is used for this invocation
+	// only and never persisted back into the manifest.
+	portal.Target.Host = host
+	return portal, spacePath, nil
+}
+
+// UnresolvedEC2Host is substituted into dry-run command previews when the
+// EC2 SSH host cannot be resolved (e.g. the aws CLI is unavailable); dry-run
+// must never fail on missing runtime tooling.
+const UnresolvedEC2Host = "UNRESOLVED-EC2-HOST"
+
+func (s Service) loadPortalForPlan(ctx context.Context, opts SelectOptions, dryRun bool) (Portal, string, error) {
+	if !dryRun {
+		return s.LoadPortalForRuntime(ctx, opts)
+	}
+	portal, spacePath, err := s.LoadPortal(opts)
 	if err != nil {
 		return Portal{}, "", err
 	}
-	portal.Target.Host = host
-	manifest.Portals[portal.ID] = portal
-	if err := SaveManifest(spacePath, manifest); err != nil {
-		return Portal{}, "", err
+	if portal.Driver == DriverEC2Attach && portal.Target.Host == "" {
+		if host, err := s.resolveEC2Host(ctx, portal); err == nil {
+			portal.Target.Host = host
+		} else {
+			portal.Target.Host = UnresolvedEC2Host
+		}
 	}
 	return portal, spacePath, nil
 }
@@ -412,7 +479,14 @@ func (s Service) Status(ctx context.Context, opts SelectOptions) (Status, error)
 	return status, nil
 }
 
+// probeTimeout bounds read-only status probes (ssh true, docker inspect,
+// aws describe-instances) so an unreachable target degrades to a warning
+// instead of hanging the command indefinitely.
+const probeTimeout = 30 * time.Second
+
 func (s Service) normalizeRuntimeStatus(ctx context.Context, portal Portal, status *Status) error {
+	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
 	if s.Runner == nil {
 		status.Diagnostics = append(status.Diagnostics, Diagnostic{Component: "runtime", Severity: SeverityInfo, Code: "runtime.no_runner", Message: "runtime status was not queried because no runner is configured"})
 		return nil
@@ -510,6 +584,14 @@ func (s Service) Doctor(ctx context.Context, opts SelectOptions) (DoctorReport, 
 			report.Diagnostics = append(report.Diagnostics, Diagnostic{Component: "driver", Severity: SeverityWarn, Code: "driver.binary_missing", Message: fmt.Sprintf("%s was not found in PATH", binary), NextAction: fmt.Sprintf("install %s or choose another portal driver", binary)})
 		}
 	}
+	// Probe the runtime the same way status does so doctor cannot report ok
+	// while the daemon/host is unreachable.
+	runtimeStatus := Status{Overall: OverallUnknown, State: "not-queried", Health: "unknown"}
+	if err := s.normalizeRuntimeStatus(ctx, portal, &runtimeStatus); err != nil {
+		report.Diagnostics = append(report.Diagnostics, Diagnostic{Component: "runtime", Severity: SeverityError, Code: "runtime.status_error", Message: "runtime status could not be queried", Evidence: err.Error()})
+	} else {
+		report.Diagnostics = append(report.Diagnostics, runtimeStatus.Diagnostics...)
+	}
 	if portal.Auth.Mode == AuthCopyCache {
 		report.Diagnostics = append(report.Diagnostics, Diagnostic{Component: "auth", Severity: SeverityError, Code: "auth.copy_cache_default", Message: "copy-cache cannot be the persisted default auth posture"})
 	}
@@ -603,6 +685,22 @@ func (s Service) now() time.Time {
 		return s.Now().UTC()
 	}
 	return time.Now().UTC()
+}
+
+func (s Service) stdioIsTerminal() bool {
+	if s.IsTerminal != nil {
+		return s.IsTerminal()
+	}
+	return term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd()))
+}
+
+// resolveTTY pins TTYAuto to a concrete mode based on the actual stdio: a
+// TTY is only requested when one is really attached.
+func (s Service) resolveTTY(tty TTYMode) TTYMode {
+	if tty == TTYAuto && !s.stdioIsTerminal() {
+		return TTYNever
+	}
+	return tty
 }
 
 type localRunner struct{}
@@ -791,6 +889,8 @@ func parseEC2State(output string) string {
 }
 
 func (s Service) resolveEC2Host(ctx context.Context, portal Portal) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
 	result, err := s.Runner.Run(ctx, ec2DescribeCommand(portal))
 	if err != nil {
 		return "", fmt.Errorf("%w: %s", err, strings.TrimSpace(firstString(result.Stderr, result.Stdout)))

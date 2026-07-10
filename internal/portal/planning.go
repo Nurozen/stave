@@ -78,7 +78,7 @@ type SyncOptions struct {
 }
 
 func (s Service) PlanUp(ctx context.Context, opts UpOptions) (Plan, error) {
-	portal, _, err := s.LoadPortalForRuntime(ctx, SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID})
+	portal, _, err := s.loadPortalForPlan(ctx, SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID}, opts.DryRun)
 	if err != nil {
 		return Plan{}, err
 	}
@@ -113,7 +113,7 @@ func (s Service) PlanUp(ctx context.Context, opts UpOptions) (Plan, error) {
 		plan.Commands = append(plan.Commands, remotePrepareCommands(portal, false)...)
 	}
 	if attach == "shell" {
-		plan.Commands = append(plan.Commands, portalExecCommand(portal, []string{DefaultShell}, portalCWD(portal, opts.Workdir), "", TTYAuto, true))
+		plan.Commands = append(plan.Commands, s.portalExecCommand(portal, []string{DefaultShell}, portalCWD(portal, opts.Workdir), "", TTYAuto, true))
 	}
 	return plan, nil
 }
@@ -130,7 +130,7 @@ func (s Service) PlanShell(ctx context.Context, opts ShellOptions) (Plan, error)
 	cwd := portalCWD(portal, opts.CWD)
 	tty := firstTTY(opts.TTY, TTYAuto)
 	plan := Plan{Operation: "shell", Summary: fmt.Sprintf("open shell in portal %s for space %s", portal.ID, opts.SpaceID)}
-	plan.Commands = append(plan.Commands, portalExecCommand(portal, []string{shell}, cwd, opts.User, tty, true))
+	plan.Commands = append(plan.Commands, s.portalExecCommand(portal, []string{shell}, cwd, opts.User, tty, true))
 	return plan, nil
 }
 
@@ -145,12 +145,12 @@ func (s Service) PlanExec(ctx context.Context, opts ExecOptions) (Plan, error) {
 	cwd := portalCWD(portal, opts.CWD)
 	tty := firstTTY(opts.TTY, TTYNever)
 	plan := Plan{Operation: "exec", Summary: fmt.Sprintf("run command in portal %s for space %s", portal.ID, opts.SpaceID)}
-	plan.Commands = append(plan.Commands, portalExecCommand(portal, opts.Command, cwd, opts.User, tty, false))
+	plan.Commands = append(plan.Commands, s.portalExecCommand(portal, opts.Command, cwd, opts.User, tty, false))
 	return plan, nil
 }
 
 func (s Service) PlanSummon(ctx context.Context, opts SummonOptions) (Plan, error) {
-	portal, _, err := s.LoadPortalForRuntime(ctx, SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID})
+	portal, _, err := s.loadPortalForPlan(ctx, SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID}, opts.DryRun)
 	if err != nil {
 		return Plan{}, err
 	}
@@ -170,12 +170,12 @@ func (s Service) PlanSummon(ctx context.Context, opts SummonOptions) (Plan, erro
 		})
 	}
 	interactive := opts.Mode != "headless"
-	plan.Commands = append(plan.Commands, portalExecCommand(portal, agentCommand, portalCWD(portal, ""), "", TTYAuto, interactive))
+	plan.Commands = append(plan.Commands, s.portalExecCommand(portal, agentCommand, portalCWD(portal, ""), "", TTYAuto, interactive))
 	return plan, nil
 }
 
 func (s Service) PlanSync(ctx context.Context, opts SyncOptions) (Plan, error) {
-	portal, spacePath, err := s.LoadPortalForRuntime(ctx, SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID})
+	portal, spacePath, err := s.loadPortalForPlan(ctx, SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID}, opts.DryRun)
 	if err != nil {
 		return Plan{}, err
 	}
@@ -227,13 +227,19 @@ func (s Service) PlanSync(ctx context.Context, opts SyncOptions) (Plan, error) {
 	return plan, nil
 }
 
-func portalExecCommand(portal Portal, argv []string, cwd, user string, tty TTYMode, interactive bool) Command {
+func (s Service) portalExecCommand(portal Portal, argv []string, cwd, user string, tty TTYMode, interactive bool) Command {
 	providerEnv := inheritedEnvNames(portal, argv)
+	tty = s.resolveTTY(tty)
+	wantTTY := tty == TTYAlways || (tty == TTYAuto && interactive)
 	switch portal.Driver {
 	case DriverDocker:
 		args := []string{"exec"}
-		if tty == TTYAlways || (tty == TTYAuto && interactive) {
+		if wantTTY {
 			args = append(args, "-it")
+		} else if interactive {
+			// Keep stdin wired through without allocating a TTY so piped
+			// interactive invocations do not fail with "not a TTY".
+			args = append(args, "-i")
 		}
 		for _, name := range providerEnv {
 			args = append(args, "-e", name)
@@ -259,8 +265,12 @@ func portalExecCommand(portal Portal, argv []string, cwd, user string, tty TTYMo
 		cmd.Interactive = interactive
 		return cmd
 	case DriverSSH, DriverEC2Attach:
-		remote := "cd " + quoteRemote(cwd) + " && exec " + joinRemote(argv)
-		cmd := sshCommandWithEnv(portal, providerEnv, remote)
+		remote := "cd " + quoteRemotePath(cwd) + " && exec " + joinRemote(argv)
+		var extra []string
+		if wantTTY {
+			extra = []string{"-t"}
+		}
+		cmd := sshCommandWithEnv(portal, providerEnv, remote, extra...)
 		cmd.Interactive = interactive
 		return cmd
 	default:
@@ -276,12 +286,16 @@ func devcontainerCommand(portal Portal, action string) Command {
 	return command("devcontainer", args...)
 }
 
+// sshCommand builds a non-interactive ssh invocation: BatchMode fails fast
+// instead of hanging on an auth prompt, and -n keeps ssh from draining stdin.
 func sshCommand(portal Portal, remoteCommand string) Command {
-	return sshCommandWithEnv(portal, nil, remoteCommand)
+	args := append([]string{"-n", "-o", "BatchMode=yes"}, sshArgs(portal)...)
+	args = append(args, sshDestination(portal), remoteCommand)
+	return command("ssh", args...)
 }
 
-func sshCommandWithEnv(portal Portal, envNames []string, remoteCommand string) Command {
-	args := sshArgs(portal)
+func sshCommandWithEnv(portal Portal, envNames []string, remoteCommand string, extraArgs ...string) Command {
+	args := append(append([]string{}, extraArgs...), sshArgs(portal)...)
 	for _, name := range envNames {
 		args = append(args, "-o", "SendEnv="+name)
 	}
@@ -290,7 +304,7 @@ func sshCommandWithEnv(portal Portal, envNames []string, remoteCommand string) C
 }
 
 func sshArgs(portal Portal) []string {
-	args := []string{}
+	args := []string{"-o", "ConnectTimeout=10"}
 	if portal.Target.Port > 0 {
 		args = append(args, "-p", fmt.Sprintf("%d", portal.Target.Port))
 	}
@@ -335,7 +349,7 @@ func remotePrepareCommands(portal Portal, sync bool) []Command {
 	if !isRemoteDriver(portal.Driver) || portal.Workspace.RemoteRoot == "" || strings.TrimSpace(portal.Target.Host) == "" {
 		return nil
 	}
-	commands := []Command{sshCommand(portal, "mkdir -p "+quoteRemote(portal.Workspace.RemoteRoot))}
+	commands := []Command{sshCommand(portal, "mkdir -p "+quoteRemotePath(portal.Workspace.RemoteRoot))}
 	if sync {
 		var syncCommands []Command
 		var err error
@@ -579,6 +593,20 @@ func remoteEndpoint(portal Portal) string {
 }
 
 func quoteRemote(value string) string {
+	return quoteShell(value)
+}
+
+// quoteRemotePath quotes a remote filesystem path while keeping a leading
+// tilde meaningful: single-quoting '~/x' would make the remote shell create a
+// literal directory named '~', diverging from rsync's host:~/x endpoint which
+// does expand to $HOME. A leading ~/ is therefore rewritten to "$HOME"/.
+func quoteRemotePath(value string) string {
+	if value == "~" {
+		return `"$HOME"`
+	}
+	if rest, ok := strings.CutPrefix(value, "~/"); ok {
+		return `"$HOME"/` + quoteShell(rest)
+	}
 	return quoteShell(value)
 }
 

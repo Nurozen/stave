@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -239,6 +240,9 @@ type execRunner struct{}
 func (execRunner) Run(ctx context.Context, bin string, args []string, opts RunOptions) (Result, error) {
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = opts.Dir
+	// Fail fast instead of hanging on a credential prompt, and pin the
+	// locale so output parsing is not localization-dependent.
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "LC_ALL=C")
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stdout = &stdout

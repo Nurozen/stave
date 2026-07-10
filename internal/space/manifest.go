@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/Nurozen/stave/internal/fsio"
 	"gopkg.in/yaml.v3"
 )
 
@@ -55,7 +56,7 @@ func SaveManifest(spacePath string, manifest Manifest) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(spacePath, ManifestName), data, 0o644)
+	return fsio.WriteFileAtomic(filepath.Join(spacePath, ManifestName), data, 0o644)
 }
 
 func (m Manifest) FindRepo(name string) (RepoManifest, int, bool) {

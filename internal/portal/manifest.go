@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Nurozen/stave/internal/config"
+	"github.com/Nurozen/stave/internal/fsio"
 	"gopkg.in/yaml.v3"
 )
 
@@ -149,7 +150,7 @@ func SaveManifest(spacePath string, manifest Manifest) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(spacePath, ManifestName), data, 0o644)
+	return fsio.WriteFileAtomic(filepath.Join(spacePath, ManifestName), data, 0o644)
 }
 
 func MarshalManifest(spacePath string, manifest Manifest) ([]byte, error) {

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+
+	"github.com/Nurozen/stave/internal/fsio"
 )
 
 type ConfigureOptions struct {
@@ -62,6 +64,12 @@ type DestroyOptions struct {
 }
 
 func (s Service) Configure(opts ConfigureOptions) (Plan, error) {
+	return s.withManifestLock(opts.SpaceID, func() (Plan, error) {
+		return s.configureLocked(opts)
+	})
+}
+
+func (s Service) configureLocked(opts ConfigureOptions) (Plan, error) {
 	manifest, spacePath, err := s.loadOrCreateManifest(opts.SpaceID)
 	if err != nil {
 		return Plan{}, err
@@ -130,7 +138,7 @@ func (s Service) PlanAuthInherit(ctx context.Context, opts AuthCommandOptions) (
 	if !opts.DryRun && !opts.Yes {
 		return Plan{}, fmt.Errorf("auth inherit requires --yes unless --dry-run is used")
 	}
-	portal, spacePath, err := s.LoadPortalForRuntime(ctx, SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID})
+	portal, spacePath, err := s.loadPortalForPlan(ctx, SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID}, opts.DryRun)
 	if err != nil {
 		return Plan{}, err
 	}
@@ -156,7 +164,7 @@ func (s Service) PlanAuthRevoke(ctx context.Context, opts AuthCommandOptions) (P
 	if !opts.DryRun && !opts.Yes {
 		return Plan{}, fmt.Errorf("auth revoke requires --yes unless --dry-run is used")
 	}
-	portal, _, err := s.LoadPortalForRuntime(ctx, SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID})
+	portal, _, err := s.loadPortalForPlan(ctx, SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID}, opts.DryRun)
 	if err != nil {
 		return Plan{}, err
 	}
@@ -168,13 +176,13 @@ func (s Service) PlanAuthRevoke(ctx context.Context, opts AuthCommandOptions) (P
 		plan.Commands = append(plan.Commands, commandFromArgv(authLogoutArgv(opts.Provider)))
 	}
 	if target == "portal" || target == "all" {
-		plan.Commands = append(plan.Commands, portalExecCommand(portal, authLogoutArgv(opts.Provider), portalCWD(portal, ""), "", TTYAuto, true))
+		plan.Commands = append(plan.Commands, s.portalExecCommand(portal, authLogoutArgv(opts.Provider), portalCWD(portal, ""), "", TTYAuto, true))
 	}
 	return plan, nil
 }
 
 func (s Service) planAuthCommand(ctx context.Context, operation string, opts AuthCommandOptions, argv []string) (Plan, error) {
-	portal, _, err := s.LoadPortalForRuntime(ctx, SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID})
+	portal, _, err := s.loadPortalForPlan(ctx, SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID}, opts.DryRun)
 	if err != nil {
 		return Plan{}, err
 	}
@@ -182,7 +190,7 @@ func (s Service) planAuthCommand(ctx context.Context, operation string, opts Aut
 		return Plan{}, err
 	}
 	plan := Plan{Operation: operation, DryRun: opts.DryRun, Mutates: true, Summary: fmt.Sprintf("%s for %s in portal %s", operation, opts.Provider, portal.ID)}
-	plan.Commands = append(plan.Commands, portalExecCommand(portal, argv, portalCWD(portal, ""), "", TTYAuto, true))
+	plan.Commands = append(plan.Commands, s.portalExecCommand(portal, argv, portalCWD(portal, ""), "", TTYAuto, true))
 	return plan, nil
 }
 
@@ -235,6 +243,12 @@ func (s Service) PlanDown(ctx context.Context, opts DownOptions) (Plan, error) {
 }
 
 func (s Service) Detach(opts DetachOptions) (Plan, error) {
+	return s.withManifestLock(opts.SpaceID, func() (Plan, error) {
+		return s.detachLocked(opts)
+	})
+}
+
+func (s Service) detachLocked(opts DetachOptions) (Plan, error) {
 	manifest, spacePath, err := s.loadOrCreateManifest(opts.SpaceID)
 	if err != nil {
 		return Plan{}, err
@@ -340,11 +354,20 @@ func commandFromArgv(argv []string) Command {
 }
 
 func (s Service) updateAuthProvider(spacePath, portalID, provider string, mode AuthMode, status AuthStatus) error {
+	return fsio.WithLock(filepath.Join(spacePath, ManifestName+".lock"), func() error {
+		return s.updateAuthProviderLocked(spacePath, portalID, provider, mode, status)
+	})
+}
+
+func (s Service) updateAuthProviderLocked(spacePath, portalID, provider string, mode AuthMode, status AuthStatus) error {
 	manifest, err := LoadManifest(spacePath)
 	if err != nil {
 		return err
 	}
-	portal := manifest.Portals[portalID]
+	portal, ok := manifest.Portals[portalID]
+	if !ok {
+		return fmt.Errorf("portal %q is not registered in %s", portalID, spacePath)
+	}
 	portal.Auth.Mode = mode
 	found := false
 	for i := range portal.Auth.Providers {

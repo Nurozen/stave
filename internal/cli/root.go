@@ -1113,7 +1113,7 @@ func (a *app) portalExecCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			spaceID, portalID, argv := splitPortalExecArgs(svc, args)
+			spaceID, portalID, argv := splitPortalExecArgs(svc, args, cmd.ArgsLenAtDash())
 			return a.runPortalPlanningCommand(cmd, func(svc portal.Service) (portal.Plan, error) {
 				return svc.PlanExec(cmd.Context(), portal.ExecOptions{SpaceID: spaceID, PortalID: portalID, Command: argv, CWD: cwd, User: user, TTY: portal.TTYMode(ttyMode)})
 			}, dryRun, false)
@@ -1388,7 +1388,9 @@ func (a *app) portalService(cmd *cobra.Command) (portal.Service, error) {
 	if err != nil {
 		return portal.Service{}, err
 	}
-	return portal.NewService(*cfg, a.effectivePortalRunner(), nil), nil
+	svc := portal.NewService(*cfg, a.effectivePortalRunner(), nil)
+	svc.IsTerminal = func() bool { return a.commandIsTerminal(cmd) }
+	return svc, nil
 }
 
 func (a *app) runPortalPlanningCommand(cmd *cobra.Command, build func(portal.Service) (portal.Plan, error), dryRun bool, printOnly bool) error {
@@ -1407,6 +1409,7 @@ func (a *app) runPortalPlanningCommand(cmd *cobra.Command, build func(portal.Ser
 		return nil
 	}
 	previousFailed := false
+	var suppressed []string
 	for _, command := range plan.Commands {
 		if command.RunIfPreviousFailed && !previousFailed {
 			continue
@@ -1416,7 +1419,15 @@ func (a *app) runPortalPlanningCommand(cmd *cobra.Command, build func(portal.Ser
 		if err != nil {
 			previousFailed = true
 			if command.ContinueOnError {
+				// Hold the output back: it is noise when the fallback
+				// succeeds, but essential context when it fails too.
+				if output := strings.TrimSpace(strings.Join(nonEmptyStrings(result.Stderr, result.Stdout), "\n")); output != "" {
+					suppressed = append(suppressed, fmt.Sprintf("%s: %s", command.String(), output))
+				}
 				continue
+			}
+			if len(suppressed) > 0 {
+				result.Stderr = strings.Join(append(suppressed, result.Stderr), "\n")
 			}
 			printed := command.Stream || printPortalRunResult(cmd, result)
 			cmd.SilenceUsage = true
@@ -1543,7 +1554,23 @@ func guidedPortalPreview(ctx context.Context, svc portal.Service, spaceID, porta
 	return svc.InitContainer(ctx, portal.InitContainerOptions{SpaceID: spaceID, PortalID: portalID, Preset: preset, DryRun: true})
 }
 
-func splitPortalExecArgs(svc portal.Service, args []string) (string, string, []string) {
+// splitPortalExecArgs separates "space-id [portal-id]" from the command argv.
+// An explicit "--" (argsLenAtDash >= 0) is authoritative; only without it do
+// we fall back to probing whether args[1] names a registered portal, so the
+// executed command can no longer change based on on-disk manifest state when
+// the user followed the documented "-- <command...>" form.
+func splitPortalExecArgs(svc portal.Service, args []string, argsLenAtDash int) (string, string, []string) {
+	if argsLenAtDash >= 0 && argsLenAtDash <= len(args) {
+		head := args[:argsLenAtDash]
+		spaceID, portalID := "", ""
+		if len(head) > 0 {
+			spaceID = head[0]
+		}
+		if len(head) > 1 {
+			portalID = head[1]
+		}
+		return spaceID, portalID, args[argsLenAtDash:]
+	}
 	spaceID := args[0]
 	if len(args) >= 3 {
 		if _, _, err := svc.LoadPortal(portal.SelectOptions{SpaceID: spaceID, PortalID: args[1]}); err == nil {

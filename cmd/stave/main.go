@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/Nurozen/stave/internal/cli"
 )
@@ -26,5 +29,9 @@ func main() {
 }
 
 func run() error {
-	return cli.NewRootCommand().Execute()
+	// Cancel in-flight subprocesses (ssh, docker, rsync) on Ctrl-C/SIGTERM
+	// instead of leaving them orphaned.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return cli.ExecuteContext(ctx)
 }

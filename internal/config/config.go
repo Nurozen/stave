@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/Nurozen/stave/internal/fsio"
 	"github.com/spf13/viper"
 	"gopkg.in/yaml.v3"
 )
@@ -198,7 +199,7 @@ func (c Config) Save(path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), DefaultDirMode); err != nil {
 		return fmt.Errorf("create config directory: %w", err)
 	}
-	if err := os.WriteFile(path, data, DefaultConfigMode); err != nil {
+	if err := fsio.WriteFileAtomic(path, data, DefaultConfigMode); err != nil {
 		return fmt.Errorf("write config: %w", err)
 	}
 	return nil
