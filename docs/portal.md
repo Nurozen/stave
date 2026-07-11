@@ -28,10 +28,23 @@ Create a Docker-backed portal:
 stave portal init container example --image alpine:3.20
 ```
 
+`--engine` selects the container engine (default `docker`):
+
+```sh
+stave portal init container example --image alpine:3.20 --engine docker
+```
+
 Start or validate the portal runtime:
 
 ```sh
 stave portal up example
+```
+
+Use `--attach shell` to drop into a shell once the runtime is up (default
+`none`), and `--workdir` to set the working directory for that shell:
+
+```sh
+stave portal up example --attach shell --workdir /workspace/example
 ```
 
 Run a command inside the portal:
@@ -110,6 +123,7 @@ stave portal init <space-id> --preset local-codex
 stave portal init <space-id> --preset local-claude
 stave portal init <space-id> --preset claude-devcontainer
 stave portal attach ssh <space-id> user@example.com --preset ssh-codex
+stave portal attach ssh <space-id> user@example.com --preset ssh-claude
 ```
 
 Preview without writing:
@@ -197,6 +211,7 @@ Attach an existing EC2 instance:
 ```sh
 stave portal attach ec2 example i-0123456789abcdef0 ec2 \
   --region us-west-2 \
+  --profile my-aws-profile \
   --ssh-user ec2-user \
   --host ec2-203-0-113-10.us-west-2.compute.amazonaws.com \
   --port 22 \
@@ -259,9 +274,18 @@ stave portal auth inherit example \
   --yes
 ```
 
-Supported inherit methods are `env`, `volume`, `ssh-forward`, and `copy-cache`.
-Use `copy-cache` only when you intentionally want local auth material copied
-into the portal target.
+Supported inherit methods are `env`, `volume`, and `ssh-forward`. `copy-cache`
+is intentionally not automated: copying local auth material into a portal
+requires direct manual handling, so `auth inherit` rejects it.
+
+Revoke target-local auth when you no longer want it in the portal. `--target`
+selects what is cleared: `portal` (default) clears auth inside the portal
+target, `local` clears the local copy, and `all` clears both:
+
+```sh
+stave portal auth revoke example --provider codex --target portal --yes
+stave portal auth revoke example --provider claude --target all --yes
+```
 
 Launch or print an agent command:
 
@@ -287,6 +311,10 @@ stave portal summon example --with codex --permission read-only
 stave portal summon example --with codex --permission workspace-write
 ```
 
+`--permission` currently affects only headless Codex runs, where it maps to
+`codex exec --sandbox <permission>`. It is ignored by foreground Codex, Claude
+Code, and Cursor Agent.
+
 ## Inspecting Portals
 
 List portals:
@@ -311,11 +339,17 @@ stave portal doctor example
 stave portal doctor example --json
 ```
 
-Show logs or log plans:
+Stream portal runtime or agent logs:
 
 ```sh
 stave portal logs example --tail 100
 stave portal logs example --agent codex --tail 50
+```
+
+Use `--follow` to keep streaming new log output until interrupted:
+
+```sh
+stave portal logs example --follow
 ```
 
 ## Syncing
@@ -395,15 +429,30 @@ stave portal exec example \
 
 The command working directory defaults to the portal's space root.
 
+### Non-interactive use
+
+`portal shell` and `portal summon` attach to your terminal. When stdin or
+stdout is not a terminal (for example in scripts or CI), they cannot attach, so
+instead they print the underlying command plus a notice and exit without
+launching. Pass `--tty never` to force this non-TTY behavior even from an
+interactive terminal.
+
 ## Configure After Setup
 
 Use `configure` for advanced tuning after a portal exists:
 
 ```sh
 stave portal configure example \
-  --sync rsync \
   --agent codex \
   --auth env
+```
+
+`--sync rsync` applies only to ssh and ec2 portals; docker and devcontainer
+portals require mount sync and reject `--sync rsync`. Set it on the remote
+portal instead:
+
+```sh
+stave portal configure example remote --sync rsync
 ```
 
 Other useful fields:
@@ -456,6 +505,14 @@ Delete recorded Stave-owned volumes only when you mean it:
 ```sh
 stave portal destroy example --delete-volumes
 ```
+
+Other destroy flags:
+
+| Flag | Meaning |
+|------|---------|
+| `--force` | Force destroy even when the runtime does not stop cleanly |
+| `--timeout <seconds>` | Graceful stop timeout before forcing |
+| `--delete-remote-data` | Delete the exact recorded remote data when supported |
 
 For SSH and EC2 portals, use `detach`. Portal v1 does not delete arbitrary
 remote hosts, terminate EC2 instances, or remove files outside the exact

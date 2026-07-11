@@ -27,6 +27,7 @@ go install github.com/Nurozen/stave/cmd/stave@latest
 ```text
 stave
 ├── setup
+├── completion
 ├── agent
 │   ├── configure
 │   └── <query>
