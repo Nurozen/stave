@@ -37,6 +37,7 @@ type LogsOptions struct {
 	Agent    string
 	Follow   bool
 	Tail     int
+	DryRun   bool
 }
 
 type DownOptions struct {
@@ -195,7 +196,7 @@ func (s Service) planAuthCommand(ctx context.Context, operation string, opts Aut
 }
 
 func (s Service) PlanLogs(ctx context.Context, opts LogsOptions) (Plan, error) {
-	portal, _, err := s.LoadPortalForRuntime(ctx, SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID})
+	portal, _, err := s.loadPortalForPlan(ctx, SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID}, opts.DryRun)
 	if err != nil {
 		return Plan{}, err
 	}

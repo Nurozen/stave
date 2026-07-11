@@ -170,7 +170,9 @@ func (s Service) initContainerLocked(ctx context.Context, opts InitContainerOpti
 		},
 		Ownership: Ownership{CreatedContainer: true},
 	}
-	applyPreset(opts.Preset, &portal)
+	if err := applyPreset(opts.Preset, &portal); err != nil {
+		return Plan{}, err
+	}
 	applyPortalDefaults(opts.SpaceID, &portal)
 	if err := ValidatePortal(opts.SpaceID, portal); err != nil {
 		return Plan{}, err
@@ -222,7 +224,9 @@ func (s Service) initDevcontainerLocked(ctx context.Context, opts InitDevcontain
 		},
 		Ownership: Ownership{CreatedContainer: true},
 	}
-	applyPreset(opts.Preset, &portal)
+	if err := applyPreset(opts.Preset, &portal); err != nil {
+		return Plan{}, err
+	}
 	applyPortalDefaults(opts.SpaceID, &portal)
 	if err := ValidatePortal(opts.SpaceID, portal); err != nil {
 		return Plan{}, err
@@ -268,7 +272,9 @@ func (s Service) attachSSHLocked(ctx context.Context, opts AttachSSHOptions) (Pl
 		},
 		Target: Target{Host: opts.Host, Port: opts.Port, IdentityPath: opts.IdentityPath, KnownHostsPath: opts.KnownHostsPath, StrictHostKey: opts.StrictHostKey},
 	}
-	applyPreset(opts.Preset, &portal)
+	if err := applyPreset(opts.Preset, &portal); err != nil {
+		return Plan{}, err
+	}
 	portal.Driver = DriverSSH
 	if opts.SyncMode != "" {
 		portal.Workspace.SyncMode = opts.SyncMode
@@ -319,7 +325,9 @@ func (s Service) attachEC2Locked(ctx context.Context, opts AttachEC2Options) (Pl
 		},
 		Target: Target{Host: opts.Host, Port: opts.Port, InstanceID: opts.InstanceID, Region: opts.Region, Profile: opts.Profile, SSHUser: opts.SSHUser, IdentityPath: opts.IdentityPath, KnownHostsPath: opts.KnownHostsPath, StrictHostKey: opts.StrictHostKey},
 	}
-	applyPreset(opts.Preset, &portal)
+	if err := applyPreset(opts.Preset, &portal); err != nil {
+		return Plan{}, err
+	}
 	portal.Driver = DriverEC2Attach
 	if opts.SyncMode != "" {
 		portal.Workspace.SyncMode = opts.SyncMode
@@ -360,6 +368,9 @@ func (s Service) LoadPortal(opts SelectOptions) (Portal, string, error) {
 		return Portal{}, "", err
 	}
 	spacePath := s.SpacePath(opts.SpaceID)
+	if _, err := os.Stat(spacePath); errors.Is(err, os.ErrNotExist) {
+		return Portal{}, "", fmt.Errorf("space %q does not exist; create it with stave space create %s", opts.SpaceID, opts.SpaceID)
+	}
 	manifest, err := LoadManifest(spacePath)
 	if err != nil {
 		return Portal{}, "", err
@@ -530,7 +541,7 @@ func (s Service) normalizeContainerStatus(ctx context.Context, portal Portal, st
 		return nil
 	}
 	status.Overall = OverallWarn
-	status.Diagnostics = append(status.Diagnostics, Diagnostic{Component: "runtime", Severity: SeverityWarn, Code: "runtime.container_not_ready", Message: "container exists but is not ready", Evidence: fmt.Sprintf("state=%s health=%s", status.State, status.Health)})
+	status.Diagnostics = append(status.Diagnostics, Diagnostic{Component: "runtime", Severity: SeverityWarn, Code: "runtime.container_not_ready", Message: "container exists but is not ready", Evidence: fmt.Sprintf("state=%s health=%s", status.State, status.Health), NextAction: fmt.Sprintf("run stave portal up %s %s to start it", status.SpaceID, status.PortalID)})
 	return nil
 }
 
@@ -604,7 +615,7 @@ func (s Service) Inspect(ctx context.Context, opts SelectOptions) (InspectReport
 	if err != nil {
 		return InspectReport{}, err
 	}
-	report := InspectReport{ManifestPath: filepath.Join(spacePath, ManifestName), Portal: portal}
+	report := InspectReport{ManifestPath: filepath.Join(spacePath, ManifestName), Portal: portal, OwnedResources: []string{}}
 	if portal.Ownership.CreatedContainer && portal.Runtime.ContainerName != "" {
 		report.OwnedResources = append(report.OwnedResources, "container:"+portal.Runtime.ContainerName)
 		report.DestroyDryRunNotes = append(report.DestroyDryRunNotes, fmt.Sprintf("stop and remove Stave-owned container %s", portal.Runtime.ContainerName))
@@ -660,6 +671,9 @@ func (s Service) loadOrCreateManifest(spaceID string) (Manifest, string, error) 
 		return Manifest{}, "", err
 	}
 	spacePath := s.SpacePath(spaceID)
+	if _, err := os.Stat(spacePath); errors.Is(err, os.ErrNotExist) {
+		return Manifest{}, "", fmt.Errorf("space %q does not exist; create it with stave space create %s", spaceID, spaceID)
+	}
 	spaceManifest, err := space.LoadManifest(spacePath)
 	if err != nil {
 		return Manifest{}, "", err
@@ -761,7 +775,7 @@ func firstSyncMode(value, fallback SyncMode) SyncMode {
 func listEntries(manifest Manifest) []ListEntry {
 	entries := make([]ListEntry, 0, len(manifest.Portals))
 	for _, portal := range manifest.Portals {
-		entries = append(entries, ListEntry{SpaceID: manifest.SpaceID, PortalID: portal.ID, Driver: portal.Driver, SyncMode: portal.Workspace.SyncMode, Auth: summarizeAuth(portal.Auth.Providers), Notes: "-"})
+		entries = append(entries, ListEntry{SpaceID: manifest.SpaceID, PortalID: portal.ID, Driver: portal.Driver, SyncMode: portal.Workspace.SyncMode, Auth: summarizeAuth(portal.Auth.Providers)})
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].PortalID < entries[j].PortalID })
 	return entries

@@ -23,7 +23,7 @@ type Diagnostic struct {
 	Code       string   `json:"code"`
 	Message    string   `json:"message"`
 	Evidence   string   `json:"evidence,omitempty"`
-	NextAction string   `json:"nextAction,omitempty"`
+	NextAction string   `json:"next_action,omitempty"`
 }
 
 type Status struct {
@@ -43,7 +43,7 @@ type ListEntry struct {
 	Driver   Driver   `json:"driver"`
 	SyncMode SyncMode `json:"sync_mode"`
 	Auth     string   `json:"auth"`
-	Notes    string   `json:"notes"`
+	Notes    string   `json:"notes,omitempty"`
 }
 
 type DriverInfo struct {

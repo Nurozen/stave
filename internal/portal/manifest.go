@@ -278,6 +278,9 @@ func ValidatePortal(spaceID string, portal Portal) error {
 	if portal.Auth.Mode == AuthCopyCache {
 		return fmt.Errorf("copy-cache auth cannot be stored as the default auth mode")
 	}
+	if err := validateAuthMode(portal.Auth.Mode); err != nil {
+		return err
+	}
 	for _, provider := range portal.Auth.Providers {
 		if provider.SecretRef != "" {
 			return fmt.Errorf("auth provider %q stores secretRef; portal manifests must not store credential references", provider.Provider)
@@ -285,8 +288,20 @@ func ValidatePortal(spaceID string, portal Portal) error {
 		if provider.Mode == AuthCopyCache {
 			return fmt.Errorf("auth provider %q uses copy-cache; this requires direct CLI intent and must not be persisted as default", provider.Provider)
 		}
+		if err := validateAuthMode(provider.Mode); err != nil {
+			return fmt.Errorf("auth provider %q: %w", provider.Provider, err)
+		}
 	}
 	return nil
+}
+
+func validateAuthMode(mode AuthMode) error {
+	switch mode {
+	case "", AuthNative, AuthEnv, AuthVolume, AuthSSHForward, AuthRemoteLogin:
+		return nil
+	default:
+		return fmt.Errorf("auth mode %q is not supported; use native, env, volume, ssh-forward, or remote-login", mode)
+	}
 }
 
 func validateStrictHostKey(value string) error {

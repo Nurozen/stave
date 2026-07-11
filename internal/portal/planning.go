@@ -41,6 +41,7 @@ type ShellOptions struct {
 	User     string
 	TTY      TTYMode
 	Shell    string
+	DryRun   bool
 }
 
 type ExecOptions struct {
@@ -50,6 +51,7 @@ type ExecOptions struct {
 	CWD      string
 	User     string
 	TTY      TTYMode
+	DryRun   bool
 }
 
 type SummonOptions struct {
@@ -119,7 +121,10 @@ func (s Service) PlanUp(ctx context.Context, opts UpOptions) (Plan, error) {
 }
 
 func (s Service) PlanShell(ctx context.Context, opts ShellOptions) (Plan, error) {
-	portal, _, err := s.LoadPortalForRuntime(ctx, SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID})
+	if err := validateTTYMode(opts.TTY); err != nil {
+		return Plan{}, err
+	}
+	portal, _, err := s.loadPortalForPlan(ctx, SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID}, opts.DryRun)
 	if err != nil {
 		return Plan{}, err
 	}
@@ -138,7 +143,10 @@ func (s Service) PlanExec(ctx context.Context, opts ExecOptions) (Plan, error) {
 	if len(opts.Command) == 0 {
 		return Plan{}, fmt.Errorf("exec command is required")
 	}
-	portal, _, err := s.LoadPortalForRuntime(ctx, SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID})
+	if err := validateTTYMode(opts.TTY); err != nil {
+		return Plan{}, err
+	}
+	portal, _, err := s.loadPortalForPlan(ctx, SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID}, opts.DryRun)
 	if err != nil {
 		return Plan{}, err
 	}
@@ -152,6 +160,12 @@ func (s Service) PlanExec(ctx context.Context, opts ExecOptions) (Plan, error) {
 func (s Service) PlanSummon(ctx context.Context, opts SummonOptions) (Plan, error) {
 	portal, _, err := s.loadPortalForPlan(ctx, SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID}, opts.DryRun)
 	if err != nil {
+		return Plan{}, err
+	}
+	if err := validateSummonMode(opts.Mode); err != nil {
+		return Plan{}, err
+	}
+	if err := validateSummonPermission(opts.Permission); err != nil {
 		return Plan{}, err
 	}
 	summoner := normalizeSummoner(opts.With)
@@ -436,10 +450,10 @@ func spaceManifest(spacePath string) (space.Manifest, error) {
 	return space.LoadManifest(spacePath)
 }
 
-func applyPreset(preset string, portal *Portal) {
+func applyPreset(preset string, portal *Portal) error {
 	switch preset {
 	case "", "custom":
-		return
+		return nil
 	case "local-codex":
 		portal.Workspace.SyncMode = SyncMount
 		portal.Auth.Mode = AuthNative
@@ -460,7 +474,10 @@ func applyPreset(preset string, portal *Portal) {
 		portal.Workspace.SyncMode = SyncRsync
 		portal.Auth.Mode = AuthRemoteLogin
 		portal.Auth.Providers = []AuthProvider{defaultAuthProvider("claude", AuthRemoteLogin)}
+	default:
+		return fmt.Errorf("preset %q is not supported; use local-codex, local-claude, claude-devcontainer, ssh-codex, or ssh-claude", preset)
 	}
+	return nil
 }
 
 func summonCommand(summoner string, portal Portal, opts SummonOptions) ([]string, error) {
@@ -472,12 +489,19 @@ func summonCommand(summoner string, portal Portal, opts SummonOptions) ([]string
 	if permission == "" {
 		permission = "workspace-write"
 	}
+	// The exec wrapper already switches into the workspace (docker -w /
+	// remote cd with $HOME expansion); a literal --cd '~/...' would never be
+	// tilde-expanded on the remote side, so point codex at the current dir.
+	cwd := portalCWD(portal, "")
+	if isRemoteDriver(portal.Driver) {
+		cwd = "."
+	}
 	switch summoner {
 	case "codex":
 		if opts.Mode == "headless" {
-			return []string{"codex", "exec", "--cd", portalCWD(portal, ""), "--sandbox", permission, "--json", prompt}, nil
+			return []string{"codex", "exec", "--cd", cwd, "--sandbox", permission, "--json", prompt}, nil
 		}
-		return []string{"codex", "--cd", portalCWD(portal, ""), prompt}, nil
+		return []string{"codex", "--cd", cwd, prompt}, nil
 	case "claude":
 		if opts.Mode == "headless" {
 			return []string{"claude", "-p", "--output-format", "stream-json", prompt}, nil
@@ -527,6 +551,33 @@ func firstTTY(value, fallback TTYMode) TTYMode {
 		return value
 	}
 	return fallback
+}
+
+func validateTTYMode(value TTYMode) error {
+	switch value {
+	case "", TTYAuto, TTYAlways, TTYNever:
+		return nil
+	default:
+		return fmt.Errorf("tty mode %q is not supported; use auto, always, or never", value)
+	}
+}
+
+func validateSummonMode(mode string) error {
+	switch mode {
+	case "", "foreground", "tmux", "headless", "print":
+		return nil
+	default:
+		return fmt.Errorf("summon mode %q is not supported; use foreground, tmux, headless, or print", mode)
+	}
+}
+
+func validateSummonPermission(permission string) error {
+	switch permission {
+	case "", "read-only", "workspace-write":
+		return nil
+	default:
+		return fmt.Errorf("summon permission %q is not supported; use read-only or workspace-write", permission)
+	}
 }
 
 func sortedLabels(labels map[string]string) []string {
