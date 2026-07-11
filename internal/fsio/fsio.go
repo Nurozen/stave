@@ -19,7 +19,9 @@ func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
 		return err
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
+	// Best-effort cleanup: after a successful rename the temp file is gone
+	// and this remove fails harmlessly.
+	defer func() { _ = os.Remove(tmpName) }()
 	_, writeErr := tmp.Write(data)
 	syncErr := tmp.Sync()
 	closeErr := tmp.Close()
@@ -40,10 +42,11 @@ func WithLock(lockPath string, fn func() error) error {
 	if err != nil {
 		return fmt.Errorf("open lock %s: %w", lockPath, err)
 	}
-	defer file.Close()
+	// Closing also releases the flock, so both deferred failures are moot.
+	defer func() { _ = file.Close() }()
 	if err := lockFile(file); err != nil {
 		return fmt.Errorf("lock %s: %w", lockPath, err)
 	}
-	defer unlockFile(file)
+	defer func() { _ = unlockFile(file) }()
 	return fn()
 }
