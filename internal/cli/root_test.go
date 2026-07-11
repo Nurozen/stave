@@ -184,11 +184,11 @@ func TestCLIReposListSyncAndRemove(t *testing.T) {
 	if strings.Contains(listOut, "repo-a\t") || !strings.Contains(listOut, "repo-b\t") {
 		t.Fatalf("repos list after remove = %s", listOut)
 	}
-	if out, err := runCLIError(t, nil, "repos", "sync", "missing"); err == nil || !strings.Contains(out, "not registered") {
-		t.Fatalf("expected missing repo sync error, err=%v out=%s", err, out)
+	if _, err := runCLIError(t, nil, "repos", "sync", "missing"); err == nil || !strings.Contains(err.Error(), "not registered") {
+		t.Fatalf("expected missing repo sync error, err=%v", err)
 	}
-	if out, err := runCLIError(t, nil, "repos", "remove", "missing"); err == nil || !strings.Contains(out, "not registered") {
-		t.Fatalf("expected missing repo remove error, err=%v out=%s", err, out)
+	if _, err := runCLIError(t, nil, "repos", "remove", "missing"); err == nil || !strings.Contains(err.Error(), "not registered") {
+		t.Fatalf("expected missing repo remove error, err=%v", err)
 	}
 }
 
@@ -207,8 +207,8 @@ func TestCLIReposAddDryRunAndDuplicate(t *testing.T) {
 	}
 
 	runCLI(t, "repos", "add", "repo-a", src)
-	if out, err := runCLIError(t, nil, "repos", "add", "repo-a", src); err == nil || !strings.Contains(out, "already registered") {
-		t.Fatalf("expected duplicate repo error, err=%v out=%s", err, out)
+	if _, err := runCLIError(t, nil, "repos", "add", "repo-a", src); err == nil || !strings.Contains(err.Error(), "already registered") {
+		t.Fatalf("expected duplicate repo error, err=%v", err)
 	}
 }
 
@@ -326,8 +326,8 @@ func TestCLIPortalReadCommandsTextAndJSON(t *testing.T) {
 	if err := json.Unmarshal([]byte(authJSON), &auth); err != nil || len(auth.Providers) != 1 || auth.Providers[0].Provider != "codex" {
 		t.Fatalf("portal auth json = %s err=%v auth=%#v", authJSON, err, auth)
 	}
-	if filtered := runCLIWithApp(t, application, "portal", "auth", "status", "ex-1234", "--provider", "cursor"); strings.TrimSpace(filtered) != "" {
-		t.Fatalf("unexpected filtered auth output = %s", filtered)
+	if filtered := runCLIWithApp(t, application, "portal", "auth", "status", "ex-1234", "--provider", "cursor"); !strings.Contains(filtered, "not configured for this portal") {
+		t.Fatalf("expected filter-miss note, got %q", filtered)
 	}
 	if _, err := runCLIError(t, application, "portal", "auth", "status", "ex-1234", "--provider", "bad"); err == nil || !strings.Contains(err.Error(), "provider") {
 		t.Fatalf("expected bad auth status provider error, got %v", err)
@@ -496,10 +496,11 @@ func TestCLIPortalPlanningCommandsExecuteAndPreview(t *testing.T) {
 		{name: "up executes", args: []string{"portal", "up", "ex-1234"}, want: "portal stdout", executes: true},
 		{name: "up print command", args: []string{"portal", "up", "ex-1234", "--print-command"}, want: "docker start"},
 		{name: "up attach shell print command", args: []string{"portal", "up", "ex-1234", "--print-command", "--attach", "shell", "--workdir", "/workspace/ex-1234/references"}, want: "docker exec -it -w /workspace/ex-1234/references"},
-		{name: "exec executes", args: []string{"portal", "exec", "ex-1234", "default", "true"}, want: "portal stdout", executes: true},
+		{name: "exec executes", args: []string{"portal", "exec", "ex-1234", "default", "--", "true"}, want: "portal stdout", executes: true},
 		{name: "sync dry-run", args: []string{"portal", "sync", "ex-1234", "--dry-run", "--include", "*.go", "--exclude", ".git", "--delete", "--max-delete", "3", "--yes"}, want: "sync portal default"},
 		{name: "sync auto dry-run", args: []string{"portal", "sync", "ex-1234", "--dry-run", "--mode", "auto"}, want: "sync.mount_noop"},
-		{name: "logs preview", args: []string{"portal", "logs", "ex-1234", "--tail", "5", "--follow"}, want: "show logs for portal default"},
+		{name: "logs executes", args: []string{"portal", "logs", "ex-1234", "--tail", "5"}, want: "portal stdout", executes: true},
+		{name: "logs preview", args: []string{"portal", "logs", "ex-1234", "--tail", "5", "--follow", "--dry-run"}, want: "show logs for portal default"},
 		{name: "down dry-run", args: []string{"portal", "down", "ex-1234", "--timeout", "5", "--force", "--dry-run"}, want: "stop portal default"},
 		{name: "destroy dry-run", args: []string{"portal", "destroy", "ex-1234", "--timeout", "5", "--delete-volumes", "--force", "--dry-run"}, want: "destroy Stave-owned resources for portal default"},
 	} {
@@ -623,18 +624,6 @@ func TestCLIRunPortalPlanningCommandConditionalCommands(t *testing.T) {
 }
 
 func TestCLISplitPortalExecArgs(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	runCLI(t, "setup")
-	runCLI(t, "space", "create", "ex-1")
-	cfg, _, err := config.Load("")
-	if err != nil {
-		t.Fatal(err)
-	}
-	svc := portal.NewService(*cfg, &fakePortalRunner{}, nil)
-	if _, err := svc.InitContainer(context.Background(), portal.InitContainerOptions{SpaceID: "ex-1", PortalID: "dev"}); err != nil {
-		t.Fatal(err)
-	}
 	for _, tc := range []struct {
 		name     string
 		args     []string
@@ -642,14 +631,25 @@ func TestCLISplitPortalExecArgs(t *testing.T) {
 		portalID string
 		argv     []string
 		dash     int
+		wantErr  string
 	}{
-		{name: "default portal", args: []string{"ex-1", "echo"}, spaceID: "ex-1", argv: []string{"echo"}, dash: -1},
-		{name: "explicit portal", args: []string{"ex-1", "dev", "echo", "hi"}, spaceID: "ex-1", portalID: "dev", argv: []string{"echo", "hi"}, dash: -1},
 		{name: "dash separates command", args: []string{"ex-1", "dev", "echo", "hi"}, spaceID: "ex-1", portalID: "dev", argv: []string{"echo", "hi"}, dash: 2},
-		{name: "dash with default portal", args: []string{"ex-1", "dev", "echo"}, spaceID: "ex-1", argv: []string{"dev", "echo"}, dash: 1},
+		{name: "dash with default portal", args: []string{"ex-1", "echo", "hi"}, spaceID: "ex-1", argv: []string{"echo", "hi"}, dash: 1},
+		{name: "missing dash is rejected", args: []string{"ex-1", "dev", "echo"}, dash: -1, wantErr: "requires \"--\""},
+		{name: "missing command after dash", args: []string{"ex-1", "dev"}, dash: 2, wantErr: "requires a command"},
+		{name: "too many positionals before dash", args: []string{"ex-1", "dev", "extra", "echo"}, dash: 3, wantErr: "takes <space-id> [portal-id]"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			spaceID, portalID, argv := splitPortalExecArgs(svc, tc.args, tc.dash)
+			spaceID, portalID, argv, err := splitPortalExecArgs(tc.args, tc.dash)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err = %v, want %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
 			if spaceID != tc.spaceID || portalID != tc.portalID || strings.Join(argv, "\x00") != strings.Join(tc.argv, "\x00") {
 				t.Fatalf("splitPortalExecArgs(%v) = %q %q %v", tc.args, spaceID, portalID, argv)
 			}
@@ -665,8 +665,8 @@ func TestCLISpaceAddSyncArchiveAndDestroy(t *testing.T) {
 	runCLI(t, "repos", "add", "repo-a", src)
 	runCLI(t, "space", "init", "ex-1234")
 
-	if out, err := runCLIError(t, nil, "space", "add", "ex-1234", "repo-a"); err == nil || !strings.Contains(out, "choose exactly one") {
-		t.Fatalf("expected missing mode error, err=%v out=%s", err, out)
+	if _, err := runCLIError(t, nil, "space", "add", "ex-1234", "repo-a"); err == nil || !strings.Contains(err.Error(), "choose exactly one") {
+		t.Fatalf("expected missing mode error, err=%v", err)
 	}
 	dryRunRef := runCLI(t, "space", "add", "ex-1234", "repo-a", "--reference", "--base", "main", "--dry-run")
 	if !strings.Contains(dryRunRef, "dry-run:") {
@@ -1324,7 +1324,7 @@ func TestCLICommandsSurfaceConfigLoadErrors(t *testing.T) {
 		{"portal", "up", "ex-1"},
 		{"portal", "sync", "ex-1"},
 		{"portal", "shell", "ex-1", "--print-command"},
-		{"portal", "exec", "ex-1", "true"},
+		{"portal", "exec", "ex-1", "--", "true"},
 		{"portal", "summon", "ex-1", "--print-command"},
 		{"portal", "logs", "ex-1"},
 		{"portal", "down", "ex-1"},
