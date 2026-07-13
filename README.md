@@ -32,6 +32,7 @@ stave
 │   ├── configure
 │   └── <query>
 ├── summon <space-id>
+├── review <pr> [space-id]
 ├── portal
 │   ├── init <space-id> [portal-id]
 │   ├── attach ssh|ec2 <space-id> ...
@@ -90,6 +91,29 @@ stave space status ticket-482
 # Fetch remotes, refresh references, report edit drift
 stave space sync ticket-482
 ```
+
+## Reviewing a pull request
+
+`stave review` collapses the review setup into one command: it registers the
+repository if needed, fetches the PR head (`refs/pull/N/head`, so fork PRs
+work too), checks it out as an editable worktree whose drift is measured
+against the PR's base branch, and writes the PR's metadata (title, author,
+size, checks, description) to `spec/pr-<N>.md` via the `gh` CLI when
+available.
+
+```bash
+# From a URL, owner/repo#N, or a registered repo name
+stave review https://github.com/owner/repo/pull/123
+stave review owner/repo#123 my-review-space
+
+# Straight into an agent session (the spec primes it with the PR context)
+stave review owner/repo#123 --summon claude
+```
+
+Inside the space, `git diff origin/<base>...HEAD` is the full PR diff and
+`stave space status` shows the PR's size as ahead/behind drift. Review
+skills (for example a PR walkthrough skill) find everything they need in
+`spec/` and the checked-out worktree.
 
 ## Layout
 
@@ -215,6 +239,8 @@ When `--spec` points at a file, it is copied under `spec/` with its original bas
 |---------|-------------|
 | `stave summon <space-id> --with codex` | Start Codex in the space root |
 | `stave summon <space-id> --with claude` | Start Claude Code in the space root |
+| `stave review <pr>` | One-step PR review space: fetch the PR head, check it out, record metadata under `spec/` |
+| `stave review <pr> --summon claude` | Same, then launch Claude Code in the review space |
 | `stave summon <space-id> --with cursor` | Start Cursor Agent in the space root |
 
 Summoned agents always launch from `agent-work/<space-id>`, not from an individual repo. That gives them the manifest, generated `AGENTS.md`, copied specs, editable top-level repos, and `references/` context in one working directory.
