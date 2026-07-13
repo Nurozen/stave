@@ -24,6 +24,28 @@ func TestPromptIncludesSpecPath(t *testing.T) {
 	}
 }
 
+func TestSummonPromptOverride(t *testing.T) {
+	cfg := testConfig(t)
+	spacePath := filepath.Join(cfg.AgentWorkDir, "ex-1")
+	if err := space.SaveManifest(spacePath, space.Manifest{ID: "ex-1", CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	var out strings.Builder
+	launcher := &fakeLauncher{}
+	svc := NewService(cfg, launcher, &out)
+	svc.Interactive = true
+
+	if err := svc.Summon(context.Background(), Options{SpaceID: "ex-1", Summoner: Claude, Prompt: "/pr-teach"}); err != nil {
+		t.Fatal(err)
+	}
+	if !launcher.called {
+		t.Fatal("launcher was not called")
+	}
+	if len(launcher.invocation.Args) != 1 || launcher.invocation.Args[0] != "/pr-teach" {
+		t.Fatalf("invocation args = %#v, want the override prompt only", launcher.invocation.Args)
+	}
+}
+
 func TestBuildInvocation(t *testing.T) {
 	cfg := testConfig(t)
 	spacePath := filepath.Join(cfg.AgentWorkDir, "ex-1")

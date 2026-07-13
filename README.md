@@ -108,6 +108,10 @@ stave review owner/repo#123 my-review-space
 
 # Straight into an agent session (the spec primes it with the PR context)
 stave review owner/repo#123 --summon claude
+
+# Pull in sibling repos as read-only context, and launch directly into a
+# review skill instead of the default prompt
+stave review owner/repo#123 -r other-repo --summon claude --prompt "/pr-teach"
 ```
 
 Inside the space, `git diff origin/<base>...HEAD` is the full PR diff and
@@ -241,6 +245,7 @@ When `--spec` points at a file, it is copied under `spec/` with its original bas
 | `stave summon <space-id> --with claude` | Start Claude Code in the space root |
 | `stave review <pr>` | One-step PR review space: fetch the PR head, check it out, record metadata under `spec/` |
 | `stave review <pr> --summon claude` | Same, then launch Claude Code in the review space |
+| `stave review <pr> -r <repo> --summon claude --prompt "/skill"` | Add read-only reference repos and launch straight into a review skill |
 | `stave summon <space-id> --with cursor` | Start Cursor Agent in the space root |
 
 Summoned agents always launch from `agent-work/<space-id>`, not from an individual repo. That gives them the manifest, generated `AGENTS.md`, copied specs, editable top-level repos, and `references/` context in one working directory.

@@ -84,7 +84,9 @@ type prMetadata struct {
 
 func (a *app) reviewCommand() *cobra.Command {
 	var summonName string
+	var summonPrompt string
 	var repoOverride string
+	var references []string
 	var noSummon bool
 	cmd := &cobra.Command{
 		Use:   "review <pr> [space-id]",
@@ -117,7 +119,11 @@ The <pr> argument accepts a GitHub PR URL, owner/repo#123, or
 			if err := cfg.EnsureRootDirs(); err != nil {
 				return err
 			}
-			result, err := a.setUpReviewSpace(cmd, cfg, cfgPath, ref, spaceID)
+			refSpecs, err := parseRepoSpecs(references)
+			if err != nil {
+				return err
+			}
+			result, err := a.setUpReviewSpace(cmd, cfg, cfgPath, ref, spaceID, refSpecs)
 			if err != nil {
 				return err
 			}
@@ -132,10 +138,12 @@ The <pr> argument accepts a GitHub PR URL, owner/repo#123, or
 				fmt.Fprintf(out, "  next:  stave summon %s --with claude\n", result.SpaceID)
 				return nil
 			}
-			return a.runSummon(cmd, *cfg, result.SpaceID, summonName, false)
+			return a.runSummon(cmd, *cfg, result.SpaceID, summonName, summonPrompt, false)
 		},
 	}
 	cmd.Flags().StringVar(&summonName, "summon", "", "launch a summoner in the review space (codex, claude, or cursor)")
+	cmd.Flags().StringVar(&summonPrompt, "prompt", "", "launch prompt for --summon (e.g. a skill invocation like \"/pr-teach\")")
+	cmd.Flags().StringArrayVarP(&references, "reference", "r", nil, "registered repo to add as read-only context, optionally repo:ref (repeatable)")
 	cmd.Flags().StringVar(&repoOverride, "repo", "", "registered repo name to use instead of resolving from the PR URL")
 	cmd.Flags().BoolVar(&noSummon, "no-summon", false, "never launch a summoner, even if --summon is set")
 	return cmd
@@ -149,7 +157,7 @@ type reviewResult struct {
 	SpecFile     string
 }
 
-func (a *app) setUpReviewSpace(cmd *cobra.Command, cfg *config.Config, cfgPath string, ref prRef, spaceID string) (reviewResult, error) {
+func (a *app) setUpReviewSpace(cmd *cobra.Command, cfg *config.Config, cfgPath string, ref prRef, spaceID string, references []space.RepoSpec) (reviewResult, error) {
 	ctx := cmd.Context()
 	out := cmd.OutOrStdout()
 	client := git.New()
@@ -209,6 +217,11 @@ func (a *app) setUpReviewSpace(cmd *cobra.Command, cfg *config.Config, cfgPath s
 		NoFetch:    true, // fetched above, including the PR ref
 	}); err != nil {
 		return reviewResult{}, err
+	}
+	for _, spec := range references {
+		if err := svc.AddRepo(ctx, space.AddOptions{SpaceID: spaceID, RepoName: spec.Name, Mode: space.ModeReference, Ref: spec.Ref}); err != nil {
+			return reviewResult{}, err
+		}
 	}
 
 	return reviewResult{

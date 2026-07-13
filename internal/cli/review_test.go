@@ -143,6 +143,43 @@ func TestCLIReviewEndToEnd(t *testing.T) {
 	}
 }
 
+func TestCLIReviewWithReferenceRepo(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	src := createGitRepo(t, "repo-a")
+	runGit(t, src, "checkout", "-b", "pr-branch")
+	if err := os.WriteFile(filepath.Join(src, "feature.txt"), []byte("pr change\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, src, "add", "feature.txt")
+	runGit(t, src, "commit", "-m", "pr change")
+	prSHA := gitOutput(t, src, "rev-parse", "pr-branch")
+	runGit(t, src, "checkout", "main")
+	runGit(t, src, "update-ref", "refs/pull/7/head", prSHA)
+	ctxSrc := createGitRepo(t, "ctx-repo")
+
+	runCLI(t, "setup")
+	runCLI(t, "repos", "add", "repo-a", src)
+	runCLI(t, "repos", "add", "ctx-repo", ctxSrc)
+
+	out := runCLI(t, "review", "repo-a#7", "-r", "ctx-repo")
+	if !strings.Contains(out, "review space review-repo-a-7 is ready") {
+		t.Fatalf("review output = %s", out)
+	}
+	refPath := filepath.Join(home, "stave", "agent-work", "review-repo-a-7", "references", "ctx-repo")
+	if _, err := os.Stat(refPath); err != nil {
+		t.Fatalf("reference worktree missing: %v", err)
+	}
+	agents, err := os.ReadFile(filepath.Join(home, "stave", "agent-work", "review-repo-a-7", "AGENTS.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(agents), "reference at `references/ctx-repo`") {
+		t.Fatalf("AGENTS.md missing reference entry:\n%s", agents)
+	}
+}
+
 func TestCLIReviewSpaceCollisionErrors(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

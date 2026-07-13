@@ -512,7 +512,7 @@ func (a *app) createCommand() *cobra.Command {
 			if dryRun {
 				return a.printPlannedSummon(cmd, svc.Config, args[0], summonName, spec)
 			}
-			return a.runSummon(cmd, svc.Config, args[0], summonName, false)
+			return a.runSummon(cmd, svc.Config, args[0], summonName, "", false)
 		},
 	}
 	cmd.Flags().StringVarP(&kind, "kind", "k", "", "space kind, such as ticket, spike, or audit")
@@ -525,7 +525,7 @@ func (a *app) createCommand() *cobra.Command {
 }
 
 func (a *app) summonCommand() *cobra.Command {
-	var summoner string
+	var summoner, prompt string
 	var printCommand bool
 	cmd := &cobra.Command{
 		Use:   "summon <space-id>",
@@ -536,10 +536,11 @@ func (a *app) summonCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return a.runSummon(cmd, *cfg, args[0], summoner, printCommand)
+			return a.runSummon(cmd, *cfg, args[0], summoner, prompt, printCommand)
 		},
 	}
 	cmd.Flags().StringVar(&summoner, "with", "", "summoner to launch (codex, claude, or cursor; defaults to config)")
+	cmd.Flags().StringVar(&prompt, "prompt", "", "override the launch prompt (e.g. a skill invocation like \"/pr-teach\")")
 	cmd.Flags().BoolVar(&printCommand, "print-command", false, "print the launch command instead of running it")
 	return cmd
 }
@@ -1168,7 +1169,7 @@ func (a *app) portalExecCommand() *cobra.Command {
 }
 
 func (a *app) portalSummonCommand() *cobra.Command {
-	var with, mode, permission string
+	var with, mode, permission, prompt string
 	var printCommand, dryRun bool
 	cmd := &cobra.Command{
 		Use:   "summon <space-id> [portal-id]",
@@ -1183,13 +1184,14 @@ func (a *app) portalSummonCommand() *cobra.Command {
 				fmt.Fprintln(cmd.ErrOrStderr(), "Non-interactive terminal detected; printing summon command instead of launching.")
 			}
 			return a.runPortalPlanningCommand(cmd, func(svc portal.Service) (portal.Plan, error) {
-				return svc.PlanSummon(cmd.Context(), portal.SummonOptions{SpaceID: args[0], PortalID: optionalPortalID(args), With: with, Mode: mode, Permission: permission, DryRun: dryRun || printCommand})
+				return svc.PlanSummon(cmd.Context(), portal.SummonOptions{SpaceID: args[0], PortalID: optionalPortalID(args), With: with, Mode: mode, Permission: permission, Prompt: prompt, DryRun: dryRun || printCommand})
 			}, dryRun, printCommand)
 		},
 	}
 	cmd.Flags().StringVar(&with, "with", "", "summoner: codex, claude, or cursor (defaults to codex)")
 	cmd.Flags().StringVar(&mode, "mode", "foreground", "mode: foreground, tmux, headless, or print")
 	cmd.Flags().StringVar(&permission, "permission", "workspace-write", "permission for headless codex runs: read-only or workspace-write")
+	cmd.Flags().StringVar(&prompt, "prompt", "", "override the launch prompt (e.g. a skill invocation like \"/pr-teach\")")
 	cmd.Flags().BoolVar(&printCommand, "print-command", false, "preview the commands without running them")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview the commands without running them")
 	return cmd
@@ -1625,13 +1627,13 @@ func splitPortalExecArgs(args []string, argsLenAtDash int) (string, string, []st
 	return head[0], portalID, argv, nil
 }
 
-func (a *app) runSummon(cmd *cobra.Command, cfg config.Config, spaceID string, summoner string, printCommand bool) error {
+func (a *app) runSummon(cmd *cobra.Command, cfg config.Config, spaceID string, summoner string, prompt string, printCommand bool) error {
 	svc := summon.NewService(cfg, a.effectiveSummonLauncher(), cmd.OutOrStdout())
 	svc.Interactive = a.commandIsTerminal(cmd)
 	if !printCommand && !svc.Interactive {
 		fmt.Fprintln(cmd.ErrOrStderr(), "Non-interactive terminal detected; printing summon command instead of launching.")
 	}
-	return svc.Summon(cmd.Context(), summon.Options{SpaceID: spaceID, Summoner: summoner, PrintCommand: printCommand})
+	return svc.Summon(cmd.Context(), summon.Options{SpaceID: spaceID, Summoner: summoner, Prompt: prompt, PrintCommand: printCommand})
 }
 
 func (a *app) printPlannedSummon(cmd *cobra.Command, cfg config.Config, spaceID string, summoner string, specPath string) error {

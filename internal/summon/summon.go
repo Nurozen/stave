@@ -36,6 +36,9 @@ type Options struct {
 	SpaceID      string
 	Summoner     string
 	PrintCommand bool
+	// Prompt overrides the generated launch prompt; a skill invocation such
+	// as "/pr-teach" launches the agent straight into that skill.
+	Prompt string
 }
 
 type Invocation struct {
@@ -86,7 +89,11 @@ func (s Service) Invocation(opts Options) (Invocation, error) {
 	if err != nil {
 		return Invocation{}, err
 	}
-	return BuildInvocation(s.Config, spacePath, ResolveName(s.Config, opts.Summoner), PromptForKind(spacePath, manifest.SpecPath, manifest.Kind))
+	prompt := opts.Prompt
+	if prompt == "" {
+		prompt = PromptForKind(spacePath, manifest.SpecPath, manifest.Kind)
+	}
+	return BuildInvocation(s.Config, spacePath, ResolveName(s.Config, opts.Summoner), prompt)
 }
 
 func BuildInvocation(cfg config.Config, spacePath string, summoner string, prompt string) (Invocation, error) {
