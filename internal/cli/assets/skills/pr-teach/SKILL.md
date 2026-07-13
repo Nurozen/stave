@@ -1,13 +1,13 @@
 ---
 name: pr-teach
-description: "Guided PR/diff comprehension loop that gets a human reviewer to a confident, defensible review decision in minimum time. Use when the user wants to understand, walk through, learn, or review a pull request, diff, branch, or set of changes — especially large, unfamiliar, or AI-generated ones — rather than have Claude review it for them. Triggers on: 'walk me through this PR', 'help me understand this diff', 'teach me this change', 'I need to review this but don't understand it', 'get me up to speed on this branch'."
+description: "Guided PR/diff comprehension loop that gets a human reviewer to a confident, defensible review decision in minimum time. Use when the user wants to understand, walk through, learn, or review a pull request, diff, branch, or set of changes — especially large, unfamiliar, or AI-generated ones — rather than have the assistant review it for them. Triggers on: 'walk me through this PR', 'help me understand this diff', 'teach me this change', 'I need to review this but don't understand it', 'get me up to speed on this branch'."
 ---
 
 # PR Teach: Reviewer Comprehension Loop
 
 ## Purpose
 
-The human reviewer is the bottleneck. This skill exists to remove that bottleneck **without removing the human's judgment**. The deliverable is not a review written by Claude — it is a human who can state, in their own words: what changed, why, where the risk is, what they would test, and whether they approve. Everything in this skill is in service of reaching that state as fast as possible.
+The human reviewer is the bottleneck. This skill exists to remove that bottleneck **without removing the human's judgment**. The deliverable is not a review written by the assistant — it is a human who can state, in their own words: what changed, why, where the risk is, what they would test, and whether they approve. Everything in this skill is in service of reaching that state as fast as possible.
 
 Act as a review mentor, not a review ghostwriter. The human's understanding is the product; your explanations are scaffolding.
 
@@ -36,7 +36,7 @@ Gather the full picture before teaching anything. Delegate the bulk reading to s
 - Enough surrounding code context to judge the diff (a diff hunk without its enclosing function is often unreviewable).
 - Who wrote it. AI-generated or unfamiliar-author PRs warrant more adversarial verification of claims.
 
-Ask the user two calibration questions up front (one AskUserQuestion call):
+Ask the user two calibration questions up front (ask both together, then wait for the answers):
 
 1. **Familiarity** — how well do they already know this area of the codebase? (Owns it / touched it before / never seen it)
 2. **Stakes** — what does this review gate? (Hotfix under time pressure / normal merge / high-risk area like auth, payments, data migration)
@@ -75,7 +75,7 @@ Work through the review map in risk order. For each **Tier 2** item:
 2. **Teach the gap**, moving motivation → mechanism → edge cases → blast radius. Show the actual code; use `file:line` references so they can click through. Use the debugger, tests, or a quick script when concrete evidence beats explanation.
 3. **Verify the author's claims** against the code together. "The description says this is backwards-compatible — let's check what happens to callers of the old signature." Update the claims ledger.
 4. **Ask reviewer-stance questions**, not textbook questions: What invariant does this rely on? What input breaks it? Is the new behavior tested? What else calls this? What happens on the error path? If this shipped broken, how would we find out?
-5. **Teach-back check.** One or two questions via AskUserQuestion — open-ended preferred; multiple choice only when it sharpens a distinction (vary the position of the correct option; never reveal the answer until they've responded). A good PR teach-back is predictive: "Given this change, what does `f(x)` return now when x is empty?"
+5. **Teach-back check.** Ask one or two questions and wait for the user's answer — open-ended preferred; multiple choice only when it sharpens a distinction (vary the position of the correct option; never reveal the answer until they've responded). A good PR teach-back is predictive: "Given this change, what does `f(x)` return now when x is empty?"
 6. **Correct and re-test.** If they miss, fix the misunderstanding, then ask a follow-up that tests the corrected idea. Move on only when they can explain the hunk in their own words or explicitly choose to accept it on trust (record that in the risk register — accepted-on-trust is a legitimate reviewer move, but it should be a *recorded* one).
 7. **Harvest.** After each checkpoint, capture into the review doc: any question for the author, any claim verified or contradicted, any blocker. Preserve the user's phrasing for anything that will become a PR comment.
 
@@ -83,7 +83,7 @@ For **Tier 1** items: steps 2 and 5 only, compressed — one short explanation, 
 
 For **Tier 0**: batch-summarize, offer a spot-check, tick without quizzing.
 
-Use ELI5 / ELI-intern re-explanations on request. If the user asks a question that requires codebase archaeology (who calls this, when was this introduced, does this pattern exist elsewhere), delegate it to an Explore subagent rather than burning teaching context — report back only the conclusion.
+Use ELI5 / ELI-intern re-explanations on request. If the user asks a question that requires codebase archaeology (who calls this, when was this introduced, does this pattern exist elsewhere), delegate it to a subagent (or investigate it yourself in a tight, bounded pass) rather than burning teaching context — report back only the conclusion.
 
 ## Efficiency Rules
 
