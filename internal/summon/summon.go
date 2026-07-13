@@ -89,11 +89,12 @@ func (s Service) Invocation(opts Options) (Invocation, error) {
 	if err != nil {
 		return Invocation{}, err
 	}
+	summoner := ResolveName(s.Config, opts.Summoner)
 	prompt := opts.Prompt
 	if prompt == "" {
-		prompt = PromptForKind(spacePath, manifest.SpecPath, manifest.Kind)
+		prompt = defaultPrompt(spacePath, manifest.SpecPath, manifest.Kind, summoner)
 	}
-	return BuildInvocation(s.Config, spacePath, ResolveName(s.Config, opts.Summoner), prompt)
+	return BuildInvocation(s.Config, spacePath, summoner, prompt)
 }
 
 func BuildInvocation(cfg config.Config, spacePath string, summoner string, prompt string) (Invocation, error) {
@@ -135,6 +136,23 @@ func ValidateSummoner(name string) error {
 
 func Prompt(spacePath string, specPath string) string {
 	return PromptForKind(spacePath, specPath, "")
+}
+
+// ReviewSkillName is the project-level Claude Code skill that stave review
+// installs into each review space (embedded in the stave binary).
+const ReviewSkillName = "pr-teach"
+
+// defaultPrompt picks the launch prompt for a space: Claude sessions in
+// review spaces launch straight into the embedded review skill when the
+// space carries it, so the guided review loop starts without any typing.
+func defaultPrompt(spacePath, specPath, kind, summoner string) string {
+	if kind == "review" && summoner == Claude {
+		skillPath := filepath.Join(spacePath, ".claude", "skills", ReviewSkillName, "SKILL.md")
+		if _, err := os.Stat(skillPath); err == nil {
+			return "/" + ReviewSkillName
+		}
+	}
+	return PromptForKind(spacePath, specPath, kind)
 }
 
 // PromptForKind tailors the launch prompt to the space's purpose: a review

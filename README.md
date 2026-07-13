@@ -109,10 +109,15 @@ stave review owner/repo#123 my-review-space
 # Straight into an agent session (the spec primes it with the PR context)
 stave review owner/repo#123 --summon claude
 
-# Pull in sibling repos as read-only context, and launch directly into a
-# review skill instead of the default prompt
-stave review owner/repo#123 -r other-repo --summon claude --prompt "/pr-teach"
+# Pull in sibling repos as read-only context
+stave review owner/repo#123 -r other-repo --summon claude
 ```
+
+Every review space ships with an embedded `pr-teach` skill (installed at
+`.claude/skills/pr-teach/` inside the space), a guided review-comprehension
+loop. Summoning Claude in a review space launches straight into it — no
+setup and no personal skills required. Pass `--prompt` to launch with
+something else instead.
 
 Inside the space, `git diff origin/<base>...HEAD` is the full PR diff and
 `stave space status` shows the PR's size as ahead/behind drift. Review

@@ -46,6 +46,52 @@ func TestSummonPromptOverride(t *testing.T) {
 	}
 }
 
+func TestReviewSpaceDefaultsToEmbeddedSkill(t *testing.T) {
+	cfg := testConfig(t)
+	spacePath := filepath.Join(cfg.AgentWorkDir, "ex-1")
+	if err := space.SaveManifest(spacePath, space.Manifest{ID: "ex-1", Kind: "review", CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	skillDir := filepath.Join(spacePath, ".claude", "skills", ReviewSkillName)
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("skill"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	svc := NewService(cfg, &fakeLauncher{}, nil)
+
+	claude, err := svc.Invocation(Options{SpaceID: "ex-1", Summoner: Claude})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claude.Args) != 1 || claude.Args[0] != "/"+ReviewSkillName {
+		t.Fatalf("claude review args = %#v, want the skill invocation", claude.Args)
+	}
+
+	// Codex has no skill system: it keeps the review-stance prompt.
+	codex, err := svc.Invocation(Options{SpaceID: "ex-1", Summoner: Codex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(codex.Args, " "), "review space") {
+		t.Fatalf("codex review args = %#v, want the review-stance prompt", codex.Args)
+	}
+
+	// Without the installed skill (e.g. a pre-existing review space), claude
+	// falls back to the review-stance prompt instead of a dangling /command.
+	if err := os.RemoveAll(skillDir); err != nil {
+		t.Fatal(err)
+	}
+	claude, err = svc.Invocation(Options{SpaceID: "ex-1", Summoner: Claude})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.Join(claude.Args, " "), "/"+ReviewSkillName) {
+		t.Fatalf("claude args = %#v, want fallback prompt when skill missing", claude.Args)
+	}
+}
+
 func TestBuildInvocation(t *testing.T) {
 	cfg := testConfig(t)
 	spacePath := filepath.Join(cfg.AgentWorkDir, "ex-1")

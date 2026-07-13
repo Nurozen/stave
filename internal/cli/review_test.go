@@ -171,6 +171,13 @@ func TestCLIReviewWithReferenceRepo(t *testing.T) {
 	if _, err := os.Stat(refPath); err != nil {
 		t.Fatalf("reference worktree missing: %v", err)
 	}
+	skill, err := os.ReadFile(filepath.Join(home, "stave", "agent-work", "review-repo-a-7", ".claude", "skills", "pr-teach", "SKILL.md"))
+	if err != nil {
+		t.Fatalf("embedded review skill not installed: %v", err)
+	}
+	if !strings.Contains(string(skill), "name: pr-teach") {
+		t.Fatalf("installed skill content unexpected:\n%.200s", skill)
+	}
 	agents, err := os.ReadFile(filepath.Join(home, "stave", "agent-work", "review-repo-a-7", "AGENTS.md"))
 	if err != nil {
 		t.Fatal(err)

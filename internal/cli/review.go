@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -13,8 +14,16 @@ import (
 	"github.com/Nurozen/stave/internal/config"
 	"github.com/Nurozen/stave/internal/git"
 	"github.com/Nurozen/stave/internal/space"
+	"github.com/Nurozen/stave/internal/summon"
 	"github.com/spf13/cobra"
 )
+
+// The pr-teach review skill ships inside the binary and is written into each
+// review space as a project-level Claude Code skill, so summoned sessions
+// can run the guided review loop on any machine without personal skills.
+//
+//go:embed assets/skills/pr-teach/SKILL.md
+var prTeachSkill []byte
 
 // prRef is a parsed pull-request coordinate.
 type prRef struct {
@@ -135,7 +144,7 @@ The <pr> argument accepts a GitHub PR URL, owner/repo#123, or
 			fmt.Fprintf(out, "  spec:  %s\n", result.SpecFile)
 			fmt.Fprintf(out, "  diff:  git -C %s diff %s...HEAD\n", result.WorktreePath, result.BaseRef)
 			if summonName == "" || noSummon {
-				fmt.Fprintf(out, "  next:  stave summon %s --with claude\n", result.SpaceID)
+				fmt.Fprintf(out, "  next:  stave summon %s --with claude   # launches the /%s review loop\n", result.SpaceID, summon.ReviewSkillName)
 				return nil
 			}
 			return a.runSummon(cmd, *cfg, result.SpaceID, summonName, summonPrompt, false)
@@ -222,6 +231,14 @@ func (a *app) setUpReviewSpace(cmd *cobra.Command, cfg *config.Config, cfgPath s
 		if err := svc.AddRepo(ctx, space.AddOptions{SpaceID: spaceID, RepoName: spec.Name, Mode: space.ModeReference, Ref: spec.Ref}); err != nil {
 			return reviewResult{}, err
 		}
+	}
+
+	skillDir := filepath.Join(spacePath, ".claude", "skills", summon.ReviewSkillName)
+	if err := os.MkdirAll(skillDir, config.DefaultDirMode); err != nil {
+		return reviewResult{}, err
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), prTeachSkill, 0o644); err != nil {
+		return reviewResult{}, err
 	}
 
 	return reviewResult{
