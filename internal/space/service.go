@@ -62,8 +62,12 @@ type AddOptions struct {
 	Base     string
 	Ref      string
 	Branch   string
-	NoFetch  bool
-	DryRun   bool
+	// StartPoint optionally creates the edit branch at a different ref than
+	// Base. Review spaces use it to check out a PR head while Base stays the
+	// PR's target branch, so status drift reports the PR's ahead/behind.
+	StartPoint string
+	NoFetch    bool
+	DryRun     bool
 }
 
 type SyncOptions struct {
@@ -275,6 +279,10 @@ func (s Service) AddRepo(ctx context.Context, opts AddOptions) error {
 		if manifest.HasPath(repoPath) {
 			return fmt.Errorf("repo path %q already exists in manifest", repoPath)
 		}
+		startPoint := baseRef
+		if opts.StartPoint != "" {
+			startPoint = normalizeRemoteRef(opts.StartPoint)
+		}
 		worktreePath := filepath.Join(spacePath, repoPath)
 		if !opts.DryRun {
 			exists, err := s.Git.BranchExists(ctx, repoCfg.BareRepoPath, branch)
@@ -284,13 +292,13 @@ func (s Service) AddRepo(ctx context.Context, opts AddOptions) error {
 			if exists {
 				err = s.Git.WorktreeAddExisting(ctx, repoCfg.BareRepoPath, worktreePath, branch)
 			} else {
-				err = s.Git.WorktreeAddBranch(ctx, repoCfg.BareRepoPath, worktreePath, branch, baseRef)
+				err = s.Git.WorktreeAddBranch(ctx, repoCfg.BareRepoPath, worktreePath, branch, startPoint)
 			}
 			if err != nil {
 				return err
 			}
 		} else {
-			s.printf("dry-run: add edit worktree %s from %s at %s\n", branch, baseRef, worktreePath)
+			s.printf("dry-run: add edit worktree %s from %s at %s\n", branch, startPoint, worktreePath)
 		}
 		entry = RepoManifest{Name: opts.RepoName, Mode: ModeEdit, Path: repoPath, Base: baseRef, Branch: branch, BareRepoPath: repoCfg.BareRepoPath}
 	case ModeReference:
@@ -498,7 +506,11 @@ func (s Service) writeAgents(spacePath string, manifest Manifest) error {
 	b.WriteString("# Stave Workspace Instructions\n\n")
 	b.WriteString("- Top-level repository folders are editable worktrees for this space.\n")
 	b.WriteString("- Repositories under `references/` are read-only context unless the user explicitly asks for edits there.\n")
-	b.WriteString("- Keep `.stave.yaml` aligned with worktree changes made through Stave.\n\n")
+	b.WriteString("- Keep `.stave.yaml` aligned with worktree changes made through Stave.\n")
+	if manifest.SpecPath != "" {
+		fmt.Fprintf(&b, "- Read `%s/` before starting; it holds the task or review context for this space.\n", manifest.SpecPath)
+	}
+	b.WriteString("\n")
 	if len(manifest.Repos) > 0 {
 		b.WriteString("## Repositories\n")
 		for _, repo := range manifest.Repos {

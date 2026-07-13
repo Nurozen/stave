@@ -93,6 +93,14 @@ func (c *Client) FetchAllPrune(ctx context.Context, bareRepo string) error {
 	return err
 }
 
+// FetchRefspec fetches an explicit refspec from origin, e.g. pull-request
+// head refs (+refs/pull/N/head:refs/remotes/origin/pr/N) that the mirror's
+// standard refs/heads/* tracking never picks up.
+func (c *Client) FetchRefspec(ctx context.Context, bareRepo, refspec string) error {
+	_, err := c.run(ctx, "--git-dir", bareRepo, "fetch", "origin", refspec)
+	return err
+}
+
 func (c *Client) WorktreeAddBranch(ctx context.Context, bareRepo, path, branch, startPoint string) error {
 	_, err := c.run(ctx, "--git-dir", bareRepo, "worktree", "add", "--no-track", "-b", branch, path, startPoint)
 	return err

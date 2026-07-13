@@ -54,6 +54,7 @@ func newRootCommand(a *app) *cobra.Command {
 		a.portalCommand(),
 		a.agentCommand(),
 		a.summonCommand(),
+		a.reviewCommand(),
 	)
 	return cmd
 }

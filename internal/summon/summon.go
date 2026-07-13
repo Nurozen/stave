@@ -86,7 +86,7 @@ func (s Service) Invocation(opts Options) (Invocation, error) {
 	if err != nil {
 		return Invocation{}, err
 	}
-	return BuildInvocation(s.Config, spacePath, ResolveName(s.Config, opts.Summoner), Prompt(spacePath, manifest.SpecPath))
+	return BuildInvocation(s.Config, spacePath, ResolveName(s.Config, opts.Summoner), PromptForKind(spacePath, manifest.SpecPath, manifest.Kind))
 }
 
 func BuildInvocation(cfg config.Config, spacePath string, summoner string, prompt string) (Invocation, error) {
@@ -127,6 +127,12 @@ func ValidateSummoner(name string) error {
 }
 
 func Prompt(spacePath string, specPath string) string {
+	return PromptForKind(spacePath, specPath, "")
+}
+
+// PromptForKind tailors the launch prompt to the space's purpose: a review
+// space primes the agent to assess a change rather than implement one.
+func PromptForKind(spacePath string, specPath string, kind string) string {
 	var b strings.Builder
 	b.WriteString("Using a team of agents, familiarize yourself with this workspace.\n\n")
 	b.WriteString("Focus on:\n")
@@ -137,7 +143,11 @@ func Prompt(spacePath string, specPath string) string {
 		b.WriteString(resolveSpecPath(spacePath, specPath))
 		b.WriteString(".\n")
 	}
-	b.WriteString("\nKeep in mind how the codebase relates to the spec, then propose a concise implementation plan before making changes.")
+	if kind == "review" {
+		b.WriteString("\nThis is a review space: the worktree is checked out at the change under review and the spec records its context (a pull request's metadata and diff commands). Help the user assess the change — treat the author's description as claims to verify, not facts — and do not modify the code unless the user explicitly asks.")
+	} else {
+		b.WriteString("\nKeep in mind how the codebase relates to the spec, then propose a concise implementation plan before making changes.")
+	}
 	return b.String()
 }
 
