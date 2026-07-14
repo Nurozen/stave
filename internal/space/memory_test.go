@@ -289,7 +289,9 @@ func TestProposeMemoryDryRun(t *testing.T) {
 
 func TestReferenceSpecsPassedThrough(t *testing.T) {
 	svc, _, cfg := testService(t)
-	cfg.Repos["repo-b"] = cfg.Repos["repo-b"] // already present
+	if _, ok := cfg.Repos["repo-b"]; !ok {
+		t.Fatal("test fixture missing repo-b")
+	}
 	var saw []memory.ReferenceSpec
 	fake := &memory.Fake{
 		AttachFn: func(ctx context.Context, opts memory.AttachOptions) (memory.AttachResult, error) {

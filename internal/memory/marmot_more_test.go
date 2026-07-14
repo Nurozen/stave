@@ -38,17 +38,17 @@ func writeFakeMarmot(t *testing.T, responses map[string]fakeResp) string {
 		if !ok {
 			continue
 		}
-		b.WriteString(fmt.Sprintf("case \"$args\" in *%q*)\n", k))
+		fmt.Fprintf(&b, "case \"$args\" in *%q*)\n", k)
 		if r.Stdout != "" {
 			// Use printf %s to avoid echo -e quirks; embed via heredoc-ish.
 			escaped := strings.ReplaceAll(r.Stdout, `'`, `'\''`)
-			b.WriteString(fmt.Sprintf("  printf '%%s' '%s'\n", escaped))
+			fmt.Fprintf(&b, "  printf '%%s' '%s'\n", escaped)
 		}
 		if r.Stderr != "" {
 			escaped := strings.ReplaceAll(r.Stderr, `'`, `'\''`)
-			b.WriteString(fmt.Sprintf("  printf '%%s' '%s' >&2\n", escaped))
+			fmt.Fprintf(&b, "  printf '%%s' '%s' >&2\n", escaped)
 		}
-		b.WriteString(fmt.Sprintf("  exit %d\n", r.Code))
+		fmt.Fprintf(&b, "  exit %d\n", r.Code)
 		b.WriteString("  ;;\nesac\n")
 	}
 	// default: if den --help not matched earlier, succeed empty for capability probe fallback
@@ -623,10 +623,7 @@ func TestDetachOwnedFalseNeverDestroy(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !res.Kept {
-			// dry-run returns before setting Kept summary for keep with no cmds —
-			// but DryRunCommands should not include destroy.
-		}
+		// Dry-run keep path may or may not set Kept; the hard rule is no destroy cmds.
 		for _, line := range res.DryRunCommands {
 			if strings.Contains(line, "destroy") {
 				t.Fatalf("owned:false must not destroy (fate=%s): %q", fate, line)

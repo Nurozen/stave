@@ -62,7 +62,7 @@ func (m *Marmot) Probe(ctx context.Context) (ProbeResult, error) {
 			Available:  false,
 			Capable:    false,
 			Message:    fmt.Sprintf("%s not found on PATH", bin),
-			ManualHint: fmt.Sprintf("install marmot or set memory.binary; then: stave memory attach <space-id>"),
+			ManualHint: "install marmot or set memory.binary; then: stave memory attach <space-id>",
 		}, &UnavailableError{Provider: "marmot", Err: err, Hint: "binary not found"}
 	}
 	// Capability probe: den subcommand present.
