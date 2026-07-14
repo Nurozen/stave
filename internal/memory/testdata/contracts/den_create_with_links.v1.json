@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "den_id": "task-42",
+  "den_path": "/home/user/.marmot/dens/task-42",
+  "vault_id": "task-42",
+  "routes": {
+    "project_path": "/home/user/src/work/task-42"
+  },
+  "pointer_written": true,
+  "links": [
+    {
+      "ref": "platform-warren/docs",
+      "mode": "link",
+      "resolved_via": "warren-url"
+    },
+    {
+      "ref": "local-checkout",
+      "mode": "link",
+      "resolved_via": "checkout-vault"
+    },
+    {
+      "ref": "unknown-repo",
+      "mode": null,
+      "resolved_via": "none"
+    }
+  ],
+  "warnings": [
+    "ref unknown-repo: no warren source_url or checkout vault_id match; skipped"
+  ]
+}

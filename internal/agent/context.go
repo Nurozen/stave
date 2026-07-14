@@ -58,6 +58,14 @@ func BuildContext(cfg config.Config) (Context, error) {
 				Branch: repo.Branch,
 			})
 		}
+		for _, mem := range manifest.Memories {
+			spaceCtx.Memories = append(spaceCtx.Memories, SpaceMemoryContext{
+				Name:     mem.Name,
+				Provider: mem.Provider,
+				ID:       mem.ID,
+				Owned:    mem.Owned,
+			})
+		}
 		spaceCtx.Portals = portalSummaries(spacePath)
 		ctx.Spaces = append(ctx.Spaces, spaceCtx)
 	}

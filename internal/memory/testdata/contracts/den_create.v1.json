@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "den_id": "myproject",
+  "den_path": "/home/user/.marmot/dens/myproject",
+  "vault_id": "myproject",
+  "routes": {
+    "project_path": "/home/user/src/myproject"
+  },
+  "pointer_written": true,
+  "links": [],
+  "warnings": []
+}

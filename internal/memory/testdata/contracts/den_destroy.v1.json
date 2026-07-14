@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "den_id": "task-42",
+  "destroyed": true,
+  "kept": false,
+  "unpushed_edits": 0,
+  "promoted": {
+    "added": 1,
+    "updated": 2,
+    "superseded": 0,
+    "noop": 3
+  },
+  "contributed": null
+}

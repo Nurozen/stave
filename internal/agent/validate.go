@@ -70,6 +70,18 @@ func validateOperation(cfg config.Config, op Operation, plannedSpaces map[string
 				return fmt.Errorf("spec path %q: %w", op.SpecPath, err)
 			}
 		}
+		for _, raw := range op.Memories {
+			if err := validateMemorySpec(raw); err != nil {
+				return err
+			}
+		}
+		if op.MemoryFate != "" {
+			switch strings.ToLower(op.MemoryFate) {
+			case "keep", "destroy", "contribute":
+			default:
+				return fmt.Errorf("memory_fate %q must be keep, destroy, or contribute", op.MemoryFate)
+			}
+		}
 	case OpSpaceAdd:
 		if err := config.ValidateName("space id", op.SpaceID); err != nil {
 			return err
@@ -378,4 +390,30 @@ func validateSafePortalPath(label, value string) error {
 		return fmt.Errorf("%s %q must not contain glob characters", label, value)
 	}
 	return nil
+}
+
+// validateMemorySpec accepts "." or [provider:]id using the same name charset
+// as space/repo ids (config.ValidateName).
+func validateMemorySpec(raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return fmt.Errorf("memory spec is empty")
+	}
+	if raw == "." {
+		return nil
+	}
+	provider, spec, found := strings.Cut(raw, ":")
+	if !found {
+		if raw == "marmot" {
+			return nil
+		}
+		return config.ValidateName("memory id", raw)
+	}
+	if err := config.ValidateName("memory provider", provider); err != nil {
+		return err
+	}
+	if spec == "" || spec == "." {
+		return nil
+	}
+	return config.ValidateName("memory id", spec)
 }

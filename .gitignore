@@ -1,1 +1,7 @@
 test_rig/tmp/
+
+# Local validation / build / session scratch (never commit)
+artifacts/
+bin/
+human.md
+scratchpad/

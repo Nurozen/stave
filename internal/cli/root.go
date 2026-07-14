@@ -14,6 +14,7 @@ import (
 	"github.com/Nurozen/stave/internal/agent"
 	"github.com/Nurozen/stave/internal/config"
 	"github.com/Nurozen/stave/internal/git"
+	"github.com/Nurozen/stave/internal/memory"
 	"github.com/Nurozen/stave/internal/portal"
 	"github.com/Nurozen/stave/internal/space"
 	"github.com/Nurozen/stave/internal/summon"
@@ -51,6 +52,7 @@ func newRootCommand(a *app) *cobra.Command {
 		a.setupCommand(),
 		a.reposCommand(),
 		a.spaceCommand(),
+		a.memoryCommand(),
 		a.portalCommand(),
 		a.agentCommand(),
 		a.summonCommand(),
@@ -484,6 +486,7 @@ func (a *app) createCommand() *cobra.Command {
 	var spec string
 	var edits []string
 	var references []string
+	var memories []string
 	var dryRun bool
 	var summonName string
 	cmd := &cobra.Command{
@@ -503,7 +506,15 @@ func (a *app) createCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := svc.Create(cmd.Context(), space.CreateOptions{ID: args[0], Kind: kind, SpecPath: spec, Edits: editSpecs, References: refSpecs, DryRun: dryRun}); err != nil {
+			if err := svc.Create(cmd.Context(), space.CreateOptions{
+				ID:         args[0],
+				Kind:       kind,
+				SpecPath:   spec,
+				Edits:      editSpecs,
+				References: refSpecs,
+				Memories:   memories,
+				DryRun:     dryRun,
+			}); err != nil {
 				return err
 			}
 			if summonName == "" {
@@ -519,6 +530,7 @@ func (a *app) createCommand() *cobra.Command {
 	cmd.Flags().StringVarP(&spec, "spec", "s", "", "path to a spec file or directory to copy into the space")
 	cmd.Flags().StringArrayVarP(&edits, "edit", "e", nil, "editable repo spec, optionally repo:base")
 	cmd.Flags().StringArrayVarP(&references, "reference", "r", nil, "reference repo spec, optionally repo:ref")
+	cmd.Flags().StringArrayVar(&memories, "memory", nil, "attach memory: [provider:]<spec>; '.' = fresh task store (repeatable)")
 	cmd.Flags().StringVar(&summonName, "summon", "", "launch a summoner after creation (codex, claude, or cursor)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print operations without changing state")
 	return cmd
@@ -1390,19 +1402,257 @@ func (a *app) archiveCommand() *cobra.Command {
 func (a *app) destroyCommand() *cobra.Command {
 	var force bool
 	var dryRun bool
+	var memoryFate string
 	cmd := &cobra.Command{
 		Use:   "destroy <space-id>",
 		Short: "Remove a space's worktrees and delete its directory",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			fate, err := memory.ParseMemoryFate(memoryFate)
+			if err != nil {
+				return err
+			}
+			svc, err := a.serviceWithDryRun(cmd, dryRun)
+			if err != nil {
+				return err
+			}
+			return svc.Destroy(cmd.Context(), space.DestroyOptions{
+				SpaceID:    args[0],
+				Force:      force,
+				DryRun:     dryRun,
+				MemoryFate: fate,
+			})
+		},
+	}
+	cmd.Flags().BoolVar(&force, "force", false, "destroy even when editable worktrees are dirty")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print operations without changing state")
+	cmd.Flags().StringVar(&memoryFate, "memory", string(memory.FateKeep), "owned memory fate: keep, destroy, or contribute (default keep)")
+	return cmd
+}
+
+func (a *app) memoryCommand() *cobra.Command {
+	cmd := groupCommand("memory", "Manage provider-agnostic space memory attachments")
+	cmd.AddCommand(
+		a.memoryProvidersCommand(),
+		a.memoryAttachCommand(),
+		a.memoryStatusCommand(),
+		a.memoryListCommand(),
+		a.memorySyncCommand(),
+		a.memoryProposeCommand(),
+		a.memoryDetachCommand(),
+	)
+	return cmd
+}
+
+func (a *app) memoryProvidersCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "providers",
+		Short: "List registered memory providers and capability-probe results",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, _, err := a.loadConfig()
+			if err != nil {
+				return err
+			}
+			mc := cfg.Memory
+			mc.ApplyDefaults()
+			for _, name := range memory.Names() {
+				prov, err := memory.Lookup(name, mc)
+				if err != nil {
+					fmt.Fprintf(cmd.OutOrStdout(), "%s\terror: %v\n", name, err)
+					continue
+				}
+				probe, probeErr := prov.Probe(cmd.Context())
+				status := "ok"
+				if probeErr != nil {
+					status = probeErr.Error()
+				} else if !probe.Capable {
+					status = probe.Message
+				} else if probe.Message != "" {
+					status = probe.Message
+				}
+				marker := ""
+				if name == mc.Provider {
+					marker = " (default)"
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "%s%s\t%s\n", name, marker, status)
+			}
+			return nil
+		},
+	}
+}
+
+func (a *app) memoryAttachCommand() *cobra.Command {
+	var provider string
+	var useID string
+	var name string
+	var editRefs []string
+	var linkRefs []string
+	var opts []string
+	var dryRun bool
+	var asJSON bool
+	cmd := &cobra.Command{
+		Use:   "attach <space-id>",
+		Short: "Attach a memory store to a space (create task store or --use existing)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			svc, err := a.serviceWithDryRun(cmd, dryRun)
 			if err != nil {
 				return err
 			}
-			return svc.Destroy(cmd.Context(), space.DestroyOptions{SpaceID: args[0], Force: force, DryRun: dryRun})
+			optMap := map[string]string{}
+			for _, raw := range opts {
+				k, v, ok := strings.Cut(raw, "=")
+				if !ok || k == "" {
+					return fmt.Errorf("invalid --opt %q (want k=v)", raw)
+				}
+				optMap[k] = v
+			}
+			err = svc.AttachMemory(cmd.Context(), space.AttachMemoryOptions{
+				SpaceID:  args[0],
+				Provider: provider,
+				UseID:    useID,
+				Name:     name,
+				EditRefs: editRefs,
+				LinkRefs: linkRefs,
+				Opts:     optMap,
+				DryRun:   dryRun,
+				Strict:   true,
+			})
+			if err != nil {
+				return err
+			}
+			if asJSON && !dryRun {
+				// Minimal confirmation object for scripting.
+				fmt.Fprintf(cmd.OutOrStdout(), "{\"space_id\":%q,\"attached\":true}\n", args[0])
+			}
+			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&force, "force", false, "destroy even when editable worktrees are dirty")
+	cmd.Flags().StringVar(&provider, "provider", "", "memory provider (default from config memory.provider)")
+	cmd.Flags().StringVar(&useID, "use", "", "attach an existing durable store id instead of creating a task store")
+	cmd.Flags().StringVar(&name, "name", "", "attachment alias (default \"default\")")
+	cmd.Flags().StringArrayVar(&editRefs, "edit", nil, "provider edit ref (repeatable, passed through)")
+	cmd.Flags().StringArrayVar(&linkRefs, "link", nil, "provider link ref (repeatable, passed through)")
+	cmd.Flags().StringArrayVar(&opts, "opt", nil, "provider-specific k=v option (repeatable)")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print exact provider commands without invoking them")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "emit a JSON confirmation on success")
+	return cmd
+}
+
+func (a *app) memoryStatusCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "status <space-id> [alias]",
+		Short: "Show memory attachment status (provider, id, freshness)",
+		Args:  cobra.RangeArgs(1, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			svc, err := a.service(cmd)
+			if err != nil {
+				return err
+			}
+			alias := ""
+			if len(args) > 1 {
+				alias = args[1]
+			}
+			return svc.MemoryStatus(cmd.Context(), args[0], alias)
+		},
+	}
+}
+
+func (a *app) memoryListCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "list [space-id]",
+		Short: "List memory attachments for a space or all spaces",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			svc, err := a.service(cmd)
+			if err != nil {
+				return err
+			}
+			spaceID := ""
+			if len(args) == 1 {
+				spaceID = args[0]
+			}
+			return svc.ListMemories(spaceID)
+		},
+	}
+}
+
+func (a *app) memorySyncCommand() *cobra.Command {
+	var dryRun bool
+	cmd := &cobra.Command{
+		Use:   "sync <space-id> [alias]",
+		Short: "Sync memory provider state (e.g. warren sync + skew re-report)",
+		Args:  cobra.RangeArgs(1, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			svc, err := a.serviceWithDryRun(cmd, dryRun)
+			if err != nil {
+				return err
+			}
+			alias := ""
+			if len(args) > 1 {
+				alias = args[1]
+			}
+			return svc.SyncMemory(cmd.Context(), args[0], alias, dryRun)
+		},
+	}
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print operations without invoking the provider")
+	return cmd
+}
+
+func (a *app) memoryProposeCommand() *cobra.Command {
+	var dryRun bool
+	cmd := &cobra.Command{
+		Use:   "propose <space-id> [alias]",
+		Short: "Flow task learnings back (den contribute + warren propose; never auto-pushes)",
+		Args:  cobra.RangeArgs(1, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			svc, err := a.serviceWithDryRun(cmd, dryRun)
+			if err != nil {
+				return err
+			}
+			alias := ""
+			if len(args) > 1 {
+				alias = args[1]
+			}
+			return svc.ProposeMemory(cmd.Context(), args[0], alias, dryRun)
+		},
+	}
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print contribute/propose commands without invoking them")
+	return cmd
+}
+
+func (a *app) memoryDetachCommand() *cobra.Command {
+	var keep bool
+	var destroy bool
+	var force bool
+	var dryRun bool
+	cmd := &cobra.Command{
+		Use:   "detach <space-id> [alias]",
+		Short: "Detach a memory attachment (--keep default, or --destroy)",
+		Args:  cobra.RangeArgs(1, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if keep && destroy {
+				return fmt.Errorf("specify only one of --keep or --destroy")
+			}
+			fate := memory.FateKeep
+			if destroy {
+				fate = memory.FateDestroy
+			}
+			svc, err := a.serviceWithDryRun(cmd, dryRun)
+			if err != nil {
+				return err
+			}
+			alias := ""
+			if len(args) > 1 {
+				alias = args[1]
+			}
+			return svc.DetachMemory(cmd.Context(), args[0], alias, fate, force, dryRun)
+		},
+	}
+	cmd.Flags().BoolVar(&keep, "keep", false, "leave the store intact (default)")
+	cmd.Flags().BoolVar(&destroy, "destroy", false, "destroy an owned store on detach")
+	cmd.Flags().BoolVar(&force, "force", false, "forward force to provider destroy (unpushed edits)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print operations without changing state")
 	return cmd
 }
@@ -1424,7 +1674,16 @@ func (a *app) serviceWithDryRun(cmd *cobra.Command, dryRun bool) (space.Service,
 	client := git.New(git.WithDryRun(dryRun, func(format string, args ...any) {
 		fmt.Fprintf(cmd.OutOrStdout(), format+"\n", args...)
 	}))
-	return space.NewService(*cfg, client, cmd.OutOrStdout()), nil
+	svc := space.NewService(*cfg, client, cmd.OutOrStdout())
+	// Portal notice for memory attach (local-summon-only v1).
+	svc.HasPortal = func(spaceID string) bool {
+		manifest, err := portal.LoadManifest(svc.SpacePath(spaceID))
+		if err != nil {
+			return false
+		}
+		return len(manifest.Portals) > 0
+	}
+	return svc, nil
 }
 
 func (a *app) portalService(cmd *cobra.Command) (portal.Service, error) {

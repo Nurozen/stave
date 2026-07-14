@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/Nurozen/stave/internal/config"
+	"github.com/Nurozen/stave/internal/fsio"
 	"github.com/Nurozen/stave/internal/git"
+	"github.com/Nurozen/stave/internal/memory"
 )
 
 type Git interface {
@@ -31,8 +33,16 @@ type Git interface {
 type Service struct {
 	Config config.Config
 	Git    Git
-	Out    io.Writer
-	Now    func() time.Time
+	// Memory is the provider seam. Nil falls back to memory.FromConfig.
+	Memory memory.Provider
+	// MemoryFactory builds a provider by name; used by multi-provider --memory specs.
+	// Nil uses memory.Lookup.
+	MemoryFactory func(provider string) (memory.Provider, error)
+	Out           io.Writer
+	Now           func() time.Time
+	// HasPortal, when set, reports whether a space has any portal attached
+	// (memory is local-summon-only in v1 — attach prints a notice).
+	HasPortal func(spaceID string) bool
 }
 
 type InitOptions struct {
@@ -52,7 +62,12 @@ type CreateOptions struct {
 	SpecPath   string
 	Edits      []RepoSpec
 	References []RepoSpec
-	DryRun     bool
+	// Memories are raw `[provider:]<spec>` values from --memory (repeatable).
+	// Empty with config memory.default:true triggers ambient attach.
+	Memories []string
+	// SkipAmbientMemory disables ambient memory.default attach (tests / explicit off).
+	SkipAmbientMemory bool
+	DryRun            bool
 }
 
 type AddOptions struct {
@@ -68,6 +83,9 @@ type AddOptions struct {
 	StartPoint string
 	NoFetch    bool
 	DryRun     bool
+	// LinkMemory, when true and the space has memory attached, passes the
+	// added reference repo through the provider seam as a raw ref (S4).
+	LinkMemory bool
 }
 
 type SyncOptions struct {
@@ -78,12 +96,31 @@ type SyncOptions struct {
 type ArchiveOptions struct {
 	SpaceID string
 	Force   bool
+	DryRun  bool
 }
 
+// MemoryFate values: keep | destroy | contribute (default keep).
 type DestroyOptions struct {
-	SpaceID string
-	Force   bool
-	DryRun  bool
+	SpaceID    string
+	Force      bool
+	DryRun     bool
+	MemoryFate memory.MemoryFate // empty → keep
+}
+
+// AttachMemoryOptions is the service-level entry for stave memory attach
+// and create --memory sugar.
+type AttachMemoryOptions struct {
+	SpaceID    string
+	Provider   string // empty → config default
+	UseID      string // attach existing
+	Name       string
+	EditRefs   []string
+	LinkRefs   []string
+	Opts       map[string]string
+	DryRun     bool
+	Strict     bool // true for explicit attach/--memory; false for ambient
+	RawSpec    string
+	References []RepoSpec // S4: pass raw url/path/ref through seam
 }
 
 type Status struct {
@@ -186,7 +223,7 @@ func (s Service) InitSpace(ctx context.Context, opts InitOptions) error {
 
 func (s Service) Create(ctx context.Context, opts CreateOptions) error {
 	if opts.DryRun {
-		return s.createDryRun(opts)
+		return s.createDryRun(ctx, opts)
 	}
 	if err := s.InitSpace(ctx, InitOptions{ID: opts.ID, Kind: opts.Kind, SpecPath: opts.SpecPath}); err != nil {
 		return err
@@ -201,10 +238,10 @@ func (s Service) Create(ctx context.Context, opts CreateOptions) error {
 			return err
 		}
 	}
-	return nil
+	return s.attachMemoriesAfterCreate(ctx, opts)
 }
 
-func (s Service) createDryRun(opts CreateOptions) error {
+func (s Service) createDryRun(ctx context.Context, opts CreateOptions) error {
 	if err := config.ValidateName("space id", opts.ID); err != nil {
 		return err
 	}
@@ -240,7 +277,191 @@ func (s Service) createDryRun(opts CreateOptions) error {
 		s.printf("dry-run: fetch %s\n", repoCfg.BareRepoPath)
 		s.printf("dry-run: add reference worktree %s at %s\n", ref, filepath.Join(spacePath, "references", spec.Name))
 	}
+	// Memory dry-run lines (no binary invoke).
+	return s.attachMemoriesAfterCreate(ctx, opts)
+}
+
+// attachMemoriesAfterCreate runs explicit --memory specs and/or ambient default.
+func (s Service) attachMemoriesAfterCreate(ctx context.Context, opts CreateOptions) error {
+	specs := opts.Memories
+	strict := len(specs) > 0
+	if len(specs) == 0 && !opts.SkipAmbientMemory && s.Config.Memory.Default {
+		specs = []string{"."}
+		strict = false
+	}
+	for _, raw := range specs {
+		if err := s.AttachMemory(ctx, AttachMemoryOptions{
+			SpaceID:    opts.ID,
+			RawSpec:    raw,
+			DryRun:     opts.DryRun,
+			Strict:     strict,
+			References: opts.References,
+		}); err != nil {
+			if !strict {
+				s.printf("notice: ambient memory attach failed: %v\n", err)
+				s.printf("notice: equivalent: stave memory attach %s\n", opts.ID)
+				continue
+			}
+			return err
+		}
+	}
 	return nil
+}
+
+// AttachMemory binds a memory store to a space via the provider seam, writes
+// space-local MCP config, and appends a MemoryManifest record (owned when created).
+func (s Service) AttachMemory(ctx context.Context, opts AttachMemoryOptions) error {
+	if err := config.ValidateName("space id", opts.SpaceID); err != nil {
+		return err
+	}
+	spacePath := s.SpacePath(opts.SpaceID)
+	providerName := opts.Provider
+	useID := opts.UseID
+	name := opts.Name
+
+	if opts.RawSpec != "" {
+		parsed, err := memory.ParseMemorySpec(opts.RawSpec, s.defaultMemoryProvider())
+		if err != nil {
+			return err
+		}
+		if providerName == "" {
+			providerName = parsed.Provider
+		}
+		if !parsed.Fresh && useID == "" {
+			useID = parsed.Spec
+		}
+	}
+	if providerName == "" {
+		providerName = s.defaultMemoryProvider()
+	}
+	if name == "" {
+		name = "default"
+	}
+
+	prov, err := s.provider(providerName)
+	if err != nil {
+		if opts.Strict {
+			return err
+		}
+		return err
+	}
+
+	// Preflight: reject duplicate aliases / store ids BEFORE provider effects
+	// so a failed retry does not leave an orphan den without a memories: entry.
+	storeIDHint := useID
+	if storeIDHint == "" {
+		storeIDHint = opts.SpaceID
+	}
+	if !opts.DryRun {
+		if manifest, err := LoadManifest(spacePath); err == nil {
+			for _, existing := range manifest.Memories {
+				if existing.Name == name || existing.ID == storeIDHint {
+					return fmt.Errorf("memory %q already attached to space %q", name, opts.SpaceID)
+				}
+			}
+		}
+	}
+
+	// Build reference specs for S4 pass-through (argv gated inside provider until P4).
+	var refSpecs []memory.ReferenceSpec
+	refs := opts.References
+	if len(refs) == 0 && !opts.DryRun {
+		if manifest, err := LoadManifest(spacePath); err == nil {
+			for _, repo := range manifest.Repos {
+				if repo.Mode != ModeReference {
+					continue
+				}
+				refs = append(refs, RepoSpec{Name: repo.Name, Ref: repo.Ref})
+			}
+		}
+	}
+	for _, r := range refs {
+		repoCfg := s.Config.Repos[r.Name]
+		if repoCfg.MarmotVault == "off" {
+			continue
+		}
+		refSpecs = append(refSpecs, memory.ReferenceSpec{
+			Name:        r.Name,
+			URL:         repoCfg.URL,
+			Ref:         r.Ref,
+			MarmotVault: repoCfg.MarmotVault,
+		})
+	}
+
+	attachOpts := memory.AttachOptions{
+		SpaceID:        opts.SpaceID,
+		SpacePath:      spacePath,
+		StoreID:        opts.SpaceID,
+		UseID:          useID,
+		Name:           name,
+		EditRefs:       opts.EditRefs,
+		LinkRefs:       opts.LinkRefs,
+		ReferenceSpecs: refSpecs,
+		Opts:           opts.Opts,
+		DryRun:         opts.DryRun,
+		Out:            s.Out,
+		Strict:         opts.Strict,
+	}
+	result, err := prov.Attach(ctx, attachOpts)
+	if err != nil {
+		return err
+	}
+	if opts.DryRun {
+		return nil
+	}
+
+	// Portal local-summon-only notice (v1).
+	if s.HasPortal != nil && s.HasPortal(opts.SpaceID) {
+		s.printf("notice: memory is local-summon-only in v1; portal-attached spaces do not mount dens into remote environments\n")
+	}
+
+	manifest, err := LoadManifest(spacePath)
+	if err != nil {
+		return err
+	}
+	// Re-check after attach (another process may have raced).
+	for _, existing := range manifest.Memories {
+		if existing.Name == result.Name || existing.ID == result.StoreID {
+			return fmt.Errorf("memory %q already attached to space %q", result.Name, opts.SpaceID)
+		}
+	}
+	manifest.Memories = append(manifest.Memories, MemoryManifest{
+		Name:     result.Name,
+		Provider: firstNonEmpty(result.Provider, providerName),
+		ID:       result.StoreID,
+		Owned:    result.Owned,
+	})
+	if err := SaveManifest(spacePath, manifest); err != nil {
+		return err
+	}
+	if err := s.writeAgents(spacePath, manifest); err != nil {
+		return err
+	}
+	// Invariant: never leave .marmot-vault in the space.
+	if _, err := os.Stat(filepath.Join(spacePath, ".marmot-vault")); err == nil {
+		_ = os.Remove(filepath.Join(spacePath, ".marmot-vault"))
+		s.printf("notice: removed unexpected .marmot-vault pointer from space (stave uses space-local MCP config)\n")
+	}
+	s.printf("attached memory %s (%s:%s, owned=%v) to %s\n", result.Name, providerName, result.StoreID, result.Owned, opts.SpaceID)
+	return nil
+}
+
+func (s Service) defaultMemoryProvider() string {
+	mc := s.Config.Memory
+	mc.ApplyDefaults()
+	return mc.Provider
+}
+
+func (s Service) provider(name string) (memory.Provider, error) {
+	if s.MemoryFactory != nil {
+		return s.MemoryFactory(name)
+	}
+	if s.Memory != nil && (name == "" || name == s.Memory.Name() || name == s.defaultMemoryProvider()) {
+		return s.Memory, nil
+	}
+	mc := s.Config.Memory
+	mc.ApplyDefaults()
+	return memory.Lookup(name, mc)
 }
 
 func (s Service) AddRepo(ctx context.Context, opts AddOptions) error {
@@ -419,7 +640,23 @@ func (s Service) Archive(ctx context.Context, opts ArchiveOptions) error {
 			return err
 		}
 	}
+	// Compute archive dest first so reverse-route rewrite knows NewSpacePath.
+	archiveRoot := filepath.Join(s.Config.AgentWorkDir, ".archive")
+	dest := filepath.Join(archiveRoot, opts.SpaceID)
+	if _, err := os.Stat(dest); err == nil {
+		dest = fmt.Sprintf("%s-%s", dest, time.Now().Format("20060102150405"))
+	}
+
+	// Archive = detach-keep + reverse-route fix (den itself untouched).
+	if err := s.applyMemoryFate(ctx, spacePath, dest, manifest, memory.FateKeep, false, opts.DryRun, true); err != nil {
+		return err
+	}
+
 	for _, repo := range manifest.Repos {
+		if opts.DryRun {
+			s.printf("dry-run: remove worktree %s\n", filepath.Join(spacePath, repo.Path))
+			continue
+		}
 		if err := s.Git.WorktreeRemove(ctx, repo.BareRepoPath, filepath.Join(spacePath, repo.Path), true); err != nil {
 			return err
 		}
@@ -427,13 +664,12 @@ func (s Service) Archive(ctx context.Context, opts ArchiveOptions) error {
 			return err
 		}
 	}
-	archiveRoot := filepath.Join(s.Config.AgentWorkDir, ".archive")
+	if opts.DryRun {
+		s.printf("dry-run: archive %s to %s\n", spacePath, dest)
+		return nil
+	}
 	if err := os.MkdirAll(archiveRoot, config.DefaultDirMode); err != nil {
 		return err
-	}
-	dest := filepath.Join(archiveRoot, opts.SpaceID)
-	if _, err := os.Stat(dest); err == nil {
-		dest = fmt.Sprintf("%s-%s", dest, time.Now().Format("20060102150405"))
 	}
 	if err := os.Rename(spacePath, dest); err != nil {
 		return err
@@ -452,6 +688,14 @@ func (s Service) Destroy(ctx context.Context, opts DestroyOptions) error {
 		if err := s.ensureNoDirtyEdits(ctx, spacePath, manifest); err != nil {
 			return err
 		}
+	}
+	fate := opts.MemoryFate
+	if fate == "" {
+		fate = memory.FateKeep
+	}
+	// Memory fate BEFORE RemoveAll — manifest is gone after.
+	if err := s.applyMemoryFate(ctx, spacePath, "", manifest, fate, opts.Force, opts.DryRun, false); err != nil {
+		return err
 	}
 	for _, repo := range manifest.Repos {
 		worktreePath := filepath.Join(spacePath, repo.Path)
@@ -474,6 +718,240 @@ func (s Service) Destroy(ctx context.Context, opts DestroyOptions) error {
 		return err
 	}
 	s.printf("destroyed %s\n", opts.SpaceID)
+	return nil
+}
+
+// applyMemoryFate runs provider Detach for each attachment.
+// owned:false never destroyed. archive=true rewrites reverse route to newPath.
+func (s Service) applyMemoryFate(ctx context.Context, spacePath, newPath string, manifest Manifest, fate memory.MemoryFate, force, dryRun, archive bool) error {
+	if len(manifest.Memories) == 0 {
+		return nil
+	}
+	if fate == "" {
+		fate = memory.FateKeep
+	}
+	if !dryRun && fate == memory.FateKeep && !archive {
+		s.printf("memory fate=keep (default): dens retained as durable residue of this task\n")
+	}
+	for _, mem := range manifest.Memories {
+		effective := fate
+		if !mem.Owned && (fate == memory.FateDestroy || fate == memory.FateContribute) {
+			s.printf("notice: memory %q (%s) is not owned; detach-only (never destroy)\n", mem.Name, mem.ID)
+			effective = memory.FateKeep
+		}
+		prov, err := s.provider(mem.Provider)
+		if err != nil {
+			return fmt.Errorf("memory %s: %w", mem.Name, err)
+		}
+		detachOpts := memory.DetachOptions{
+			StoreID:   mem.ID,
+			SpacePath: spacePath,
+			Fate:      effective,
+			Force:     force,
+			Owned:     mem.Owned,
+			DryRun:    dryRun,
+			Out:       s.Out,
+		}
+		if archive {
+			detachOpts.NewSpacePath = newPath
+			detachOpts.Fate = memory.FateKeep
+		} else if effective == memory.FateKeep {
+			detachOpts.RemoveRoute = true
+		}
+		if _, err := prov.Detach(ctx, detachOpts); err != nil {
+			return fmt.Errorf("memory %s fate %s: %w", mem.Name, effective, err)
+		}
+	}
+	return nil
+}
+
+// DetachMemory removes one attachment from the manifest after provider Detach.
+func (s Service) DetachMemory(ctx context.Context, spaceID, alias string, fate memory.MemoryFate, force, dryRun bool) error {
+	spacePath := s.SpacePath(spaceID)
+	manifest, err := LoadManifest(spacePath)
+	if err != nil {
+		return err
+	}
+	mem, idx, ok := manifest.FindMemory(alias)
+	if !ok {
+		if alias == "" {
+			return fmt.Errorf("space %q has %d memory attachments; specify an alias", spaceID, len(manifest.Memories))
+		}
+		return fmt.Errorf("memory %q not found on space %q", alias, spaceID)
+	}
+	if fate == "" {
+		fate = memory.FateKeep
+	}
+	if !mem.Owned && (fate == memory.FateDestroy || fate == memory.FateContribute) {
+		s.printf("notice: memory %q is not owned; detach-only\n", mem.Name)
+		fate = memory.FateKeep
+	}
+	prov, err := s.provider(mem.Provider)
+	if err != nil {
+		return err
+	}
+	if _, err := prov.Detach(ctx, memory.DetachOptions{
+		StoreID:     mem.ID,
+		SpacePath:   spacePath,
+		RemoveRoute: fate == memory.FateKeep,
+		Fate:        fate,
+		Force:       force,
+		Owned:       mem.Owned,
+		DryRun:      dryRun,
+		Out:         s.Out,
+	}); err != nil {
+		return err
+	}
+	if dryRun {
+		s.printf("dry-run: remove memory attachment %q from .stave.yaml\n", mem.Name)
+		return nil
+	}
+	manifest.Memories = append(manifest.Memories[:idx], manifest.Memories[idx+1:]...)
+	if err := SaveManifest(spacePath, manifest); err != nil {
+		return err
+	}
+	if err := s.writeAgents(spacePath, manifest); err != nil {
+		return err
+	}
+	s.printf("detached memory %s from %s\n", mem.Name, spaceID)
+	return nil
+}
+
+// ProposeMemory runs provider Propose (contribute + warren propose) for an attachment.
+func (s Service) ProposeMemory(ctx context.Context, spaceID, alias string, dryRun bool) error {
+	spacePath := s.SpacePath(spaceID)
+	manifest, err := LoadManifest(spacePath)
+	if err != nil {
+		return err
+	}
+	mem, _, ok := manifest.FindMemory(alias)
+	if !ok {
+		if alias == "" {
+			return fmt.Errorf("space %q has %d memory attachments; specify an alias", spaceID, len(manifest.Memories))
+		}
+		return fmt.Errorf("memory %q not found on space %q", alias, spaceID)
+	}
+	prov, err := s.provider(mem.Provider)
+	if err != nil {
+		return err
+	}
+	res, err := prov.Propose(ctx, memory.ProposeOptions{StoreID: mem.ID, DryRun: dryRun, Out: s.Out})
+	if err != nil {
+		return err
+	}
+	if res.Summary != "" {
+		s.printf("%s\n", res.Summary)
+	}
+	return nil
+}
+
+// SyncMemory runs provider Sync for an attachment.
+func (s Service) SyncMemory(ctx context.Context, spaceID, alias string, dryRun bool) error {
+	spacePath := s.SpacePath(spaceID)
+	manifest, err := LoadManifest(spacePath)
+	if err != nil {
+		return err
+	}
+	mem, _, ok := manifest.FindMemory(alias)
+	if !ok {
+		if alias == "" {
+			return fmt.Errorf("space %q has %d memory attachments; specify an alias", spaceID, len(manifest.Memories))
+		}
+		return fmt.Errorf("memory %q not found on space %q", alias, spaceID)
+	}
+	prov, err := s.provider(mem.Provider)
+	if err != nil {
+		return err
+	}
+	res, err := prov.Sync(ctx, memory.SyncOptions{StoreID: mem.ID, DryRun: dryRun, Out: s.Out})
+	if err != nil {
+		return err
+	}
+	if res.Summary != "" {
+		s.printf("%s\n", res.Summary)
+	}
+	return nil
+}
+
+// MemoryStatus prints provider status for one or all attachments.
+func (s Service) MemoryStatus(ctx context.Context, spaceID, alias string) error {
+	spacePath := s.SpacePath(spaceID)
+	manifest, err := LoadManifest(spacePath)
+	if err != nil {
+		return err
+	}
+	if len(manifest.Memories) == 0 {
+		s.printf("space %s: no memory attachments\n", spaceID)
+		return nil
+	}
+	targets := manifest.Memories
+	if alias != "" {
+		mem, _, ok := manifest.FindMemory(alias)
+		if !ok {
+			return fmt.Errorf("memory %q not found on space %q", alias, spaceID)
+		}
+		targets = []MemoryManifest{mem}
+	}
+	for _, mem := range targets {
+		s.printf("%s  provider=%s id=%s owned=%v\n", mem.Name, mem.Provider, mem.ID, mem.Owned)
+		prov, err := s.provider(mem.Provider)
+		if err != nil {
+			s.printf("  status: %v\n", err)
+			continue
+		}
+		res, err := prov.Status(ctx, memory.StatusOptions{StoreID: mem.ID, Out: s.Out})
+		if err != nil {
+			s.printf("  status: %v\n", err)
+			continue
+		}
+		if res.Summary != "" {
+			s.printf("  %s\n", strings.TrimSpace(res.Summary))
+		}
+	}
+	return nil
+}
+
+// ListMemories prints attachment records for one space or all spaces.
+func (s Service) ListMemories(spaceID string) error {
+	if spaceID != "" {
+		manifest, err := LoadManifest(s.SpacePath(spaceID))
+		if err != nil {
+			return err
+		}
+		if len(manifest.Memories) == 0 {
+			s.printf("space %s: no memory attachments\n", spaceID)
+			return nil
+		}
+		for _, mem := range manifest.Memories {
+			s.printf("%s\t%s\t%s\towned=%v\n", spaceID, mem.Name, mem.Provider+":"+mem.ID, mem.Owned)
+		}
+		return nil
+	}
+	entries, err := os.ReadDir(s.Config.AgentWorkDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			s.printf("no spaces\n")
+			return nil
+		}
+		return err
+	}
+	found := false
+	for _, entry := range entries {
+		if !entry.IsDir() || entry.Name() == ".archive" {
+			continue
+		}
+		manifest, err := LoadManifest(filepath.Join(s.Config.AgentWorkDir, entry.Name()))
+		if err != nil || len(manifest.Memories) == 0 {
+			continue
+		}
+		found = true
+		for _, mem := range manifest.Memories {
+			s.printf("%s\t%s\t%s\towned=%v\n", manifest.ID, mem.Name, mem.Provider+":"+mem.ID, mem.Owned)
+		}
+	}
+	if !found {
+		s.printf("no memory attachments\n")
+	}
 	return nil
 }
 
@@ -510,6 +988,9 @@ func (s Service) writeAgents(spacePath string, manifest Manifest) error {
 	if manifest.SpecPath != "" {
 		fmt.Fprintf(&b, "- Read `%s/` before starting; it holds the task or review context for this space.\n", manifest.SpecPath)
 	}
+	for _, mem := range manifest.Memories {
+		fmt.Fprintf(&b, "- Persistent memory is available via the context-marmot MCP tools (den: %s).\n", mem.ID)
+	}
 	b.WriteString("\n")
 	if len(manifest.Repos) > 0 {
 		b.WriteString("## Repositories\n")
@@ -517,7 +998,7 @@ func (s Service) writeAgents(spacePath string, manifest Manifest) error {
 			fmt.Fprintf(&b, "- `%s`: %s at `%s`\n", repo.Name, repo.Mode, repo.Path)
 		}
 	}
-	return os.WriteFile(filepath.Join(spacePath, AgentsName), []byte(b.String()), 0o644)
+	return fsio.WriteFileAtomic(filepath.Join(spacePath, AgentsName), []byte(b.String()), 0o644)
 }
 
 func (s Service) now() time.Time {

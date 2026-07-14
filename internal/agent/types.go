@@ -80,14 +80,18 @@ type Operation struct {
 	SpecPath         string    `json:"spec_path,omitempty"`
 	Edits            []RepoRef `json:"edits,omitempty"`
 	References       []RepoRef `json:"references,omitempty"`
-	Repo             string    `json:"repo,omitempty"`
-	Mode             string    `json:"mode,omitempty"`
-	Base             string    `json:"base,omitempty"`
-	Ref              string    `json:"ref,omitempty"`
-	Branch           string    `json:"branch,omitempty"`
-	NoFetch          bool      `json:"no_fetch,omitempty"`
-	ReferencesOnly   bool      `json:"references_only,omitempty"`
-	Summoner         string    `json:"summoner,omitempty"`
+	// Memories are raw `[provider:]<spec>` values (space create --memory sugar).
+	Memories []string `json:"memories,omitempty"`
+	// MemoryFate is keep|destroy|contribute for space destroy (default keep).
+	MemoryFate     string    `json:"memory_fate,omitempty"`
+	Repo           string    `json:"repo,omitempty"`
+	Mode           string    `json:"mode,omitempty"`
+	Base           string    `json:"base,omitempty"`
+	Ref            string    `json:"ref,omitempty"`
+	Branch         string    `json:"branch,omitempty"`
+	NoFetch        bool      `json:"no_fetch,omitempty"`
+	ReferencesOnly bool      `json:"references_only,omitempty"`
+	Summoner       string    `json:"summoner,omitempty"`
 	Driver           string    `json:"driver,omitempty"`
 	Preset           string    `json:"preset,omitempty"`
 	Engine           string    `json:"engine,omitempty"`
@@ -147,11 +151,20 @@ type RepoContext struct {
 }
 
 type SpaceContext struct {
-	ID       string             `json:"id"`
-	Kind     string             `json:"kind,omitempty"`
-	SpecPath string             `json:"spec_path,omitempty"`
-	Repos    []SpaceRepoContext `json:"repos"`
-	Portals  []PortalContext    `json:"portals,omitempty"`
+	ID       string               `json:"id"`
+	Kind     string               `json:"kind,omitempty"`
+	SpecPath string               `json:"spec_path,omitempty"`
+	Repos    []SpaceRepoContext   `json:"repos"`
+	Memories []SpaceMemoryContext `json:"memories,omitempty"`
+	Portals  []PortalContext      `json:"portals,omitempty"`
+}
+
+// SpaceMemoryContext surfaces attachment records to the planner.
+type SpaceMemoryContext struct {
+	Name     string `json:"name"`
+	Provider string `json:"provider"`
+	ID       string `json:"id"`
+	Owned    bool   `json:"owned"`
 }
 
 type SpaceRepoContext struct {
@@ -251,6 +264,9 @@ func EquivalentCommand(op Operation) string {
 		}
 		for _, ref := range op.References {
 			parts = append(parts, "-r", shellQuote(repoSpec(ref)))
+		}
+		for _, mem := range op.Memories {
+			parts = append(parts, "--memory", shellQuote(mem))
 		}
 		return strings.Join(parts, " ")
 	case OpSpaceAdd:

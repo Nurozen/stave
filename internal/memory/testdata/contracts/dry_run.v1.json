@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "dry_run": true,
+  "ops": [
+    "mkdir /home/user/.marmot/dens/myproject",
+    "write /home/user/.marmot/dens/myproject/_den.md",
+    "routes.SetProject /home/user/src/myproject -> myproject",
+    "write /home/user/src/myproject/.marmot-vault"
+  ]
+}

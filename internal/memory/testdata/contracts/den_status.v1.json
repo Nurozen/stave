@@ -1,0 +1,38 @@
+{
+  "schema": 1,
+  "den_id": "myproject",
+  "lifetime": "durable",
+  "vault_id": "myproject",
+  "projects": [
+    "/home/user/src/myproject"
+  ],
+  "links": [
+    {
+      "ref": "platform-warren/docs",
+      "mode": "edit",
+      "pinned_commit": null,
+      "ahead": 4,
+      "behind": 0,
+      "pending_edits": 2,
+      "state": "ok"
+    },
+    {
+      "ref": "platform-warren/billing",
+      "mode": "link",
+      "pinned_commit": "abc1234",
+      "ahead": 0,
+      "behind": 3,
+      "pending_edits": 0,
+      "state": "ok"
+    },
+    {
+      "ref": "auth-service-den",
+      "mode": "live",
+      "pinned_commit": null,
+      "ahead": 0,
+      "behind": 0,
+      "pending_edits": 0,
+      "state": "ok"
+    }
+  ]
+}

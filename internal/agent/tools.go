@@ -178,6 +178,11 @@ func ToolDefinitions() []ToolDefinition {
 				"spec_path":  stringSchema("Optional path to a spec file or directory supplied by the user."),
 				"edits":      repoRefArraySchema("Registered repos to create as editable top-level worktrees."),
 				"references": repoRefArraySchema("Registered repos to create as detached reference worktrees under references/."),
+				"memories": map[string]any{
+					"type":        "array",
+					"description": "Optional memory attachments as [provider:]<spec> strings; use \".\" for a fresh task store on the default provider.",
+					"items":       map[string]any{"type": "string"},
+				},
 			}, []string{"space_id"}),
 		},
 		{
@@ -495,7 +500,7 @@ func (d *ToolDispatcher) dispatch(ctx context.Context, call ToolCall) ToolResult
 		if err := decodeToolArgs(call.Arguments, &args); err != nil {
 			return toolError(call, err)
 		}
-		op := Operation{Type: OpSpaceCreate, SpaceID: args.SpaceID, Kind: args.Kind, SpecPath: args.SpecPath, Edits: args.Edits, References: args.References}
+		op := Operation{Type: OpSpaceCreate, SpaceID: args.SpaceID, Kind: args.Kind, SpecPath: args.SpecPath, Edits: args.Edits, References: args.References, Memories: args.Memories}
 		return d.queueOperation(call, op)
 	case ToolSpaceAdd:
 		var args spaceAddArgs
@@ -864,6 +869,7 @@ type spaceCreateArgs struct {
 	SpecPath   string    `json:"spec_path"`
 	Edits      []RepoRef `json:"edits"`
 	References []RepoRef `json:"references"`
+	Memories   []string  `json:"memories"`
 }
 
 type spaceAddArgs struct {

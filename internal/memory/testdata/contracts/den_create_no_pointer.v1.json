@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "den_id": "demo-space",
+  "den_path": "/home/user/.marmot/dens/demo-space",
+  "vault_id": "demo-space",
+  "routes": {
+    "project_path": "/home/user/stave/agent-work/demo-space"
+  },
+  "pointer_written": false,
+  "links": [],
+  "warnings": []
+}

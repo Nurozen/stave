@@ -34,6 +34,7 @@ type Config struct {
 	Repos        map[string]Repository `mapstructure:"repos" yaml:"repos"`
 	Agent        AgentConfig           `mapstructure:"agent" yaml:"agent,omitempty"`
 	Summon       SummonConfig          `mapstructure:"summon" yaml:"summon,omitempty"`
+	Memory       MemoryConfig          `mapstructure:"memory" yaml:"memory,omitempty"`
 }
 
 type Repository struct {
@@ -41,6 +42,21 @@ type Repository struct {
 	URL           string `mapstructure:"url" yaml:"url"`
 	BareRepoPath  string `mapstructure:"bareRepoPath" yaml:"bareRepoPath"`
 	DefaultBranch string `mapstructure:"defaultBranch,omitempty" yaml:"defaultBranch,omitempty"`
+	// MarmotVault is an optional manual override/suppression for reference→vault
+	// resolution on memory attach (S4). Values: a vault id, or "off" to suppress.
+	MarmotVault string `mapstructure:"marmotVault,omitempty" yaml:"marmotVault,omitempty"`
+}
+
+// MemoryConfig selects the memory provider and ambient attach behaviour.
+// Provider is config, not command path — see stave memory group.
+type MemoryConfig struct {
+	// Provider is the default provider name (e.g. "marmot").
+	Provider string `mapstructure:"provider" yaml:"provider,omitempty"`
+	// Default, when true, ambient-attaches memory on every new space create.
+	// Explicit attach/--memory fails hard; ambient degrades with a notice.
+	Default bool `mapstructure:"default" yaml:"default,omitempty"`
+	// Binary is the provider executable path/name (default "marmot").
+	Binary string `mapstructure:"binary" yaml:"binary,omitempty"`
 }
 
 type AgentConfig struct {
@@ -88,6 +104,7 @@ func Default() (*Config, error) {
 		Repos:        map[string]Repository{},
 		Agent:        DefaultAgentConfig(),
 		Summon:       DefaultSummonConfig(),
+		Memory:       DefaultMemoryConfig(),
 	}, nil
 }
 
@@ -114,6 +131,7 @@ func Load(path string) (*Config, string, error) {
 	v.SetDefault("repos", map[string]Repository{})
 	v.SetDefault("agent", defaults.Agent)
 	v.SetDefault("summon", defaults.Summon)
+	v.SetDefault("memory", defaults.Memory)
 
 	if err := v.ReadInConfig(); err != nil && !missingConfig(err) {
 		return nil, path, fmt.Errorf("read config: %w", err)
@@ -177,6 +195,7 @@ func (c *Config) ApplyDefaults() error {
 	}
 	c.Agent.ApplyDefaults()
 	c.Summon.ApplyDefaults()
+	c.Memory.ApplyDefaults()
 	return nil
 }
 
@@ -269,6 +288,16 @@ func DefaultSummonConfig() SummonConfig {
 	}
 }
 
+// DefaultMemoryConfig returns inert defaults safe to persist (provider marmot,
+// ambient off, binary "marmot").
+func DefaultMemoryConfig() MemoryConfig {
+	return MemoryConfig{
+		Provider: "marmot",
+		Default:  false,
+		Binary:   "marmot",
+	}
+}
+
 func (c *AgentConfig) ApplyDefaults() {
 	defaults := DefaultAgentConfig()
 	if c.DefaultProvider == "" {
@@ -301,6 +330,16 @@ func (c *SummonConfig) ApplyDefaults() {
 		if c.Commands[summoner] == "" {
 			c.Commands[summoner] = command
 		}
+	}
+}
+
+func (c *MemoryConfig) ApplyDefaults() {
+	defaults := DefaultMemoryConfig()
+	if c.Provider == "" {
+		c.Provider = defaults.Provider
+	}
+	if c.Binary == "" {
+		c.Binary = defaults.Binary
 	}
 }
 

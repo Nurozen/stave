@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "note": "Additive fields for GET /api/warren/{id}/status and CLI warren status --json; keep existing path/active/editable fields for web compat",
+  "warren_id": "product-platform",
+  "mode": "cache",
+  "entries": [
+    {
+      "project_id": "project-a",
+      "path": "/home/user/.marmot/warren-cache/checkouts/product-platform/projects/project-a/.marmot",
+      "state": "mounted",
+      "editable": false,
+      "reachable": true,
+      "ahead": 0,
+      "behind": 2,
+      "pinned_commit": "def5678",
+      "remote_head": "abc9999"
+    }
+  ]
+}

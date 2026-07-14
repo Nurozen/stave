@@ -70,6 +70,7 @@ func (e Executor) executeOperation(ctx context.Context, op Operation) error {
 			SpecPath:   op.SpecPath,
 			Edits:      repoRefsToSpecs(op.Edits),
 			References: repoRefsToSpecs(op.References),
+			Memories:   op.Memories,
 		})
 	case OpSpaceAdd:
 		mode := space.ModeEdit

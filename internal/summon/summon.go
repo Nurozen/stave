@@ -92,7 +92,7 @@ func (s Service) Invocation(opts Options) (Invocation, error) {
 	summoner := ResolveName(s.Config, opts.Summoner)
 	prompt := opts.Prompt
 	if prompt == "" {
-		prompt = defaultPrompt(spacePath, manifest.SpecPath, manifest.Kind, summoner)
+		prompt = defaultPrompt(spacePath, manifest.SpecPath, manifest.Kind, summoner, manifest.Memories)
 	}
 	return BuildInvocation(s.Config, spacePath, summoner, prompt)
 }
@@ -145,19 +145,24 @@ const ReviewSkillName = "pr-teach"
 // defaultPrompt picks the launch prompt for a space: Claude sessions in
 // review spaces launch straight into the embedded review skill when the
 // space carries it, so the guided review loop starts without any typing.
-func defaultPrompt(spacePath, specPath, kind, summoner string) string {
+func defaultPrompt(spacePath, specPath, kind, summoner string, memories []space.MemoryManifest) string {
 	if kind == "review" && summoner == Claude {
 		skillPath := filepath.Join(spacePath, ".claude", "skills", ReviewSkillName, "SKILL.md")
 		if _, err := os.Stat(skillPath); err == nil {
 			return "/" + ReviewSkillName
 		}
 	}
-	return PromptForKind(spacePath, specPath, kind)
+	return PromptForKindWithMemories(spacePath, specPath, kind, memories)
 }
 
 // PromptForKind tailors the launch prompt to the space's purpose: a review
 // space primes the agent to assess a change rather than implement one.
 func PromptForKind(spacePath string, specPath string, kind string) string {
+	return PromptForKindWithMemories(spacePath, specPath, kind, nil)
+}
+
+// PromptForKindWithMemories is PromptForKind plus optional memory attachment lines.
+func PromptForKindWithMemories(spacePath string, specPath string, kind string, memories []space.MemoryManifest) string {
 	var b strings.Builder
 	b.WriteString("Using a team of agents, familiarize yourself with this workspace.\n\n")
 	b.WriteString("Focus on:\n")
@@ -167,6 +172,11 @@ func PromptForKind(spacePath string, specPath string, kind string) string {
 		b.WriteString("- The spec material at ")
 		b.WriteString(resolveSpecPath(spacePath, specPath))
 		b.WriteString(".\n")
+	}
+	for _, mem := range memories {
+		b.WriteString("- Persistent memory is available via the context-marmot MCP tools (den: ")
+		b.WriteString(mem.ID)
+		b.WriteString(").\n")
 	}
 	if kind == "review" {
 		b.WriteString("\nThis is a review space: the worktree is checked out at the change under review and the spec records its context (a pull request's metadata and diff commands). Help the user assess the change — treat the author's description as claims to verify, not facts — and do not modify the code unless the user explicitly asks.")

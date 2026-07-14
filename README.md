@@ -11,6 +11,8 @@ Coding agents work best in a dedicated directory with clear rules: what is edita
 - **Edit worktrees** — top-level folders on branches like `stave/<space-id>/<repo>`.
 - **Reference worktrees** — detached checkouts under `references/` for context only.
 - **Lifecycle** — sync, status (dirty / ahead-behind), archive, destroy.
+- **Memory** — optional [ContextMarmot](https://github.com/Nurozen/context-marmot) dens
+  attached per space (`stave memory`); never writes in-space `.marmot/` trees.
 
 ## Install
 
@@ -50,14 +52,22 @@ stave
 │   ├── list
 │   ├── sync [name]
 │   └── remove <name>
+├── memory
+│   ├── providers
+│   ├── attach <space-id>
+│   ├── status <space-id> [alias]
+│   ├── list [space-id]
+│   ├── sync <space-id>
+│   ├── propose <space-id>
+│   └── detach <space-id> [--keep|--destroy]
 └── space
     ├── init <space-id>
-    ├── create <space-id>
+    ├── create <space-id> [--memory ...]
     ├── add <space-id> <repo>
     ├── sync <space-id>
     ├── status <space-id>
     ├── archive <space-id>
-    └── destroy <space-id>
+    └── destroy <space-id> [--memory keep|destroy|contribute]
 ```
 
 Workspace commands live under **`stave space`** (not at the top level).
@@ -123,6 +133,49 @@ Inside the space, `git diff origin/<base>...HEAD` is the full PR diff and
 `stave space status` shows the PR's size as ahead/behind drift. Review
 skills (for example a PR walkthrough skill) find everything they need in
 `spec/` and the checked-out worktree.
+
+
+## Memory (ContextMarmot dens)
+
+Stave can attach a **provider-agnostic memory store** to a space. The first provider
+is **marmot**: it creates a central den under `$MARMOT_HOME` (not inside the space)
+and writes **space-local MCP** configs so agents call `marmot serve --den <id>`.
+
+Requires a dens-aware `marmot` on `PATH` (P1b+). Optional config:
+
+```yaml
+# ~/.config/stave/config.yaml (or --config)
+memory:
+  provider: marmot
+  binary: marmot          # or absolute path
+  default: false          # if true, space create attaches memory automatically
+```
+
+```bash
+export MARMOT_HOME=~/.marmot   # dens root; embedded into MCP env when set
+export PATH="/path/to/marmot/bin:$PATH"
+
+stave memory providers                 # probe marmot binary / den support
+stave memory attach ticket-482         # den create --no-pointer --json
+stave memory status ticket-482
+stave memory list
+stave memory detach ticket-482 --keep     # keep den as durable residue; strip MCP
+stave memory detach ticket-482 --destroy  # destroy den + strip MCP + routes
+```
+
+### Contracts (S2)
+
+| Behavior | Detail |
+|----------|--------|
+| Attach argv | `marmot den create <id> --lifetime task --project <spacePath> --no-pointer --json` |
+| Pointer | **Never** writes `.marmot-vault` into the space |
+| Routes | Registers space root in `$MARMOT_HOME/routes.yml`; archive rewrites via `route set-project --from/--to` |
+| MCP | Writes `.mcp.json`, `.cursor/mcp.json`, `.vscode/mcp.json`, `.codex/config.toml` with `serve --den <id>` (+ `MARMOT_HOME` when set) |
+| Detach | Removes only the generated `context-marmot` MCP entries; preserves other servers |
+| Destroy space | `--memory keep` (default) / `destroy` / `contribute` controls den fate |
+
+See ContextMarmot [docs/dens.md](https://github.com/Nurozen/context-marmot/blob/main/docs/dens.md)
+for dens layout, discovery order, and JSON schema fixtures.
 
 ## Layout
 

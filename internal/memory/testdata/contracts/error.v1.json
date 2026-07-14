@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "error": {
+    "code": "den_not_found",
+    "message": "den \"missing-id\" not found",
+    "hint": "create one: marmot den create missing-id --lifetime task --project /path/to/project --json"
+  }
+}

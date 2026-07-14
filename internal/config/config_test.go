@@ -46,6 +46,15 @@ func TestLoadMissingConfigUsesDefaults(t *testing.T) {
 	if cfg.Summon.Commands["cursor"] != "cursor-agent" {
 		t.Fatalf("cursor command = %q", cfg.Summon.Commands["cursor"])
 	}
+	if cfg.Memory.Provider != "marmot" {
+		t.Fatalf("Memory.Provider = %q", cfg.Memory.Provider)
+	}
+	if cfg.Memory.Default {
+		t.Fatal("Memory.Default defaulted to true")
+	}
+	if cfg.Memory.Binary != "marmot" {
+		t.Fatalf("Memory.Binary = %q", cfg.Memory.Binary)
+	}
 }
 
 func TestSaveAndLoadRoundTrip(t *testing.T) {
