@@ -21,6 +21,7 @@ agent-work/<space-id>/
 +-- .stave.yaml
 +-- .stave-portal.yaml
 +-- AGENTS.md
++-- CLAUDE.md -> AGENTS.md
 +-- spec/
 +-- <editable repo>/
 +-- references/
@@ -707,7 +708,7 @@ rsync -aiz --dry-run --delete-delay --delay-updates \
 
 Use `reconstruct` when correctness matters more than quick copying:
 
-1. Copy `.stave.yaml`, `.stave-portal.yaml`, `AGENTS.md`, and specs.
+1. Copy `.stave.yaml`, `.stave-portal.yaml`, `AGENTS.md`, `CLAUDE.md`, and specs when present.
 2. Ensure remote bare repos or clones exist.
 3. Recreate edit and reference worktrees using Git.
 4. Sync working-tree deltas without treating `.git` as portable content.

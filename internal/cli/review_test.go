@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/Nurozen/stave/internal/space"
+	"github.com/spf13/cobra"
 )
 
 func TestParsePRRef(t *testing.T) {
@@ -96,7 +97,10 @@ func TestCLIReviewEndToEnd(t *testing.T) {
 	runCLI(t, "setup")
 	runCLI(t, "repos", "add", "repo-a", src)
 
-	out := runCLI(t, "review", "repo-a#7")
+	var out string
+	requestedDir := captureShellChdir(t, func() {
+		out = runCLI(t, "review", "repo-a#7")
+	})
 	if !strings.Contains(out, "review space review-repo-a-7 is ready") {
 		t.Fatalf("review output missing ready line:\n%s", out)
 	}
@@ -106,6 +110,9 @@ func TestCLIReviewEndToEnd(t *testing.T) {
 	}
 
 	spacePath := filepath.Join(home, "stave", "agent-work", "review-repo-a-7")
+	if requestedDir != spacePath {
+		t.Fatalf("review shell chdir request = %q, want space root %q", requestedDir, spacePath)
+	}
 	worktree := filepath.Join(spacePath, "repo-a")
 	if _, err := os.Stat(worktree); err != nil {
 		t.Fatalf("review worktree missing: %v", err)
@@ -140,6 +147,32 @@ func TestCLIReviewEndToEnd(t *testing.T) {
 	diff := gitOutput(t, worktree, "diff", "origin/main...HEAD")
 	if !strings.Contains(diff, "feature.txt") || !strings.Contains(diff, "pr change") {
 		t.Fatalf("PR diff missing change:\n%s", diff)
+	}
+}
+
+func TestCLIReviewSummonForwardsAgentFlags(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	src := createGitRepo(t, "repo-a")
+	prSHA := gitOutput(t, src, "rev-parse", "main")
+	runGit(t, src, "update-ref", "refs/pull/7/head", prSHA)
+	runCLI(t, "setup")
+	runCLI(t, "repos", "add", "repo-a", src)
+
+	launcher := &fakeSummonLauncher{}
+	application := &app{summonLauncher: launcher, isTerminal: func(cmd *cobra.Command) bool { return true }}
+	requestedDir := captureShellChdir(t, func() {
+		runCLIWithApp(t, application, "review", "repo-a#7", "--summon", "claude", "--dangerously-skip-permissions")
+	})
+	spacePath := filepath.Join(home, "stave", "agent-work", "review-repo-a-7")
+	if requestedDir != spacePath {
+		t.Fatalf("review shell chdir request = %q, want %q", requestedDir, spacePath)
+	}
+	if !launcher.called || len(launcher.invocation.Args) != 2 || launcher.invocation.Args[0] != "--dangerously-skip-permissions" || launcher.invocation.Args[1] != "/pr-teach" {
+		t.Fatalf("review summon invocation = %#v", launcher.invocation)
+	}
+	if launcher.chdirEnv != "" {
+		t.Fatalf("summoned agent inherited %s=%q", shellChdirFDEnv, launcher.chdirEnv)
 	}
 }
 

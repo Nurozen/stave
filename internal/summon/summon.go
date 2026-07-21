@@ -36,6 +36,8 @@ type Options struct {
 	SpaceID      string
 	Summoner     string
 	PrintCommand bool
+	// AgentArgs are passed verbatim to the summoned executable before Prompt.
+	AgentArgs []string
 	// Prompt overrides the generated launch prompt; a skill invocation such
 	// as "/pr-teach" launches the agent straight into that skill.
 	Prompt string
@@ -94,10 +96,10 @@ func (s Service) Invocation(opts Options) (Invocation, error) {
 	if prompt == "" {
 		prompt = defaultPrompt(spacePath, manifest.SpecPath, manifest.Kind, summoner, manifest.Memories)
 	}
-	return BuildInvocation(s.Config, spacePath, summoner, prompt)
+	return BuildInvocation(s.Config, spacePath, summoner, prompt, opts.AgentArgs...)
 }
 
-func BuildInvocation(cfg config.Config, spacePath string, summoner string, prompt string) (Invocation, error) {
+func BuildInvocation(cfg config.Config, spacePath string, summoner string, prompt string, agentArgs ...string) (Invocation, error) {
 	if err := ValidateSummoner(summoner); err != nil {
 		return Invocation{}, err
 	}
@@ -108,10 +110,11 @@ func BuildInvocation(cfg config.Config, spacePath string, summoner string, promp
 	invocation := Invocation{Summoner: summoner, Command: command, Dir: spacePath, Prompt: prompt}
 	switch summoner {
 	case Codex:
-		invocation.Args = []string{"--cd", spacePath, prompt}
+		invocation.Args = append([]string{"--cd", spacePath}, agentArgs...)
 	case Claude, Cursor:
-		invocation.Args = []string{prompt}
+		invocation.Args = append([]string{}, agentArgs...)
 	}
+	invocation.Args = append(invocation.Args, prompt)
 	return invocation, nil
 }
 

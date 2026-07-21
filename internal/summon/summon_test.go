@@ -112,6 +112,24 @@ func TestBuildInvocation(t *testing.T) {
 	if cursor.Command != "cursor-agent" || cursor.Dir != spacePath || len(cursor.Args) != 1 || cursor.Args[0] != prompt {
 		t.Fatalf("cursor invocation = %#v", cursor)
 	}
+
+	claude, err := BuildInvocation(cfg, spacePath, Claude, prompt, "--dangerously-skip-permissions", "--model", "opus")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantClaude := []string{"--dangerously-skip-permissions", "--model", "opus", prompt}
+	if strings.Join(claude.Args, "\x00") != strings.Join(wantClaude, "\x00") {
+		t.Fatalf("claude args = %#v, want %#v", claude.Args, wantClaude)
+	}
+
+	codexWithFlags, err := BuildInvocation(cfg, spacePath, Codex, prompt, "--yolo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCodex := []string{"--cd", spacePath, "--yolo", prompt}
+	if strings.Join(codexWithFlags.Args, "\x00") != strings.Join(wantCodex, "\x00") {
+		t.Fatalf("codex args = %#v, want %#v", codexWithFlags.Args, wantCodex)
+	}
 }
 
 func TestServicePrintsCommandWhenNonInteractive(t *testing.T) {

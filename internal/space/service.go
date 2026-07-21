@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -175,6 +176,11 @@ func (s Service) InitSpace(ctx context.Context, opts InitOptions) error {
 		return err
 	}
 	spacePath := s.SpacePath(opts.ID)
+	_, statErr := os.Stat(spacePath)
+	spaceAlreadyExisted := statErr == nil
+	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+		return statErr
+	}
 	if err := os.MkdirAll(spacePath, config.DefaultDirMode); err != nil {
 		return err
 	}
@@ -188,8 +194,17 @@ func (s Service) InitSpace(ctx context.Context, opts InitOptions) error {
 		if manifest.ID != opts.ID {
 			return fmt.Errorf("existing manifest id %q does not match %q", manifest.ID, opts.ID)
 		}
+		if err := ensureClaudeLink(spacePath); err != nil {
+			return err
+		}
 		return s.writeAgents(spacePath, manifest)
 	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := ensureClaudeLink(spacePath); err != nil {
+		if !spaceAlreadyExisted {
+			_ = os.Remove(spacePath)
+		}
 		return err
 	}
 
@@ -249,6 +264,7 @@ func (s Service) createDryRun(ctx context.Context, opts CreateOptions) error {
 	s.printf("dry-run: create space directory %s\n", spacePath)
 	s.printf("dry-run: write %s\n", filepath.Join(spacePath, ManifestName))
 	s.printf("dry-run: write %s\n", filepath.Join(spacePath, AgentsName))
+	s.printf("dry-run: link %s -> %s\n", filepath.Join(spacePath, ClaudeName), AgentsName)
 	if opts.SpecPath != "" {
 		source, err := filepath.Abs(opts.SpecPath)
 		if err != nil {
@@ -353,11 +369,16 @@ func (s Service) AttachMemory(ctx context.Context, opts AttachMemoryOptions) err
 		storeIDHint = opts.SpaceID
 	}
 	if !opts.DryRun {
-		if manifest, err := LoadManifest(spacePath); err == nil {
-			for _, existing := range manifest.Memories {
-				if existing.Name == name || existing.ID == storeIDHint {
-					return fmt.Errorf("memory %q already attached to space %q", name, opts.SpaceID)
-				}
+		manifest, err := LoadManifest(spacePath)
+		if err != nil {
+			return err
+		}
+		if err := ensureClaudeLink(spacePath); err != nil {
+			return err
+		}
+		for _, existing := range manifest.Memories {
+			if existing.Name == name || existing.ID == storeIDHint {
+				return fmt.Errorf("memory %q already attached to space %q", name, opts.SpaceID)
 			}
 		}
 	}
@@ -483,6 +504,11 @@ func (s Service) AddRepo(ctx context.Context, opts AddOptions) error {
 	if err != nil {
 		return err
 	}
+	if !opts.DryRun {
+		if err := ensureClaudeLink(spacePath); err != nil {
+			return err
+		}
+	}
 	if !opts.NoFetch && opts.DryRun {
 		s.printf("dry-run: fetch %s\n", repoCfg.BareRepoPath)
 	} else if !opts.NoFetch {
@@ -563,6 +589,9 @@ func (s Service) Sync(ctx context.Context, opts SyncOptions) error {
 	if err != nil {
 		return err
 	}
+	if err := ensureClaudeLink(spacePath); err != nil {
+		return err
+	}
 	for _, repo := range manifest.Repos {
 		if opts.ReferencesOnly && repo.Mode != ModeReference {
 			continue
@@ -594,7 +623,7 @@ func (s Service) Sync(ctx context.Context, opts SyncOptions) error {
 			s.printf("edit %s: ahead %d, behind %d versus %s\n", repo.Name, ahead, behind, repo.Base)
 		}
 	}
-	return nil
+	return s.writeAgents(spacePath, manifest)
 }
 
 func (s Service) Status(ctx context.Context, spaceID string) (Status, error) {
@@ -781,6 +810,11 @@ func (s Service) DetachMemory(ctx context.Context, spaceID, alias string, fate m
 	}
 	if fate == "" {
 		fate = memory.FateKeep
+	}
+	if !dryRun {
+		if err := ensureClaudeLink(spacePath); err != nil {
+			return err
+		}
 	}
 	if !mem.Owned && (fate == memory.FateDestroy || fate == memory.FateContribute) {
 		s.printf("notice: memory %q is not owned; detach-only\n", mem.Name)
@@ -996,9 +1030,49 @@ func (s Service) writeAgents(spacePath string, manifest Manifest) error {
 		b.WriteString("## Repositories\n")
 		for _, repo := range manifest.Repos {
 			fmt.Fprintf(&b, "- `%s`: %s at `%s`\n", repo.Name, repo.Mode, repo.Path)
+			instructionsPath := filepath.Join(repo.Path, AgentsName)
+			info, err := os.Stat(filepath.Join(spacePath, instructionsPath))
+			switch {
+			case err == nil && !info.IsDir():
+				markdownPath := filepath.ToSlash(instructionsPath)
+				fmt.Fprintf(&b, "  - Read [`%s`](%s) for repository-specific instructions.\n", markdownPath, markdownPath)
+			case err != nil && !errors.Is(err, os.ErrNotExist):
+				return err
+			}
 		}
 	}
+	if err := ensureClaudeLink(spacePath); err != nil {
+		return err
+	}
 	return fsio.WriteFileAtomic(filepath.Join(spacePath, AgentsName), []byte(b.String()), 0o644)
+}
+
+func ensureClaudeLink(spacePath string) error {
+	linkPath := filepath.Join(spacePath, ClaudeName)
+	info, err := os.Lstat(linkPath)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := os.Symlink(AgentsName, linkPath); err != nil {
+			if runtime.GOOS == "windows" {
+				return fmt.Errorf("create %s symlink to %s: %w (Windows requires Developer Mode or administrator symlink privileges)", linkPath, AgentsName, err)
+			}
+			return fmt.Errorf("create %s symlink to %s: %w", linkPath, AgentsName, err)
+		}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return fmt.Errorf("%s already exists and is not a symlink; move it before Stave can link it to %s", linkPath, AgentsName)
+	}
+	target, err := os.Readlink(linkPath)
+	if err != nil {
+		return err
+	}
+	if target == AgentsName {
+		return nil
+	}
+	return fmt.Errorf("%s points to %q instead of %s; move it before Stave can create the generated link", linkPath, target, AgentsName)
 }
 
 func (s Service) now() time.Time {

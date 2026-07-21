@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/Nurozen/stave/internal/config"
+	"github.com/Nurozen/stave/internal/space"
 )
 
 func TestManifestDefaultsAndValidationErrors(t *testing.T) {
@@ -689,6 +690,16 @@ func TestPlanSyncAndHelperBranches(t *testing.T) {
 	}
 
 	writeSpaceWithRepos(t, cfg, "ex-2")
+	spacePath2 := filepath.Join(cfg.AgentWorkDir, "ex-2")
+	if err := os.WriteFile(filepath.Join(spacePath2, space.AgentsName), []byte("instructions"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(space.AgentsName, filepath.Join(spacePath2, space.ClaudeName)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(spacePath2, "spec"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	remoteSvc := NewService(cfg, fakeRunner{}, nil)
 	remoteSvc.Git = &dirtyGit{dirty: false}
 	if _, err := remoteSvc.AttachSSH(ctx, AttachSSHOptions{SpaceID: "ex-2", Host: "devbox", PortalID: "ssh"}); err != nil {
@@ -705,8 +716,22 @@ func TestPlanSyncAndHelperBranches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(reconstruct.EquivalentCommands()[0], "--relative") {
+	if !strings.Contains(reconstruct.EquivalentCommands()[0], "--relative") || !strings.Contains(reconstruct.EquivalentCommands()[0], space.ClaudeName) || reconstruct.Commands[0].Dir != spacePath2 {
 		t.Fatalf("reconstruct = %v", reconstruct.EquivalentCommands())
+	}
+	if err := os.Remove(filepath.Join(spacePath2, space.ClaudeName)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(spacePath2, "spec")); err != nil {
+		t.Fatal(err)
+	}
+	legacyReconstruct, err := remoteSvc.PlanSync(ctx, SyncOptions{SpaceID: "ex-2", PortalID: "ssh", Mode: SyncReconstruct})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyCommand := legacyReconstruct.EquivalentCommands()[0]
+	if strings.Contains(legacyCommand, space.ClaudeName) || strings.Contains(legacyCommand, "spec/") {
+		t.Fatalf("legacy reconstruct required missing optional metadata: %s", legacyCommand)
 	}
 
 	remotePortal, _, err := remoteSvc.LoadPortal(SelectOptions{SpaceID: "ex-2", PortalID: "ssh"})

@@ -107,9 +107,12 @@ and records PR metadata under spec/ for agents and skills to consume.
 
 The <pr> argument accepts a GitHub PR URL, owner/repo#123, or
 <registered-repo>#123.`,
-		Args: cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ref, err := parsePRRef(args[0])
+			positionals, agentArgs, err := parsePassthroughArgs(cmd, args, 1, 2, func() bool { return summonName != "" })
+			if err != nil {
+				return err
+			}
+			ref, err := parsePRRef(positionals[0])
 			if err != nil {
 				return err
 			}
@@ -118,8 +121,8 @@ The <pr> argument accepts a GitHub PR URL, owner/repo#123, or
 				ref.Owner = ""
 			}
 			spaceID := ""
-			if len(args) == 2 {
-				spaceID = args[1]
+			if len(positionals) == 2 {
+				spaceID = positionals[1]
 			}
 			cfg, cfgPath, err := a.loadConfig()
 			if err != nil {
@@ -145,9 +148,12 @@ The <pr> argument accepts a GitHub PR URL, owner/repo#123, or
 			fmt.Fprintf(out, "  diff:  git -C %s diff %s...HEAD\n", result.WorktreePath, result.BaseRef)
 			if summonName == "" || noSummon {
 				fmt.Fprintf(out, "  next:  stave summon %s --with claude   # launches the /%s review loop\n", result.SpaceID, summon.ReviewSkillName)
-				return nil
+				return a.requestShellChdir(filepath.Join(cfg.AgentWorkDir, result.SpaceID))
 			}
-			return a.runSummon(cmd, *cfg, result.SpaceID, summonName, summonPrompt, false)
+			if err := a.requestShellChdir(filepath.Join(cfg.AgentWorkDir, result.SpaceID)); err != nil {
+				return err
+			}
+			return a.runSummon(cmd, *cfg, result.SpaceID, summonName, summonPrompt, agentArgs, false)
 		},
 	}
 	cmd.Flags().StringVar(&summonName, "summon", "", "launch a summoner in the review space (codex, claude, or cursor)")
@@ -155,6 +161,7 @@ The <pr> argument accepts a GitHub PR URL, owner/repo#123, or
 	cmd.Flags().StringArrayVarP(&references, "reference", "r", nil, "registered repo to add as read-only context, optionally repo:ref (repeatable)")
 	cmd.Flags().StringVar(&repoOverride, "repo", "", "registered repo name to use instead of resolving from the PR URL")
 	cmd.Flags().BoolVar(&noSummon, "no-summon", false, "never launch a summoner, even if --summon is set")
+	cmd.Flags().SetInterspersed(false)
 	return cmd
 }
 

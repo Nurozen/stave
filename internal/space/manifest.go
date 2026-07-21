@@ -14,6 +14,7 @@ import (
 const (
 	ManifestName = ".stave.yaml"
 	AgentsName   = "AGENTS.md"
+	ClaudeName   = "CLAUDE.md"
 
 	// CurrentManifestVersion is the highest .stave.yaml schema version this
 	// binary understands. Load is permissive (older/missing versions load);

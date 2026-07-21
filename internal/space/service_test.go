@@ -214,6 +214,158 @@ func TestCreateAddsEditAndReference(t *testing.T) {
 	}
 }
 
+func TestWriteAgentsLinksRepositoryInstructions(t *testing.T) {
+	svc, _, cfg := testService(t)
+	spacePath := filepath.Join(cfg.AgentWorkDir, "docs-1")
+	manifest := Manifest{ID: "docs-1", CreatedAt: svc.now(), Repos: []RepoManifest{
+		{Name: "repo-a", Mode: ModeEdit, Path: "repo-a"},
+		{Name: "repo-b", Mode: ModeReference, Path: filepath.Join("references", "repo-b")},
+		{Name: "repo-c", Mode: ModeEdit, Path: "repo-c"},
+	}}
+	for _, repoPath := range []string{"repo-a", filepath.Join("references", "repo-b"), "repo-c"} {
+		if err := os.MkdirAll(filepath.Join(spacePath, repoPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, repoPath := range []string{"repo-a", filepath.Join("references", "repo-b")} {
+		if err := os.WriteFile(filepath.Join(spacePath, repoPath, AgentsName), []byte("nested"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := svc.writeAgents(spacePath, manifest); err != nil {
+		t.Fatal(err)
+	}
+	agents, err := os.ReadFile(filepath.Join(spacePath, AgentsName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(agents)
+	for _, want := range []string{"[`repo-a/AGENTS.md`](repo-a/AGENTS.md)", "[`references/repo-b/AGENTS.md`](references/repo-b/AGENTS.md)"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("AGENTS.md missing nested instruction link %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "repo-c/AGENTS.md") {
+		t.Fatalf("AGENTS.md linked missing repository instructions:\n%s", got)
+	}
+}
+
+func TestInitCreatesIdempotentClaudeSymlink(t *testing.T) {
+	svc, _, cfg := testService(t)
+	if err := svc.InitSpace(context.Background(), InitOptions{ID: "claude-1"}); err != nil {
+		t.Fatal(err)
+	}
+	spacePath := filepath.Join(cfg.AgentWorkDir, "claude-1")
+	linkPath := filepath.Join(spacePath, ClaudeName)
+	info, err := os.Lstat(linkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("%s mode = %v, want symlink", ClaudeName, info.Mode())
+	}
+	if target, err := os.Readlink(linkPath); err != nil || target != AgentsName {
+		t.Fatalf("Readlink(%s) = %q, %v; want %q", ClaudeName, target, err, AgentsName)
+	}
+	if err := svc.InitSpace(context.Background(), InitOptions{ID: "claude-1"}); err != nil {
+		t.Fatalf("InitSpace(existing) error = %v", err)
+	}
+	throughLink, err := os.ReadFile(linkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(throughLink), "Stave Workspace Instructions") {
+		t.Fatalf("%s did not resolve current %s content:\n%s", ClaudeName, AgentsName, throughLink)
+	}
+}
+
+func TestInitPreservesConflictingClaudeFile(t *testing.T) {
+	svc, _, cfg := testService(t)
+	spacePath := filepath.Join(cfg.AgentWorkDir, "claude-conflict")
+	if err := os.MkdirAll(spacePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	linkPath := filepath.Join(spacePath, ClaudeName)
+	if err := os.WriteFile(linkPath, []byte("user instructions"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := svc.InitSpace(context.Background(), InitOptions{ID: "claude-conflict"})
+	if err == nil || !strings.Contains(err.Error(), "is not a symlink") {
+		t.Fatalf("InitSpace conflict error = %v", err)
+	}
+	got, readErr := os.ReadFile(linkPath)
+	if readErr != nil || string(got) != "user instructions" {
+		t.Fatalf("conflicting %s changed: content=%q err=%v", ClaudeName, got, readErr)
+	}
+	if _, manifestErr := os.Stat(filepath.Join(spacePath, ManifestName)); !os.IsNotExist(manifestErr) {
+		t.Fatalf("conflicting %s still wrote a manifest: %v", ClaudeName, manifestErr)
+	}
+}
+
+func TestAddRepoClaudeConflictDoesNotMutate(t *testing.T) {
+	svc, fg, cfg := testService(t)
+	spacePath := filepath.Join(cfg.AgentWorkDir, "legacy-claude")
+	if err := os.MkdirAll(spacePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := Manifest{ID: "legacy-claude", CreatedAt: svc.now(), Repos: []RepoManifest{}}
+	if err := SaveManifest(spacePath, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(spacePath, ClaudeName), []byte("legacy"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := svc.AddRepo(context.Background(), AddOptions{SpaceID: "legacy-claude", RepoName: "repo-a", Mode: ModeEdit})
+	if err == nil || !strings.Contains(err.Error(), "is not a symlink") {
+		t.Fatalf("AddRepo conflict error = %v", err)
+	}
+	if len(fg.calls) != 0 {
+		t.Fatalf("AddRepo mutated Git before CLAUDE conflict: %v", fg.calls)
+	}
+	got, err := LoadManifest(spacePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Repos) != 0 {
+		t.Fatalf("AddRepo mutated manifest before CLAUDE conflict: %#v", got.Repos)
+	}
+}
+
+func TestSyncRefreshesRepositoryInstructionLinks(t *testing.T) {
+	svc, _, cfg := testService(t)
+	if err := svc.Create(context.Background(), CreateOptions{ID: "sync-docs", References: []RepoSpec{{Name: "repo-b"}}}); err != nil {
+		t.Fatal(err)
+	}
+	spacePath := filepath.Join(cfg.AgentWorkDir, "sync-docs")
+	nested := filepath.Join(spacePath, "references", "repo-b", AgentsName)
+	if err := os.WriteFile(nested, []byte("new instructions"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Sync(context.Background(), SyncOptions{SpaceID: "sync-docs", ReferencesOnly: true}); err != nil {
+		t.Fatal(err)
+	}
+	rootAgents, err := os.ReadFile(filepath.Join(spacePath, AgentsName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(rootAgents), "references/repo-b/AGENTS.md") {
+		t.Fatalf("sync did not add nested instruction link:\n%s", rootAgents)
+	}
+	if err := os.Remove(nested); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Sync(context.Background(), SyncOptions{SpaceID: "sync-docs", ReferencesOnly: true}); err != nil {
+		t.Fatal(err)
+	}
+	rootAgents, err = os.ReadFile(filepath.Join(spacePath, AgentsName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(rootAgents), "references/repo-b/AGENTS.md") {
+		t.Fatalf("sync left stale nested instruction link:\n%s", rootAgents)
+	}
+}
+
 func TestCreateAllowsSameRepoAsEditAndReference(t *testing.T) {
 	svc, _, cfg := testService(t)
 
@@ -377,6 +529,7 @@ func TestCreateDryRunPrintsPlanWithoutMutating(t *testing.T) {
 	got := out.String()
 	for _, want := range []string{
 		"dry-run: create space directory",
+		"dry-run: link " + filepath.Join(cfg.AgentWorkDir, "dry-1", ClaudeName) + " -> " + AgentsName,
 		"dry-run: copy spec",
 		"dry-run: fetch " + filepath.Join(cfg.BareReposDir, "repo-a.git"),
 		"dry-run: add edit worktree stave/dry-1/repo-a from origin/feature",

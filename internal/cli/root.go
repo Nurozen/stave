@@ -24,6 +24,7 @@ import (
 
 type app struct {
 	configPath      string
+	shellChdirFD    int
 	providerFactory agent.ProviderFactory
 	secretStore     agent.SecretStore
 	summonLauncher  summon.Launcher
@@ -39,6 +40,9 @@ func newRootCommand(a *app) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "stave",
 		Short: "Manage agent workspaces backed by shared bare Git repositories",
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			return a.captureShellChdirHandoff()
+		},
 	}
 	// Errors are printed exactly once (by main); usage is only dumped for
 	// flag/arg parse mistakes, not for runtime failures.
@@ -50,6 +54,8 @@ func newRootCommand(a *app) *cobra.Command {
 	cmd.PersistentFlags().StringVar(&a.configPath, "config", "", "config file path (default ~/.config/stave/config.yaml)")
 	cmd.AddCommand(
 		a.setupCommand(),
+		a.inscribeCommand(),
+		a.shellInitCommand(),
 		a.reposCommand(),
 		a.spaceCommand(),
 		a.memoryCommand(),
@@ -492,8 +498,12 @@ func (a *app) createCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "create <space-id>",
 		Short: "Create a workspace and add edit/reference repos in one command",
-		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			positionals, agentArgs, err := parsePassthroughArgs(cmd, args, 1, 1, func() bool { return summonName != "" })
+			if err != nil {
+				return err
+			}
+			spaceID := positionals[0]
 			editSpecs, err := parseRepoSpecs(edits)
 			if err != nil {
 				return err
@@ -507,7 +517,7 @@ func (a *app) createCommand() *cobra.Command {
 				return err
 			}
 			if err := svc.Create(cmd.Context(), space.CreateOptions{
-				ID:         args[0],
+				ID:         spaceID,
 				Kind:       kind,
 				SpecPath:   spec,
 				Edits:      editSpecs,
@@ -518,12 +528,18 @@ func (a *app) createCommand() *cobra.Command {
 				return err
 			}
 			if summonName == "" {
-				return nil
+				if dryRun {
+					return nil
+				}
+				return a.requestShellChdir(svc.SpacePath(spaceID))
 			}
 			if dryRun {
-				return a.printPlannedSummon(cmd, svc.Config, args[0], summonName, spec)
+				return a.printPlannedSummon(cmd, svc.Config, spaceID, summonName, spec, agentArgs)
 			}
-			return a.runSummon(cmd, svc.Config, args[0], summonName, "", false)
+			if err := a.requestShellChdir(svc.SpacePath(spaceID)); err != nil {
+				return err
+			}
+			return a.runSummon(cmd, svc.Config, spaceID, summonName, "", agentArgs, false)
 		},
 	}
 	cmd.Flags().StringVarP(&kind, "kind", "k", "", "space kind, such as ticket, spike, or audit")
@@ -533,6 +549,7 @@ func (a *app) createCommand() *cobra.Command {
 	cmd.Flags().StringArrayVar(&memories, "memory", nil, "attach memory: [provider:]<spec>; '.' = fresh task store (repeatable)")
 	cmd.Flags().StringVar(&summonName, "summon", "", "launch a summoner after creation (codex, claude, or cursor)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print operations without changing state")
+	cmd.Flags().SetInterspersed(false)
 	return cmd
 }
 
@@ -540,20 +557,24 @@ func (a *app) summonCommand() *cobra.Command {
 	var summoner, prompt string
 	var printCommand bool
 	cmd := &cobra.Command{
-		Use:   "summon <space-id>",
+		Use:   "summon <space-id> [agent-flags...]",
 		Short: "Launch an interactive agent in a Stave space",
-		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			positionals, agentArgs, err := parsePassthroughArgs(cmd, args, 1, 1, func() bool { return true })
+			if err != nil {
+				return err
+			}
 			cfg, _, err := a.loadConfig()
 			if err != nil {
 				return err
 			}
-			return a.runSummon(cmd, *cfg, args[0], summoner, prompt, printCommand)
+			return a.runSummon(cmd, *cfg, positionals[0], summoner, prompt, agentArgs, printCommand)
 		},
 	}
 	cmd.Flags().StringVar(&summoner, "with", "", "summoner to launch (codex, claude, or cursor; defaults to config)")
 	cmd.Flags().StringVar(&prompt, "prompt", "", "override the launch prompt (e.g. a skill invocation like \"/pr-teach\")")
 	cmd.Flags().BoolVar(&printCommand, "print-command", false, "print the launch command instead of running it")
+	cmd.Flags().SetInterspersed(false)
 	return cmd
 }
 
@@ -1886,22 +1907,22 @@ func splitPortalExecArgs(args []string, argsLenAtDash int) (string, string, []st
 	return head[0], portalID, argv, nil
 }
 
-func (a *app) runSummon(cmd *cobra.Command, cfg config.Config, spaceID string, summoner string, prompt string, printCommand bool) error {
+func (a *app) runSummon(cmd *cobra.Command, cfg config.Config, spaceID string, summoner string, prompt string, agentArgs []string, printCommand bool) error {
 	svc := summon.NewService(cfg, a.effectiveSummonLauncher(), cmd.OutOrStdout())
 	svc.Interactive = a.commandIsTerminal(cmd)
 	if !printCommand && !svc.Interactive {
 		fmt.Fprintln(cmd.ErrOrStderr(), "Non-interactive terminal detected; printing summon command instead of launching.")
 	}
-	return svc.Summon(cmd.Context(), summon.Options{SpaceID: spaceID, Summoner: summoner, Prompt: prompt, PrintCommand: printCommand})
+	return svc.Summon(cmd.Context(), summon.Options{SpaceID: spaceID, Summoner: summoner, Prompt: prompt, AgentArgs: agentArgs, PrintCommand: printCommand})
 }
 
-func (a *app) printPlannedSummon(cmd *cobra.Command, cfg config.Config, spaceID string, summoner string, specPath string) error {
+func (a *app) printPlannedSummon(cmd *cobra.Command, cfg config.Config, spaceID string, summoner string, specPath string, agentArgs []string) error {
 	spacePath := filepath.Join(cfg.AgentWorkDir, spaceID)
 	plannedSpec := ""
 	if specPath != "" {
 		plannedSpec = "spec"
 	}
-	invocation, err := summon.BuildInvocation(cfg, spacePath, summon.ResolveName(cfg, summoner), summon.Prompt(spacePath, plannedSpec))
+	invocation, err := summon.BuildInvocation(cfg, spacePath, summon.ResolveName(cfg, summoner), summon.Prompt(spacePath, plannedSpec), agentArgs...)
 	if err != nil {
 		return err
 	}

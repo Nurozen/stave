@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -22,6 +24,9 @@ import (
 func TestCLIHelpCommands(t *testing.T) {
 	for _, args := range [][]string{
 		{"--help"},
+		{"inscribe", "--help"},
+		{"inscribe", "shell", "--help"},
+		{"shell-init", "--help"},
 		{"repos", "--help"},
 		{"space", "--help"},
 		{"space", "create", "--help"},
@@ -57,6 +62,7 @@ func TestCLIHelpCommands(t *testing.T) {
 		{"portal", "destroy", "--help"},
 		{"agent", "--help"},
 		{"summon", "--help"},
+		{"space", "create", "example", "--help"},
 	} {
 		cmd := NewRootCommand()
 		cmd.SetArgs(args)
@@ -154,6 +160,18 @@ func TestCLISummonPrintCommand(t *testing.T) {
 
 	out := runCLI(t, "summon", "ex-1234", "--with", "codex", "--print-command")
 	if !strings.Contains(out, filepath.Join(home, "stave", "agent-work", "ex-1234")) || !strings.Contains(out, "codex --cd") {
+		t.Fatalf("summon output = %s", out)
+	}
+}
+
+func TestCLISummonForwardsAgentFlags(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	runCLI(t, "setup")
+	runCLI(t, "space", "init", "ex-flags")
+
+	out := runCLI(t, "summon", "ex-flags", "--with", "codex", "--yolo", "--print-command")
+	if !strings.Contains(out, "codex --cd") || !strings.Contains(out, "--yolo") {
 		t.Fatalf("summon output = %s", out)
 	}
 }
@@ -721,6 +739,69 @@ func TestCLICreateSummonLaunchesAfterCreate(t *testing.T) {
 	}
 }
 
+func TestCLICreateSummonForwardsAgentFlags(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	runCLI(t, "setup")
+	launcher := &fakeSummonLauncher{}
+	application := &app{summonLauncher: launcher, isTerminal: func(cmd *cobra.Command) bool { return true }}
+	runCLIWithApp(t, application,
+		"space", "create", "ex-flags",
+		"--summon", "codex",
+		"--yolo", "--model", "gpt-5.6",
+		"--", "--config", "agent.toml",
+	)
+
+	spacePath := filepath.Join(home, "stave", "agent-work", "ex-flags")
+	wantPrefix := []string{"--cd", spacePath, "--yolo", "--model", "gpt-5.6", "--config", "agent.toml"}
+	if !launcher.called || len(launcher.invocation.Args) != len(wantPrefix)+1 {
+		t.Fatalf("launcher invocation = %#v", launcher.invocation)
+	}
+	for i, want := range wantPrefix {
+		if launcher.invocation.Args[i] != want {
+			t.Fatalf("launcher args[%d] = %q, want %q; all args=%#v", i, launcher.invocation.Args[i], want, launcher.invocation.Args)
+		}
+	}
+}
+
+func TestCLICreateSummonFlagsDryRunAndTypoGuard(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	runCLI(t, "setup")
+
+	out := runCLI(t, "space", "create", "dry-flags", "--summon", "codex", "--yolo", "--dry-run")
+	if !strings.Contains(out, "codex --cd") || !strings.Contains(out, "--yolo") {
+		t.Fatalf("dry-run summon output = %s", out)
+	}
+	if _, err := os.Stat(filepath.Join(home, "stave", "agent-work", "dry-flags")); !os.IsNotExist(err) {
+		t.Fatalf("dry-run created space: %v", err)
+	}
+	if _, err := runCLIError(t, nil, "space", "create", "typo", "--yolo"); err == nil || !strings.Contains(err.Error(), "unknown flag: --yolo") {
+		t.Fatalf("unknown flag without --summon error = %v", err)
+	}
+}
+
+func TestCLICreateRequestsShellDirectoryEntry(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	runCLI(t, "setup")
+
+	want := filepath.Join(home, "stave", "agent-work", "enter-me")
+	got := captureShellChdir(t, func() {
+		runCLI(t, "space", "create", "enter-me")
+	})
+	if got != want {
+		t.Fatalf("shell chdir request = %q, want %q", got, want)
+	}
+
+	dry := captureShellChdir(t, func() {
+		runCLI(t, "space", "create", "dry-enter", "--dry-run")
+	})
+	if dry != "" {
+		t.Fatalf("dry-run shell chdir request = %q, want empty", dry)
+	}
+}
+
 func TestCLICreateSummonFailureKeepsSpace(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -743,6 +824,25 @@ func TestCLICreateSummonFailureKeepsSpace(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(home, "stave", "agent-work", "ex-1234", space.ManifestName)); err != nil {
 		t.Fatalf("space was not kept: %v", err)
+	}
+}
+
+func TestCLICreateSummonFailureStillRequestsShellDirectory(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	runCLI(t, "setup")
+	launcher := &fakeSummonLauncher{err: errors.New("launch failed")}
+	application := &app{summonLauncher: launcher, isTerminal: func(cmd *cobra.Command) bool { return true }}
+	var runErr error
+	requestedDir := captureShellChdir(t, func() {
+		_, runErr = runCLIError(t, application, "space", "create", "failed-summon", "--summon", "codex")
+	})
+	if runErr == nil || !strings.Contains(runErr.Error(), "launch codex") {
+		t.Fatalf("summon failure error = %v", runErr)
+	}
+	want := filepath.Join(home, "stave", "agent-work", "failed-summon")
+	if requestedDir != want {
+		t.Fatalf("failed summon shell chdir request = %q, want %q", requestedDir, want)
 	}
 }
 
@@ -1465,6 +1565,8 @@ type fakeSecretStore struct {
 type fakeSummonLauncher struct {
 	called     bool
 	invocation summon.Invocation
+	chdirEnv   string
+	err        error
 }
 
 type fakePortalRunner struct {
@@ -1483,7 +1585,8 @@ type sequencePortalRunner struct {
 func (f *fakeSummonLauncher) Launch(ctx context.Context, invocation summon.Invocation) error {
 	f.called = true
 	f.invocation = invocation
-	return nil
+	f.chdirEnv = os.Getenv(shellChdirFDEnv)
+	return f.err
 }
 
 func (f *fakePortalRunner) LookPath(name string) (string, error) {
@@ -1581,6 +1684,27 @@ func runCLIError(t *testing.T, application *app, args ...string) (string, error)
 	cmd.SetErr(&out)
 	err := cmd.Execute()
 	return out.String(), err
+}
+
+func captureShellChdir(t *testing.T, run func()) string {
+	t.Helper()
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(shellChdirFDEnv, strconv.Itoa(int(writer.Fd())))
+	run()
+	// requestShellChdir owns and closes the inherited descriptor when it
+	// writes. Close also covers commands such as --dry-run that emit nothing.
+	_ = writer.Close()
+	data, err := io.ReadAll(reader)
+	if closeErr := reader.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.TrimSpace(string(data))
 }
 
 func createGitRepo(t *testing.T, name string) string {

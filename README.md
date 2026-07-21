@@ -24,11 +24,40 @@ Coding agents work best in a dedicated directory with clear rules: what is edita
 go install github.com/Nurozen/stave/cmd/stave@latest
 ```
 
+To let `stave space create` and `stave review` enter the new space in your
+current shell, inscribe the matching shell integration once:
+
+```bash
+stave inscribe shell --zsh  # or --bash
+```
+
+Start a new shell or source the updated startup file to activate it. Zsh uses
+`${ZDOTDIR:-$HOME}/.zshrc`; Bash uses `$HOME/.bashrc`. Bash login-shell setups
+must source `.bashrc`, or you can select the file explicitly with `--rc`.
+
+If your dotfiles are managed elsewhere, use the low-level, non-mutating form
+in the appropriate startup file instead:
+
+```bash
+eval "$(command stave shell-init zsh)"  # use bash when appropriate
+```
+
+The wrapper is necessary because an executable cannot change its parent
+shell's directory. Other Stave commands behave exactly as before. Re-running
+`stave inscribe` safely updates its marked block without duplicating it.
+
+On Windows, space creation requires permission to create the generated
+`CLAUDE.md -> AGENTS.md` symlink; enable Developer Mode or run with equivalent
+administrator symlink privileges.
+
 ## Command tree
 
 ```text
 stave
 ├── setup
+├── inscribe
+│   └── shell --zsh|--bash
+├── shell-init bash|zsh
 ├── completion
 ├── agent
 │   ├── configure
@@ -102,6 +131,9 @@ stave space status ticket-482
 stave space sync ticket-482
 ```
 
+After the inscribed shell integration is loaded, the create command leaves the
+current shell at `~/stave/agent-work/ticket-482/` after it completes.
+
 ## Reviewing a pull request
 
 `stave review` collapses the review setup into one command: it registers the
@@ -122,6 +154,10 @@ stave review owner/repo#123 --summon claude
 # Pull in sibling repos as read-only context
 stave review owner/repo#123 -r other-repo --summon claude
 ```
+
+After the inscribed shell integration is loaded, `stave review` enters the
+review space root after setup (and after the summoned session exits when
+`--summon` is used).
 
 Every review space ships with an embedded `pr-teach` skill (installed at
 `.claude/skills/pr-teach/` inside the space), a guided review-comprehension
@@ -193,8 +229,9 @@ A typical space:
 agent-work/ticket-482/
 ├── .stave.yaml          # manifest (repos, modes, branches, refs)
 ├── AGENTS.md            # instructions for agents (generated)
+├── CLAUDE.md -> AGENTS.md
 ├── spec/                # optional spec file or tree (if --spec was used)
-├── api/                 # edit worktree
+├── api/                 # edit worktree; root AGENTS.md links api/AGENTS.md when present
 ├── web/                 # edit worktree
 └── references/
     └── api/             # detached reference worktree
@@ -209,6 +246,27 @@ Global flag on all commands: `--config <path>` (default `~/.config/stave/config.
 | Command | Description |
 |---------|-------------|
 | `stave setup` | Create root directories and write config |
+
+### `stave inscribe`
+
+| Command | Description |
+|---------|-------------|
+| `stave inscribe shell --zsh` | Add or update Stave's managed block in `${ZDOTDIR:-$HOME}/.zshrc` |
+| `stave inscribe shell --bash` | Add or update Stave's managed block in `$HOME/.bashrc` |
+
+Shell inscription accepts `--rc <path>` to target a different startup file and
+`--dry-run` to inspect the target without changing it. Existing file content,
+permissions, and symlinks are preserved. An exact legacy `shell-init` line is
+migrated into the managed block.
+
+### `stave shell-init`
+
+| Command | Description |
+|---------|-------------|
+| `stave shell-init zsh` | Print the zsh wrapper that enables automatic space entry |
+| `stave shell-init bash` | Print the bash wrapper that enables automatic space entry |
+
+`shell-init` only prints integration code; it does not edit a startup file.
 
 ### `stave repos`
 
@@ -295,6 +353,12 @@ Space flags:
 
 When `--spec` points at a file, it is copied under `spec/` with its original basename. When it points at a directory, the directory contents are copied into `spec/`. The manifest records `specPath: spec`.
 
+When `--summon` is present, unrecognized trailing flags are passed verbatim to
+the selected agent before its launch prompt. For example,
+`stave space create ticket-482 --summon codex --yolo` launches Codex in yolo
+mode. Stave's own flags remain Stave-owned; use `--` before a colliding agent
+flag, such as `--summon codex -- --config agent.toml`.
+
 ### `stave summon`
 
 | Command | Description |
@@ -309,6 +373,9 @@ When `--spec` points at a file, it is copied under `spec/` with its original bas
 Summoned agents always launch from `agent-work/<space-id>`, not from an individual repo. That gives them the manifest, generated `AGENTS.md`, copied specs, editable top-level repos, and `references/` context in one working directory.
 
 `--print-command` prints the launch command instead of running it. Non-interactive terminals also print instead of launching. `cursor` maps to the Cursor Agent CLI (`cursor-agent`), not the Cursor GUI editor.
+
+Agent flags can also follow the direct command, for example
+`stave summon ticket-482 --with codex --yolo`.
 
 ### `stave portal`
 

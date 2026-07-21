@@ -3,6 +3,7 @@ package portal
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -384,12 +385,27 @@ func reconstructCommands(portal Portal, opts SyncOptions) ([]Command, error) {
 	if !isRemoteDriver(portal.Driver) {
 		return nil, fmt.Errorf("reconstruct mode requires ssh or ec2 attach portal")
 	}
-	metadata := []string{".stave.yaml", ManifestName, "AGENTS.md", "spec/"}
+	if strings.TrimSpace(portal.Workspace.LocalPath) == "" {
+		return nil, fmt.Errorf("reconstruct mode requires a local space path")
+	}
+	metadata := []string{".stave.yaml", ManifestName, space.AgentsName}
+	for _, optional := range []string{space.ClaudeName, "spec/"} {
+		_, err := os.Lstat(filepath.Join(portal.Workspace.LocalPath, optional))
+		if err == nil {
+			metadata = append(metadata, optional)
+			continue
+		}
+		if !os.IsNotExist(err) {
+			return nil, err
+		}
+	}
 	args := baseRsyncArgs(opts)
 	args = append(args, "--relative")
 	args = append(args, metadata...)
 	args = append(args, remoteEndpoint(portal)+"/")
-	return []Command{command("rsync", args...)}, nil
+	cmd := command("rsync", args...)
+	cmd.Dir = portal.Workspace.LocalPath
+	return []Command{cmd}, nil
 }
 
 func rsyncCommand(portal Portal, opts SyncOptions, source, dest string) Command {

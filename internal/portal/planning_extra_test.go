@@ -95,6 +95,9 @@ func TestReconstructDirtySyncAndPresetBranches(t *testing.T) {
 	if !strings.Contains(reconstruct.EquivalentCommands()[0], "--relative") || !strings.Contains(reconstruct.Diagnostics[0].Code, "reconstruct") {
 		t.Fatalf("reconstruct = %#v commands=%v", reconstruct, reconstruct.EquivalentCommands())
 	}
+	if reconstruct.Commands[0].Dir != filepath.Join(cfg.AgentWorkDir, "ex-1") {
+		t.Fatalf("reconstruct command dir = %q", reconstruct.Commands[0].Dir)
+	}
 	manifest, err := LoadManifest(filepath.Join(cfg.AgentWorkDir, "ex-1"))
 	if err != nil {
 		t.Fatal(err)
