@@ -1,6 +1,14 @@
 # Stave
 
+<p align="center">
+  <img src="docs/images/stave-summons-worktree-hero-concept-v4.png" alt="An arcane staff summoning a tree of isolated workspaces" width="100%">
+</p>
+
 CLI for managing **agent workspaces** backed by shared bare Git repositories. Register upstream repos once, then spin up isolated **spaces** with editable worktrees and read-only reference checkouts—each tracked in a manifest and documented for tooling via `AGENTS.md`.
+
+<p align="center">
+  <img src="docs/images/stave-guild-seal-staff-mark-concept-v5.png" alt="The Stave guild seal" width="240">
+</p>
 
 ## Why Stave
 
@@ -13,6 +21,17 @@ Coding agents work best in a dedicated directory with clear rules: what is edita
 - **Lifecycle** — sync, status (dirty / ahead-behind), archive, destroy.
 - **Memory** — optional [ContextMarmot](https://github.com/Nurozen/context-marmot) dens
   attached per space (`stave memory`); never writes in-space `.marmot/` trees.
+
+## How Stave works
+
+<p align="center">
+  <img src="docs/images/stave-system-staff-rooted-concept-v2.png" alt="A shared rooted repository fanning out into isolated workspaces, portals, and summoned agents" width="100%">
+</p>
+
+Stave treats each registered bare repository as a shared root. A space fans that
+root into isolated editable worktrees and detached reference worktrees. Portals
+can carry the prepared workspace into local containers or remote hosts before a
+configured coding agent is summoned into it.
 
 ## Install
 
