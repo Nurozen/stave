@@ -15,7 +15,7 @@
     },
     {
       "ref": "local-checkout",
-      "mode": "link",
+      "mode": "live",
       "resolved_via": "checkout-vault"
     },
     {

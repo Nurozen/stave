@@ -92,6 +92,37 @@ func TestReviewSpaceDefaultsToEmbeddedSkill(t *testing.T) {
 	}
 }
 
+func TestReviewSpaceInvocationIncludesMemoryBulletForNonClaude(t *testing.T) {
+	cfg := testConfig(t)
+	spacePath := filepath.Join(cfg.AgentWorkDir, "rev-mem")
+	if err := os.MkdirAll(spacePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := space.SaveManifest(spacePath, space.Manifest{
+		ID:        "rev-mem",
+		Kind:      "review",
+		CreatedAt: time.Now().UTC(),
+		Memories:  []space.MemoryManifest{{Name: "default", Provider: "marmot", ID: "rev-den", Owned: true}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	svc := NewService(cfg, &fakeLauncher{}, nil)
+
+	// Non-Claude summoners take defaultPrompt → PromptForKindWithMemories,
+	// which must carry both the review stance and the memory bullet.
+	codex, err := svc.Invocation(Options{SpaceID: "rev-mem", Summoner: Codex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(codex.Args, " ")
+	if !strings.Contains(joined, "context-marmot MCP tools (den: rev-den)") {
+		t.Fatalf("codex review invocation missing memory bullet: %#v", codex.Args)
+	}
+	if !strings.Contains(joined, "review space") {
+		t.Fatalf("codex review invocation missing review stance: %#v", codex.Args)
+	}
+}
+
 func TestBuildInvocation(t *testing.T) {
 	cfg := testConfig(t)
 	spacePath := filepath.Join(cfg.AgentWorkDir, "ex-1")
@@ -294,4 +325,51 @@ func testConfig(t *testing.T) config.Config {
 		t.Fatal(err)
 	}
 	return cfg
+}
+
+// F13: the Claude review-skill launch prompt must carry the memory bullets
+// (after a blank line, as skill arguments) — review agents are otherwise
+// never told memory exists. Without memories the bare skill invocation stays.
+func TestReviewSkillPromptIncludesMemoryBullets(t *testing.T) {
+	cfg := testConfig(t)
+	spacePath := filepath.Join(cfg.AgentWorkDir, "rev-skill-mem")
+	if err := os.MkdirAll(spacePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := space.SaveManifest(spacePath, space.Manifest{
+		ID:        "rev-skill-mem",
+		Kind:      "review",
+		CreatedAt: time.Now().UTC(),
+		Memories: []space.MemoryManifest{
+			{Name: "default", Provider: "marmot", ID: "den-a", Owned: true},
+			{Name: "extra", Provider: "marmot", ID: "den-b", Owned: false},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	skillDir := filepath.Join(spacePath, ".claude", "skills", ReviewSkillName)
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("skill"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	svc := NewService(cfg, &fakeLauncher{}, nil)
+
+	claude, err := svc.Invocation(Options{SpaceID: "rev-skill-mem", Summoner: Claude})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claude.Args) != 1 {
+		t.Fatalf("claude args = %#v", claude.Args)
+	}
+	want := "/" + ReviewSkillName + "\n\n" +
+		"- Persistent memory is available via the context-marmot MCP tools (den: den-a).\n" +
+		"- Persistent memory is available via the context-marmot MCP tools (den: den-b)."
+	if claude.Args[0] != want {
+		t.Fatalf("prompt = %q, want %q", claude.Args[0], want)
+	}
+	if !strings.HasPrefix(claude.Args[0], "/"+ReviewSkillName+"\n") {
+		t.Fatalf("prompt must still start with the skill invocation: %q", claude.Args[0])
+	}
 }

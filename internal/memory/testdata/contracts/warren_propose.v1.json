@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "warren_id": "acme-warren",
+  "project_id": "billing-service",
+  "branch": "marmot/propose/billing-service-20260721-101500",
+  "commit": "9fceb02d0ae598e95dc970b74767f19372d61af8",
+  "committed": true,
+  "nothing_to_propose": false,
+  "push_command": "git -C /srv/checkouts/acme-warren push -u origin marmot/propose/billing-service-20260721-101500",
+  "warnings": []
+}

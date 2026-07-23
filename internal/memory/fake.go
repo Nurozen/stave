@@ -11,12 +11,13 @@ import (
 type Fake struct {
 	Mu sync.Mutex
 
-	ProbeFn   func(context.Context) (ProbeResult, error)
-	AttachFn  func(context.Context, AttachOptions) (AttachResult, error)
-	StatusFn  func(context.Context, StatusOptions) (StatusResult, error)
-	SyncFn    func(context.Context, SyncOptions) (SyncResult, error)
-	ProposeFn func(context.Context, ProposeOptions) (ProposeResult, error)
-	DetachFn  func(context.Context, DetachOptions) (DetachResult, error)
+	ProbeFn         func(context.Context) (ProbeResult, error)
+	AttachFn        func(context.Context, AttachOptions) (AttachResult, error)
+	StatusFn        func(context.Context, StatusOptions) (StatusResult, error)
+	SyncFn          func(context.Context, SyncOptions) (SyncResult, error)
+	ProposeFn       func(context.Context, ProposeOptions) (ProposeResult, error)
+	DetachFn        func(context.Context, DetachOptions) (DetachResult, error)
+	LinkReferenceFn func(context.Context, LinkReferenceOptions) (LinkReferenceResult, error)
 
 	Calls []string
 
@@ -59,7 +60,7 @@ func (f *Fake) Attach(ctx context.Context, opts AttachOptions) (AttachResult, er
 		name = "default"
 	}
 	if opts.DryRun {
-		line := FormatCommand("marmot", DenCreateArgs(id, opts.SpacePath, "task", opts.EditRefs, opts.LinkRefs, opts.ReferenceSpecs))
+		line := FormatCommand("marmot", DenCreateArgs(id, opts.SpacePath, "task", opts.EditRefs, opts.LinkRefs, opts.ReferenceSpecs, opts.Opts, true))
 		printf(opts.Out, "dry-run: %s\n", line)
 		return AttachResult{
 			Provider:       "fake",
@@ -97,6 +98,25 @@ func (f *Fake) Propose(ctx context.Context, opts ProposeOptions) (ProposeResult,
 		return f.ProposeFn(ctx, opts)
 	}
 	return ProposeResult{Summary: "fake propose"}, nil
+}
+
+// LinkReference makes Fake a ReferenceLinker (S4 space add parity tests).
+func (f *Fake) LinkReference(ctx context.Context, opts LinkReferenceOptions) (LinkReferenceResult, error) {
+	f.record("link-reference", opts.StoreID, opts.Spec.Name, opts.Spec.URL, fmt.Sprintf("dry=%v", opts.DryRun))
+	if f.LinkReferenceFn != nil {
+		return f.LinkReferenceFn(ctx, opts)
+	}
+	target := "w/" + opts.Spec.Name
+	if opts.Spec.MarmotVault != "" && opts.Spec.MarmotVault != "off" {
+		target = opts.Spec.MarmotVault
+	}
+	if opts.DryRun {
+		line := FormatCommand("marmot", DenLinkArgs(opts.StoreID, target, false))
+		printf(opts.Out, "dry-run: %s\n", line)
+		return LinkReferenceResult{DryRunCommands: []string{line}}, nil
+	}
+	printf(opts.Out, "reference %s → %s (warren-url)\n", firstNonEmpty(opts.Spec.Name, opts.Spec.URL), target)
+	return LinkReferenceResult{Linked: true, Link: AttachLink{Ref: target, Mode: "link", ResolvedVia: "warren-url"}}, nil
 }
 
 func (f *Fake) Detach(ctx context.Context, opts DetachOptions) (DetachResult, error) {

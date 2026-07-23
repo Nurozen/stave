@@ -13,17 +13,18 @@
       "pinned_commit": null,
       "ahead": 4,
       "behind": 0,
-      "pending_edits": 2,
-      "state": "ok"
+      "pending_edits": 5,
+      "state": "unpushed"
     },
     {
       "ref": "platform-warren/billing",
       "mode": "link",
-      "pinned_commit": "abc1234",
+      "pinned_commit": "abc1234def56789000112233445566778899aabb",
       "ahead": 0,
       "behind": 3,
       "pending_edits": 0,
-      "state": "ok"
+      "state": "stale",
+      "source_commit": "77aa88bb99cc00dd11ee22ff3344556677889900"
     },
     {
       "ref": "auth-service-den",

@@ -220,6 +220,133 @@ func TestCLIReviewWithReferenceRepo(t *testing.T) {
 	}
 }
 
+// writeStubMarmot installs a shell script standing in for the marmot binary:
+// den create answers with a schema-1 envelope echoing the requested den id.
+func writeStubMarmot(t *testing.T, home string) string {
+	t.Helper()
+	binDir := filepath.Join(home, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stub := filepath.Join(binDir, "marmot")
+	script := `#!/bin/sh
+if [ "$1" = "den" ] && [ "$2" = "create" ]; then
+  printf '{"schema":1,"den_id":"%s","pointer_written":false}\n' "$3"
+  exit 0
+fi
+printf '{"schema":1}\n'
+`
+	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return stub
+}
+
+// rewriteMemoryConfig edits the memory block `stave setup` wrote to config.yaml.
+func rewriteMemoryConfig(t *testing.T, home string, old, new string) {
+	t.Helper()
+	cfgPath := filepath.Join(home, ".config", "stave", "config.yaml")
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replaced := strings.Replace(string(data), old, new, 1)
+	if replaced == string(data) {
+		t.Fatalf("config.yaml missing %q:\n%s", old, data)
+	}
+	if err := os.WriteFile(cfgPath, []byte(replaced), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCLIReviewWithMemoryFlag(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	src := createGitRepo(t, "repo-a")
+	prSHA := gitOutput(t, src, "rev-parse", "main")
+	runGit(t, src, "update-ref", "refs/pull/7/head", prSHA)
+
+	runCLI(t, "setup")
+	runCLI(t, "repos", "add", "repo-a", src)
+	stub := writeStubMarmot(t, home)
+	rewriteMemoryConfig(t, home, "binary: marmot", "binary: "+stub)
+
+	out := runCLI(t, "review", "repo-a#7", "--memory", ".")
+	if !strings.Contains(out, "review space review-repo-a-7 is ready") {
+		t.Fatalf("review output missing ready line:\n%s", out)
+	}
+	if !strings.Contains(out, "attached memory default") {
+		t.Fatalf("review output missing attach line:\n%s", out)
+	}
+
+	spacePath := filepath.Join(home, "stave", "agent-work", "review-repo-a-7")
+	manifest, err := space.LoadManifest(spacePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Memories) != 1 {
+		t.Fatalf("memories = %#v", manifest.Memories)
+	}
+	mem := manifest.Memories[0]
+	if mem.Name != "default" || mem.Provider != "marmot" || mem.ID != "review-repo-a-7" || !mem.Owned {
+		t.Fatalf("attachment = %#v", mem)
+	}
+
+	// Attach rewrote AGENTS.md so the /pr-teach Claude path (which bypasses
+	// the memory-aware prompt) still surfaces the den to the agent.
+	agents, err := os.ReadFile(filepath.Join(spacePath, "AGENTS.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(agents), "context-marmot MCP tools (den: review-repo-a-7)") {
+		t.Fatalf("AGENTS.md missing memory line:\n%s", agents)
+	}
+
+	// space status renders a compact memory row.
+	status := runCLI(t, "space", "status", "review-repo-a-7")
+	if !strings.Contains(status, "[memory] default marmot den=review-repo-a-7 owned") {
+		t.Fatalf("status missing memory row:\n%s", status)
+	}
+
+	// Non-Claude summoners get the memory bullet in the generated prompt.
+	summonOut := runCLI(t, "summon", "review-repo-a-7", "--with", "codex", "--print-command")
+	if !strings.Contains(summonOut, "context-marmot MCP tools (den: review-repo-a-7)") {
+		t.Fatalf("codex summon command missing memory bullet:\n%s", summonOut)
+	}
+}
+
+func TestCLIReviewAmbientMemoryDegrades(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	src := createGitRepo(t, "repo-a")
+	prSHA := gitOutput(t, src, "rev-parse", "main")
+	runGit(t, src, "update-ref", "refs/pull/7/head", prSHA)
+
+	runCLI(t, "setup")
+	runCLI(t, "repos", "add", "repo-a", src)
+	rewriteMemoryConfig(t, home, "binary: marmot", "default: true\n    binary: "+filepath.Join(home, "no-such-marmot"))
+
+	out := runCLI(t, "review", "repo-a#7")
+	if !strings.Contains(out, "review space review-repo-a-7 is ready") {
+		t.Fatalf("ambient degrade must not fail review:\n%s", out)
+	}
+	if !strings.Contains(out, "notice: ambient memory attach failed") {
+		t.Fatalf("expected ambient degrade notice:\n%s", out)
+	}
+	manifest, err := space.LoadManifest(filepath.Join(home, "stave", "agent-work", "review-repo-a-7"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Memories) != 0 {
+		t.Fatalf("ambient degrade must leave no memories: %#v", manifest.Memories)
+	}
+	if len(manifest.Repos) != 1 {
+		t.Fatalf("space must survive with its repo: %#v", manifest.Repos)
+	}
+}
+
 func TestCLIReviewSpaceCollisionErrors(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

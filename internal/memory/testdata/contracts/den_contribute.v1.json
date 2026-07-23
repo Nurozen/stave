@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "den_id": "demo",
+  "link": {
+    "target": "product-platform/project-a",
+    "mode": "edit",
+    "warren": "product-platform",
+    "project": "project-a"
+  },
+  "branch": "marmot/edit/demo/project-a",
+  "commit": "0123456789abcdef0123456789abcdef01234567",
+  "committed": true,
+  "checkout": "/Users/you/warrens/product-platform",
+  "push_command": "git -C /Users/you/warrens/product-platform push -u origin marmot/edit/demo/project-a",
+  "contributed": {
+    "added": 2,
+    "updated": 1,
+    "superseded": 0,
+    "noop": 3
+  },
+  "warnings": []
+}

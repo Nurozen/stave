@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "warrens": [
+    {
+      "id": "product-platform",
+      "fetched": true,
+      "previous_commit": "0123456789abcdef0123456789abcdef01234567",
+      "pinned_commit": "89abcdef0123456789abcdef0123456789abcdef",
+      "updated": true
+    },
+    {
+      "id": "docs-warren",
+      "fetched": true,
+      "previous_commit": "fedcba9876543210fedcba9876543210fedcba98",
+      "pinned_commit": "fedcba9876543210fedcba9876543210fedcba98",
+      "updated": false
+    },
+    {
+      "id": "ghost-warren",
+      "fetched": false,
+      "previous_commit": "",
+      "pinned_commit": "",
+      "updated": false,
+      "error": "fetch: git --git-dir /home/user/.marmot/warren-cache/ghost-warren.git fetch --all --prune failed with exit code 128: fatal: unable to access remote"
+    }
+  ],
+  "warnings": []
+}

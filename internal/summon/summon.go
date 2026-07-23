@@ -152,10 +152,32 @@ func defaultPrompt(spacePath, specPath, kind, summoner string, memories []space.
 	if kind == "review" && summoner == Claude {
 		skillPath := filepath.Join(spacePath, ".claude", "skills", ReviewSkillName, "SKILL.md")
 		if _, err := os.Stat(skillPath); err == nil {
-			return "/" + ReviewSkillName
+			return reviewSkillPrompt(memories)
 		}
 	}
 	return PromptForKindWithMemories(spacePath, specPath, kind, memories)
+}
+
+// reviewSkillPrompt launches the embedded review skill. When the space has
+// memory attached, the memory bullets ride along after a blank line as skill
+// arguments (slash-command-with-arguments is safe; the skill ignores extra
+// context) — review agents must still learn memory exists.
+func reviewSkillPrompt(memories []space.MemoryManifest) string {
+	if len(memories) == 0 {
+		return "/" + ReviewSkillName
+	}
+	var b strings.Builder
+	b.WriteString("/" + ReviewSkillName + "\n")
+	for _, mem := range memories {
+		b.WriteString("\n")
+		b.WriteString(memoryBullet(mem))
+	}
+	return b.String()
+}
+
+// memoryBullet is the shared memory-attachment line (AGENTS.md sentence).
+func memoryBullet(mem space.MemoryManifest) string {
+	return "- Persistent memory is available via the context-marmot MCP tools (den: " + mem.ID + ")."
 }
 
 // PromptForKind tailors the launch prompt to the space's purpose: a review
@@ -177,9 +199,8 @@ func PromptForKindWithMemories(spacePath string, specPath string, kind string, m
 		b.WriteString(".\n")
 	}
 	for _, mem := range memories {
-		b.WriteString("- Persistent memory is available via the context-marmot MCP tools (den: ")
-		b.WriteString(mem.ID)
-		b.WriteString(").\n")
+		b.WriteString(memoryBullet(mem))
+		b.WriteString("\n")
 	}
 	if kind == "review" {
 		b.WriteString("\nThis is a review space: the worktree is checked out at the change under review and the spec records its context (a pull request's metadata and diff commands). Help the user assess the change — treat the author's description as claims to verify, not facts — and do not modify the code unless the user explicitly asks.")

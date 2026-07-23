@@ -1325,6 +1325,7 @@ func (a *app) addCommand() *cobra.Command {
 	var branch string
 	var noFetch bool
 	var dryRun bool
+	var linkMemory bool
 	cmd := &cobra.Command{
 		Use:   "add <space-id> <repo>",
 		Short: "Add an editable or reference repository worktree to a space",
@@ -1344,14 +1345,15 @@ func (a *app) addCommand() *cobra.Command {
 				return err
 			}
 			return svc.AddRepo(cmd.Context(), space.AddOptions{
-				SpaceID:  args[0],
-				RepoName: args[1],
-				Mode:     mode,
-				Base:     base,
-				Ref:      ref,
-				Branch:   branch,
-				NoFetch:  noFetch,
-				DryRun:   dryRun,
+				SpaceID:    args[0],
+				RepoName:   args[1],
+				Mode:       mode,
+				Base:       base,
+				Ref:        ref,
+				Branch:     branch,
+				NoFetch:    noFetch,
+				DryRun:     dryRun,
+				LinkMemory: linkMemory,
 			})
 		},
 	}
@@ -1361,6 +1363,7 @@ func (a *app) addCommand() *cobra.Command {
 	cmd.Flags().StringVar(&branch, "branch", "", "branch name for editable repos")
 	cmd.Flags().BoolVar(&noFetch, "no-fetch", false, "skip fetching the bare repo before adding the worktree")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print operations without changing state")
+	cmd.Flags().BoolVar(&linkMemory, "link-memory", true, "resolve an added reference repo into a read-only memory link when the space has memory attached")
 	return cmd
 }
 
@@ -1396,7 +1399,14 @@ func (a *app) statusCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			printStatus(cmd.OutOrStdout(), svc.SpacePath(args[0]), status)
+			// S4 skew intelligence: each memory row gains a compact state
+			// suffix (e.g. " (2 unpushed)", " (stale)"); provider failures
+			// degrade to no suffix.
+			memStates := map[string]string{}
+			for _, mem := range status.Manifest.Memories {
+				memStates[mem.Name] = svc.MemoryStateSuffix(cmd.Context(), mem)
+			}
+			printStatus(cmd.OutOrStdout(), svc.SpacePath(args[0]), status, memStates)
 			return nil
 		},
 	}
@@ -1404,19 +1414,35 @@ func (a *app) statusCommand() *cobra.Command {
 
 func (a *app) archiveCommand() *cobra.Command {
 	var force bool
+	var dryRun bool
+	var memoryFate string
 	cmd := &cobra.Command{
 		Use:   "archive <space-id>",
 		Short: "Remove worktrees and preserve space metadata/notes under .archive",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			svc, err := a.service(cmd)
+			fate, err := memory.ParseMemoryFate(memoryFate)
 			if err != nil {
 				return err
 			}
-			return svc.Archive(cmd.Context(), space.ArchiveOptions{SpaceID: args[0], Force: force})
+			if fate == memory.FateDestroy {
+				return fmt.Errorf("--memory destroy is not valid for archive; use 'stave space destroy --memory destroy' to destroy owned memory")
+			}
+			svc, err := a.serviceWithDryRun(cmd, dryRun)
+			if err != nil {
+				return err
+			}
+			return svc.Archive(cmd.Context(), space.ArchiveOptions{
+				SpaceID:    args[0],
+				Force:      force,
+				DryRun:     dryRun,
+				MemoryFate: fate,
+			})
 		},
 	}
 	cmd.Flags().BoolVar(&force, "force", false, "archive even when editable worktrees are dirty")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print operations without changing state")
+	cmd.Flags().StringVar(&memoryFate, "memory", string(memory.FateKeep), "memory fate on archive: keep or contribute (contribute-then-keep; destroy is not allowed)")
 	return cmd
 }
 
@@ -1947,7 +1973,7 @@ func parseRepoSpecs(values []string) ([]space.RepoSpec, error) {
 	return specs, nil
 }
 
-func printStatus(out interface{ Write([]byte) (int, error) }, spacePath string, status space.Status) {
+func printStatus(out interface{ Write([]byte) (int, error) }, spacePath string, status space.Status, memStates map[string]string) {
 	fmt.Fprintf(out, "space %s (%s)\npath: %s\n", status.Manifest.ID, status.Manifest.Kind, spacePath)
 	if status.Manifest.SpecPath != "" {
 		fmt.Fprintf(out, "spec: %s\n", filepath.Join(spacePath, status.Manifest.SpecPath))
@@ -1976,6 +2002,13 @@ func printStatus(out interface{ Write([]byte) (int, error) }, spacePath string, 
 				fmt.Fprintf(out, "  warning: %s\n", repo.ReferenceWarn)
 			}
 		}
+	}
+	for _, mem := range status.Manifest.Memories {
+		owned := ""
+		if mem.Owned {
+			owned = " owned"
+		}
+		fmt.Fprintf(out, "\n[memory] %s %s den=%s%s%s\n", mem.Name, mem.Provider, mem.ID, owned, memStates[mem.Name])
 	}
 }
 

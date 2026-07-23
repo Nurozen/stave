@@ -96,6 +96,7 @@ func (a *app) reviewCommand() *cobra.Command {
 	var summonPrompt string
 	var repoOverride string
 	var references []string
+	var memories []string
 	var noSummon bool
 	cmd := &cobra.Command{
 		Use:   "review <pr> [space-id]",
@@ -135,7 +136,7 @@ The <pr> argument accepts a GitHub PR URL, owner/repo#123, or
 			if err != nil {
 				return err
 			}
-			result, err := a.setUpReviewSpace(cmd, cfg, cfgPath, ref, spaceID, refSpecs)
+			result, err := a.setUpReviewSpace(cmd, cfg, cfgPath, ref, spaceID, refSpecs, memories)
 			if err != nil {
 				return err
 			}
@@ -159,6 +160,7 @@ The <pr> argument accepts a GitHub PR URL, owner/repo#123, or
 	cmd.Flags().StringVar(&summonName, "summon", "", "launch a summoner in the review space (codex, claude, or cursor)")
 	cmd.Flags().StringVar(&summonPrompt, "prompt", "", "launch prompt for --summon (e.g. a skill invocation like \"/pr-teach\")")
 	cmd.Flags().StringArrayVarP(&references, "reference", "r", nil, "registered repo to add as read-only context, optionally repo:ref (repeatable)")
+	cmd.Flags().StringArrayVar(&memories, "memory", nil, "attach memory: [provider:]<spec>; '.' = fresh task store (repeatable)")
 	cmd.Flags().StringVar(&repoOverride, "repo", "", "registered repo name to use instead of resolving from the PR URL")
 	cmd.Flags().BoolVar(&noSummon, "no-summon", false, "never launch a summoner, even if --summon is set")
 	cmd.Flags().SetInterspersed(false)
@@ -173,7 +175,7 @@ type reviewResult struct {
 	SpecFile     string
 }
 
-func (a *app) setUpReviewSpace(cmd *cobra.Command, cfg *config.Config, cfgPath string, ref prRef, spaceID string, references []space.RepoSpec) (reviewResult, error) {
+func (a *app) setUpReviewSpace(cmd *cobra.Command, cfg *config.Config, cfgPath string, ref prRef, spaceID string, references []space.RepoSpec, memories []string) (reviewResult, error) {
 	ctx := cmd.Context()
 	out := cmd.OutOrStdout()
 	client := git.New()
@@ -238,6 +240,16 @@ func (a *app) setUpReviewSpace(cmd *cobra.Command, cfg *config.Config, cfgPath s
 		if err := svc.AddRepo(ctx, space.AddOptions{SpaceID: spaceID, RepoName: spec.Name, Mode: space.ModeReference, Ref: spec.Ref}); err != nil {
 			return reviewResult{}, err
 		}
+	}
+
+	// Explicit --memory specs fail hard; ambient memory.default degrades to a
+	// notice — same policy as space create (Service.AttachMemories owns it).
+	if err := svc.AttachMemories(ctx, space.AttachMemoriesOptions{
+		SpaceID:    spaceID,
+		Specs:      memories,
+		References: references,
+	}); err != nil {
+		return reviewResult{}, err
 	}
 
 	skillDir := filepath.Join(spacePath, ".claude", "skills", summon.ReviewSkillName)

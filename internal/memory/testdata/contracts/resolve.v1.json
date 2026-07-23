@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "resolved_via": "warren-url",
+  "warren": "product-platform",
+  "project": "project-a",
+  "vault_id": "project-a-vault",
+  "detail": "source_url github.com/acme/project-a matches warren \"product-platform\" project \"project-a\" (vault snapshot from source commit 0123456789abcdef0123456789abcdef01234567)"
+}

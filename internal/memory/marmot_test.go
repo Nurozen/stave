@@ -4,13 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 )
 
 func TestDenCreateArgsAlwaysNoPointerAndJSON(t *testing.T) {
-	args := DenCreateArgs("demo-space", "/Users/x/stave/agent-work/demo-space", "task", nil, nil, nil)
+	args := DenCreateArgs("demo-space", "/Users/x/stave/agent-work/demo-space", "task", nil, nil, nil, nil, false)
 	joined := strings.Join(args, " ")
 	if !containsAll(args, "--no-pointer", "--json", "--lifetime", "task", "--project") {
 		t.Fatalf("args missing required flags: %v", args)
@@ -256,4 +257,96 @@ func containsAll(args []string, need ...string) bool {
 		}
 	}
 	return true
+}
+
+// captureDirMarmot builds a Marmot whose Command stub records each spawned
+// *exec.Cmd (after runRaw sets Dir) and always prints a schema-1 envelope.
+func captureDirMarmot(t *testing.T, cmds *[]*exec.Cmd) *Marmot {
+	t.Helper()
+	return &Marmot{
+		Binary:   "marmot",
+		LookPath: func(string) (string, error) { return "marmot", nil },
+		Command: func(ctx context.Context, name string, args ...string) *exec.Cmd {
+			cmd := exec.CommandContext(ctx, "sh", "-c", `printf '%s' '{"schema":1}'`)
+			*cmds = append(*cmds, cmd)
+			return cmd
+		},
+	}
+}
+
+func TestProposeRunsSubprocessInSpacePath(t *testing.T) {
+	// The load-bearing fix: `marmot warren propose` resolves the workspace
+	// from cwd via reverse routes, so Propose must run den contribute AND
+	// warren propose with cwd = the space path, not stave's cwd.
+	spacePath := t.TempDir()
+	var cmds []*exec.Cmd
+	m := captureDirMarmot(t, &cmds)
+	if _, err := m.Propose(context.Background(), ProposeOptions{StoreID: "t1", SpacePath: spacePath}); err != nil {
+		t.Fatal(err)
+	}
+	if len(cmds) != 2 {
+		t.Fatalf("expected 2 subprocesses (contribute, propose), got %d", len(cmds))
+	}
+	for i, cmd := range cmds {
+		if cmd.Dir != spacePath {
+			t.Fatalf("cmd[%d].Dir = %q, want space path %q", i, cmd.Dir, spacePath)
+		}
+	}
+}
+
+func TestProposeWithoutSpacePathLeavesDirUnset(t *testing.T) {
+	var cmds []*exec.Cmd
+	m := captureDirMarmot(t, &cmds)
+	if _, err := m.Propose(context.Background(), ProposeOptions{StoreID: "t1"}); err != nil {
+		t.Fatal(err)
+	}
+	for i, cmd := range cmds {
+		if cmd.Dir != "" {
+			t.Fatalf("cmd[%d].Dir = %q, want empty (inherit cwd)", i, cmd.Dir)
+		}
+	}
+}
+
+func TestDetachContributeRunsSubprocessInSpacePath(t *testing.T) {
+	// Archive/destroy fate=contribute shells out den contribute + warren
+	// propose + den destroy; all must run with cwd = the space path.
+	spacePath := t.TempDir()
+	var cmds []*exec.Cmd
+	m := captureDirMarmot(t, &cmds)
+	if _, err := m.Detach(context.Background(), DetachOptions{
+		StoreID:   "t1",
+		SpacePath: spacePath,
+		Fate:      FateContribute,
+		Owned:     true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(cmds) != 3 {
+		t.Fatalf("expected 3 subprocesses (contribute, propose, destroy), got %d", len(cmds))
+	}
+	for i, cmd := range cmds {
+		if cmd.Dir != spacePath {
+			t.Fatalf("cmd[%d].Dir = %q, want space path %q", i, cmd.Dir, spacePath)
+		}
+	}
+}
+
+func TestAttachRunsSubprocessInSpacePath(t *testing.T) {
+	spacePath := t.TempDir()
+	var cmds []*exec.Cmd
+	m := captureDirMarmot(t, &cmds)
+	m.Command = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		cmd := exec.CommandContext(ctx, "sh", "-c", `printf '%s' '{"schema":1,"den_id":"t1"}'`)
+		cmds = append(cmds, cmd)
+		return cmd
+	}
+	if _, err := m.Attach(context.Background(), AttachOptions{SpaceID: "t1", SpacePath: spacePath}); err != nil {
+		t.Fatal(err)
+	}
+	if len(cmds) != 1 {
+		t.Fatalf("expected 1 subprocess, got %d", len(cmds))
+	}
+	if cmds[0].Dir != spacePath {
+		t.Fatalf("den create Dir = %q, want %q", cmds[0].Dir, spacePath)
+	}
 }

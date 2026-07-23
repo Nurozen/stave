@@ -18,8 +18,9 @@ import (
 // writeFakeMarmot installs a shell script that pretends to be marmot.
 // behavior is a map from a substring of argv joined by space → stdout + exit code.
 // Special keys:
-//   "den --help" / "--version" / "den create" / "den status" / "den destroy" /
-//   "den contribute" / "warren sync" / "warren propose" / "route set-project" / "route rm"
+//
+//	"den --help" / "--version" / "den create" / "den status" / "den destroy" /
+//	"den contribute" / "warren sync" / "warren propose" / "route set-project" / "route rm"
 func writeFakeMarmot(t *testing.T, responses map[string]fakeResp) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -30,8 +31,8 @@ func writeFakeMarmot(t *testing.T, responses map[string]fakeResp) string {
 	b.WriteString("args=\"$*\"\n")
 	// Order matters: longer / more specific first.
 	keys := []string{
-		"den create", "den destroy", "den contribute", "den status", "den --help",
-		"warren sync", "warren propose", "route set-project", "route rm", "--version",
+		"den create", "den destroy", "den contribute", "den status", "den link", "den --help",
+		"warren --help", "warren sync", "warren propose", "route set-project", "route rm", "route add", "--version",
 	}
 	for _, k := range keys {
 		r, ok := responses[k]
@@ -157,11 +158,12 @@ func TestProbeOK(t *testing.T) {
 }
 
 func TestDenCreateArgsRefsAndLinks(t *testing.T) {
-	// S2: DenCreateArgs deliberately ignores edit/link/refSpecs until marmot accepts them.
+	// S2 (passthrough=false): DenCreateArgs deliberately ignores
+	// edit/link/refSpecs/opts when the installed marmot does not accept them.
 	// Still always emits --no-pointer/--json and default lifetime task.
 	args := DenCreateArgs("id", "/proj", "", []string{"a"}, []string{"b"}, []ReferenceSpec{
 		{Name: "repo", URL: "https://example.com/r.git", Ref: "main", MarmotVault: "vault-1"},
-	})
+	}, map[string]string{"embedding-provider": "mock"}, false)
 	joined := strings.Join(args, " ")
 	for _, need := range []string{"den", "create", "id", "--no-pointer", "--json", "--lifetime", "task", "--project", "/proj"} {
 		if !containsAll(args, need) && !strings.Contains(joined, need) {
@@ -226,6 +228,7 @@ func TestAttachCreateSuccess(t *testing.T) {
 func TestAttachUseIDExisting(t *testing.T) {
 	bin := writeFakeMarmot(t, map[string]fakeResp{
 		"den status": {Stdout: okEnv("existing-den"), Code: 0},
+		"route add":  {Stdout: `{"schema":1}`, Code: 0},
 	})
 	m := NewMarmot(bin)
 	dir := t.TempDir()
@@ -240,6 +243,53 @@ func TestAttachUseIDExisting(t *testing.T) {
 	}
 	if res.Owned || res.StoreID != "existing-den" || !res.MCPConfigWritten {
 		t.Fatalf("res = %#v", res)
+	}
+}
+
+func TestAttachUseIDRegistersReverseRoute(t *testing.T) {
+	// G2: attach-existing must register the reverse route (space path → den id)
+	// so later space-level route ops and cwd-based resolution work.
+	var calls [][]string
+	m := &Marmot{
+		Binary:   "marmot",
+		LookPath: func(string) (string, error) { return "marmot", nil },
+		Command: func(ctx context.Context, name string, args ...string) *exec.Cmd {
+			calls = append(calls, args)
+			return exec.CommandContext(ctx, "sh", "-c", `printf '%s' '{"schema":1}'`)
+		},
+	}
+	dir := t.TempDir()
+	if _, err := m.Attach(context.Background(), AttachOptions{
+		SpaceID:   "space",
+		SpacePath: dir,
+		UseID:     "shared-den",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, args := range calls {
+		if containsAll(args, "route", "add", "--project", dir, "shared-den", "--json") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected route add --project %s shared-den; calls = %#v", dir, calls)
+	}
+	// Attach fails hard when route registration fails (no half-attached state).
+	m2 := &Marmot{
+		Binary:   "marmot",
+		LookPath: func(string) (string, error) { return "marmot", nil },
+		Command: func(ctx context.Context, name string, args ...string) *exec.Cmd {
+			if len(args) > 0 && args[0] == "route" {
+				return exec.CommandContext(ctx, "sh", "-c", `echo route boom >&2; exit 1`)
+			}
+			return exec.CommandContext(ctx, "sh", "-c", `printf '%s' '{"schema":1}'`)
+		},
+	}
+	if _, err := m2.Attach(context.Background(), AttachOptions{
+		SpaceID: "space", SpacePath: t.TempDir(), UseID: "shared-den",
+	}); err == nil || !strings.Contains(err.Error(), "reverse route") {
+		t.Fatalf("expected reverse route error, got %v", err)
 	}
 }
 
@@ -267,6 +317,9 @@ func TestAttachUseIDDryRun(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "den status") {
 		t.Fatalf("buf = %s", buf.String())
+	}
+	if !strings.Contains(buf.String(), "route add") || !strings.Contains(buf.String(), "--project") {
+		t.Fatalf("dry-run must plan reverse-route registration: %s", buf.String())
 	}
 }
 
@@ -343,7 +396,7 @@ func TestAttachSchemaMissingAndTooOld(t *testing.T) {
 		},
 		LookPath: func(string) (string, error) { return "sh", nil },
 	}
-	_, err = m.runJSON(context.Background(), "sh", []string{"x"})
+	_, err = m.runJSON(context.Background(), "sh", []string{"x"}, "")
 	if err == nil || !strings.Contains(err.Error(), "unsupported schema") {
 		t.Fatalf("got %v", err)
 	}
@@ -421,9 +474,12 @@ func TestAttachNonJSONFailure(t *testing.T) {
 }
 
 func TestStatusAndSyncAndPropose(t *testing.T) {
+	syncEnv := `{"schema":1,"warrens":[{"id":"w","fetched":true,"previous_commit":"0123456789ab","pinned_commit":"89abcdef0123","updated":true}],"warnings":[]}`
 	bin := writeFakeMarmot(t, map[string]fakeResp{
-		"den status":     {Stdout: okEnv("sid"), Code: 0},
-		"warren sync":    {Stdout: `{"schema":1,"ok":true}`, Code: 0},
+		"den status": {Stdout: okEnv("sid"), Code: 0},
+		// New-binary warren usage (probe: contains "sync"), exit 1 like marmot's.
+		"warren --help":  {Stderr: "usage: marmot warren <init|add|sync|propose> [flags]", Code: 1},
+		"warren sync":    {Stdout: syncEnv, Code: 0},
 		"den contribute": {Stdout: `{"schema":1,"ok":true}`, Code: 0},
 		"warren propose": {Stdout: `{"schema":1,"ok":true}`, Code: 0},
 	})
@@ -432,13 +488,73 @@ func TestStatusAndSyncAndPropose(t *testing.T) {
 	if err != nil || st.StoreID != "sid" || st.RawJSON == "" {
 		t.Fatalf("status = %#v err=%v", st, err)
 	}
-	sy, err := m.Sync(context.Background(), SyncOptions{StoreID: "sid"})
-	if err != nil || sy.Summary != "synced" {
+	var out strings.Builder
+	sy, err := m.Sync(context.Background(), SyncOptions{StoreID: "sid", Out: &out})
+	if err != nil || sy.Summary != "synced 1 warren(s)" || len(sy.Warrens) != 1 {
 		t.Fatalf("sync = %#v err=%v", sy, err)
+	}
+	if !strings.Contains(out.String(), "synced w (updated 0123456 → 89abcde)") {
+		t.Fatalf("sync rendering: %s", out.String())
 	}
 	pr, err := m.Propose(context.Background(), ProposeOptions{StoreID: "sid"})
 	if err != nil || !strings.Contains(pr.Summary, "proposed") {
 		t.Fatalf("propose = %#v err=%v", pr, err)
+	}
+}
+
+func TestProposeParsesBothEnvelopes(t *testing.T) {
+	// G4: contribute carries branch/commit/counts/warnings; propose carries
+	// push_command / nothing_to_propose / warnings. All must survive into
+	// ProposeResult — the user is told what was contributed and what to push.
+	contribute := `{"schema":1,"den_id":"t1","branch":"marmot/edit/t1/proj","commit":"abc123","committed":true,` +
+		`"contributed":{"added":2,"updated":1,"superseded":0,"noop":3},"warnings":["contrib warn"]}`
+	propose := `{"schema":1,"branch":"marmot/propose/x","commit":"def456","committed":true,"nothing_to_propose":false,` +
+		`"push_command":"git -C /w push -u origin marmot/edit/t1/proj","warnings":["prop warn"]}`
+	bin := writeFakeMarmot(t, map[string]fakeResp{
+		"den contribute": {Stdout: contribute, Code: 0},
+		"warren propose": {Stdout: propose, Code: 0},
+	})
+	pr, err := NewMarmot(bin).Propose(context.Background(), ProposeOptions{StoreID: "t1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pr.Branch != "marmot/edit/t1/proj" || pr.Commit != "abc123" || !pr.Committed {
+		t.Fatalf("branch/commit = %#v", pr)
+	}
+	if pr.Contributed == nil || pr.Contributed.Added != 2 || pr.Contributed.Updated != 1 || pr.Contributed.Noop != 3 {
+		t.Fatalf("contributed = %#v", pr.Contributed)
+	}
+	if pr.PushCommand != "git -C /w push -u origin marmot/edit/t1/proj" {
+		t.Fatalf("push command = %q", pr.PushCommand)
+	}
+	if len(pr.Warnings) != 2 {
+		t.Fatalf("warnings = %#v", pr.Warnings)
+	}
+	if pr.RawJSON == "" || pr.ProposeRawJSON == "" {
+		t.Fatalf("raw envelopes must be kept: %#v", pr)
+	}
+
+	// nothing_to_propose without a push command → "nothing new to push".
+	proposeNoop := `{"schema":1,"nothing_to_propose":true,"warnings":[]}`
+	bin2 := writeFakeMarmot(t, map[string]fakeResp{
+		"den contribute": {Stdout: `{"schema":1}`, Code: 0},
+		"warren propose": {Stdout: proposeNoop, Code: 0},
+	})
+	pr2, err := NewMarmot(bin2).Propose(context.Background(), ProposeOptions{StoreID: "t1"})
+	if err != nil || !pr2.NothingToPropose || pr2.PushCommand != "" {
+		t.Fatalf("%#v %v", pr2, err)
+	}
+	var buf strings.Builder
+	PrintProposeOutcome(&buf, pr2)
+	if !strings.Contains(buf.String(), "nothing new to push") {
+		t.Fatalf("outcome = %s", buf.String())
+	}
+	buf.Reset()
+	PrintProposeOutcome(&buf, pr)
+	for _, need := range []string{"contributed: 2 added, 1 updated, 0 superseded, 3 noop", "warning: contrib warn", "warning: prop warn", "push with: git -C /w push"} {
+		if !strings.Contains(buf.String(), need) {
+			t.Fatalf("outcome missing %q:\n%s", need, buf.String())
+		}
 	}
 }
 
@@ -674,15 +790,20 @@ func TestDetachKeepDefaultAndLookPathFail(t *testing.T) {
 		t.Fatal("expected err")
 	}
 
-	// runJSON fail on route rm
+	// Route rm failure (e.g. missing route) is TOLERATED: warning, not error,
+	// and the detach still reports kept (G1/G2 — den state is untouched).
 	bin3 := writeFakeMarmot(t, map[string]fakeResp{
-		"route rm": {Stderr: "fail", Code: 1},
+		"route rm": {Stderr: "project not found", Code: 1},
 	})
-	_, err = NewMarmot(bin3).Detach(context.Background(), DetachOptions{
-		StoreID: "k", SpacePath: "/p", RemoveRoute: true, Fate: FateKeep, Owned: true,
+	var warnBuf strings.Builder
+	res, err = NewMarmot(bin3).Detach(context.Background(), DetachOptions{
+		StoreID: "k", SpacePath: "/p", RemoveRoute: true, Fate: FateKeep, Owned: true, Out: &warnBuf,
 	})
-	if err == nil {
-		t.Fatal("expected err")
+	if err != nil || !res.Kept {
+		t.Fatalf("route rm failure must warn, not abort: %#v %v", res, err)
+	}
+	if len(res.Warnings) == 0 || !strings.Contains(warnBuf.String(), "warning") {
+		t.Fatalf("expected route warning: %#v out=%s", res.Warnings, warnBuf.String())
 	}
 }
 
@@ -758,7 +879,7 @@ func TestRunRawEmptyMessages(t *testing.T) {
 			return exec.CommandContext(ctx, "false")
 		},
 	}
-	_, err := m.runRaw(context.Background(), "false", []string{"x"})
+	_, err := m.runRaw(context.Background(), "false", []string{"x"}, "")
 	if err == nil {
 		t.Fatal("expected err")
 	}
@@ -769,7 +890,7 @@ func TestRunRawEmptyMessages(t *testing.T) {
 			return exec.CommandContext(ctx, "sh", "-c", "echo notjson; exit 1")
 		},
 	}
-	_, err = m2.runJSON(context.Background(), "sh", []string{"x"})
+	_, err = m2.runJSON(context.Background(), "sh", []string{"x"}, "")
 	if err == nil {
 		t.Fatal("expected err")
 	}
@@ -1094,6 +1215,116 @@ func TestRemoveSpaceMCPConfigPreservesOtherServers(t *testing.T) {
 	}
 	if !strings.Contains(string(got), "[mcp_servers.other]") || !strings.Contains(string(got), "model") {
 		t.Fatalf("codex lost unrelated config: %s", got)
+	}
+}
+
+func TestDetachKeepSpaceWiringRepointsRouteAndMCP(t *testing.T) {
+	// One-of-many detach (fate keep): route rm must NOT run, the reverse
+	// route is re-pointed at a surviving den via route add, and the MCP
+	// configs survive rewritten to target the survivor.
+	dir := t.TempDir()
+	if err := WriteSpaceMCPConfig(dir, "marmot", "den-a"); err != nil {
+		t.Fatal(err)
+	}
+	bin := writeFakeMarmot(t, map[string]fakeResp{
+		"route add": {Stdout: `{"schema":1}`, Code: 0},
+	})
+	m := NewMarmot(bin)
+	res, err := m.Detach(context.Background(), DetachOptions{
+		StoreID:             "den-a",
+		SpacePath:           dir,
+		Fate:                FateKeep,
+		Owned:               true,
+		KeepSpaceWiring:     true,
+		RepointRouteStoreID: "den-b",
+	})
+	if err != nil || !res.Kept {
+		t.Fatalf("%#v %v", res, err)
+	}
+	sawAdd := false
+	for _, c := range res.DryRunCommands {
+		if strings.Contains(c, "route rm") {
+			t.Fatalf("route rm must not run while siblings remain: %#v", res.DryRunCommands)
+		}
+		if strings.Contains(c, "route add") && strings.Contains(c, "den-b") {
+			sawAdd = true
+		}
+	}
+	if !sawAdd {
+		t.Fatalf("expected route add re-point at den-b: %#v", res.DryRunCommands)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, ".mcp.json"))
+	if err != nil {
+		t.Fatalf("MCP config must survive a non-last detach: %v", err)
+	}
+	if !strings.Contains(string(raw), "context-marmot") || !strings.Contains(string(raw), "den-b") {
+		t.Fatalf(".mcp.json must target surviving den-b: %s", raw)
+	}
+	if strings.Contains(string(raw), "den-a") {
+		t.Fatalf(".mcp.json still targets detached den-a: %s", raw)
+	}
+}
+
+func TestDetachDestroyOneOfManyRepointsRoute(t *testing.T) {
+	// Destroying one-of-many must still re-point route + MCP at a survivor
+	// (the destroyed den would otherwise leave both dangling).
+	dir := t.TempDir()
+	if err := WriteSpaceMCPConfig(dir, "marmot", "den-a"); err != nil {
+		t.Fatal(err)
+	}
+	bin := writeFakeMarmot(t, map[string]fakeResp{
+		"den destroy": {Stdout: `{"schema":1,"destroyed":true}`, Code: 0},
+		"route add":   {Stdout: `{"schema":1}`, Code: 0},
+	})
+	m := NewMarmot(bin)
+	res, err := m.Detach(context.Background(), DetachOptions{
+		StoreID:             "den-a",
+		SpacePath:           dir,
+		Fate:                FateDestroy,
+		Owned:               true,
+		KeepSpaceWiring:     true,
+		RepointRouteStoreID: "den-b",
+	})
+	if err != nil || !res.Destroyed {
+		t.Fatalf("%#v %v", res, err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, ".mcp.json"))
+	if err != nil {
+		t.Fatalf("MCP config must survive: %v", err)
+	}
+	if !strings.Contains(string(raw), "den-b") || strings.Contains(string(raw), "den-a") {
+		t.Fatalf(".mcp.json must target surviving den-b: %s", raw)
+	}
+}
+
+func TestDetachKeepSpaceWiringDryRun(t *testing.T) {
+	m := &Marmot{
+		Binary: "marmot",
+		LookPath: func(string) (string, error) {
+			t.Fatal("dry-run must not look up binary")
+			return "", nil
+		},
+	}
+	res, err := m.Detach(context.Background(), DetachOptions{
+		StoreID:             "den-a",
+		SpacePath:           "/work/agent-work/multi",
+		Fate:                FateKeep,
+		Owned:               true,
+		DryRun:              true,
+		KeepSpaceWiring:     true,
+		RepointRouteStoreID: "den-b",
+	})
+	if err != nil || !res.Kept {
+		t.Fatalf("%#v %v", res, err)
+	}
+	if len(res.DryRunCommands) != 2 {
+		t.Fatalf("DryRunCommands = %#v", res.DryRunCommands)
+	}
+	if !strings.Contains(res.DryRunCommands[0], "route add") || !strings.Contains(res.DryRunCommands[0], "den-b") {
+		t.Fatalf("expected route add re-point: %#v", res.DryRunCommands)
+	}
+	if !strings.Contains(res.DryRunCommands[1], "re-point") || !strings.Contains(res.DryRunCommands[1], "den-b") {
+		t.Fatalf("expected MCP re-point line (never removal): %#v", res.DryRunCommands)
 	}
 }
 

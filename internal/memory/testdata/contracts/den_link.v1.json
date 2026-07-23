@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "den_id": "demo",
+  "link": {
+    "target": "product-platform/project-a",
+    "mode": "edit",
+    "warren": "product-platform",
+    "project": "project-a"
+  },
+  "worktree": "/Users/you/.marmot/warren-cache/edits/product-platform/demo",
+  "branch": "marmot/edit/demo/product-platform",
+  "warnings": []
+}

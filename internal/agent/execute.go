@@ -78,13 +78,14 @@ func (e Executor) executeOperation(ctx context.Context, op Operation) error {
 			mode = space.ModeReference
 		}
 		return svc.AddRepo(ctx, space.AddOptions{
-			SpaceID:  op.SpaceID,
-			RepoName: op.Repo,
-			Mode:     mode,
-			Base:     op.Base,
-			Ref:      firstNonEmpty(op.Ref, op.Base),
-			Branch:   op.Branch,
-			NoFetch:  op.NoFetch,
+			SpaceID:    op.SpaceID,
+			RepoName:   op.Repo,
+			Mode:       mode,
+			Base:       op.Base,
+			Ref:        firstNonEmpty(op.Ref, op.Base),
+			Branch:     op.Branch,
+			NoFetch:    op.NoFetch,
+			LinkMemory: true, // S4 space add parity: mirror the CLI default
 		})
 	case OpSpaceSync:
 		return svc.Sync(ctx, space.SyncOptions{SpaceID: op.SpaceID, ReferencesOnly: op.ReferencesOnly})

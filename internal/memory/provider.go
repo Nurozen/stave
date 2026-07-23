@@ -99,6 +99,37 @@ type ReferenceSpec struct {
 	MarmotVault string // optional override/suppression ("off" or vault id)
 }
 
+// ReferenceLinker is an OPTIONAL Provider extension (S4 `space add` parity,
+// plan §3.6): providers implementing it resolve one newly added reference
+// repo into a read-only link on an already-attached store. Callers
+// type-assert; providers without it simply skip linking.
+type ReferenceLinker interface {
+	LinkReference(ctx context.Context, opts LinkReferenceOptions) (LinkReferenceResult, error)
+}
+
+// LinkReferenceOptions drives one post-attach reference link (space add).
+type LinkReferenceOptions struct {
+	StoreID   string
+	SpacePath string
+	Spec      ReferenceSpec
+	// DryRun prints exact ops without invoking the binary.
+	DryRun bool
+	Out    io.Writer
+}
+
+// LinkReferenceResult reports one space-add link outcome.
+type LinkReferenceResult struct {
+	// Linked is true when a provider link was created. False with a Notice
+	// means the reference did not resolve to memory or the binary lacks the
+	// verbs (repo still added either way — linking is soft).
+	Linked bool
+	Link   AttachLink
+	// Notice is the human line for skipped/degraded outcomes.
+	Notice         string
+	Warnings       []string
+	DryRunCommands []string
+}
+
 type AttachResult struct {
 	Provider       string
 	StoreID        string
@@ -109,6 +140,23 @@ type AttachResult struct {
 	DryRunCommands []string
 	// MCPConfigWritten is true when space-local MCP config was written.
 	MCPConfigWritten bool
+	// Links are the provider-resolved reference links from the create
+	// envelope (S4): one entry per --ref, in spec order, plus any links made
+	// by --edit/--link pass-through. ResolvedVia is the marmot vocabulary
+	// (warren-url | checkout-vault | none) or "explicit" for direct links.
+	Links []AttachLink
+}
+
+// AttachLink is one resolved reference/link outcome on attach.
+type AttachLink struct {
+	// Ref is the provider-side link label (e.g. "warren/project" for
+	// resolved refs, the spec name for unresolved ones).
+	Ref string
+	// Mode is edit|link|live, empty when the reference did not resolve.
+	Mode string
+	// ResolvedVia is warren-url|checkout-vault|none for --ref resolution,
+	// or "explicit" for --edit/--link/marmotVault-forced links.
+	ResolvedVia string
 }
 
 type StatusOptions struct {
@@ -122,6 +170,54 @@ type StatusResult struct {
 	RawJSON  string
 	Summary  string
 	Warnings []string
+	// Lifetime is the provider store lifetime (marmot: task|durable).
+	Lifetime string
+	// Links carry per-link freshness parsed from the provider status
+	// envelope (S4 skew intelligence). Empty for providers/binaries that
+	// report no links.
+	Links []LinkStatus
+}
+
+// LinkStatus is one den link's freshness row from `den status --json`.
+type LinkStatus struct {
+	Ref          string
+	Mode         string
+	PinnedCommit string
+	Ahead        int
+	Behind       int
+	PendingEdits int
+	// State is marmot's vocabulary: ok | unpushed | stale | unreachable.
+	State string
+	// SourceCommit, when set on a pinned link, is the source-repo commit the
+	// vault snapshot was taken from (skew note vs. PinnedCommit).
+	SourceCommit string
+}
+
+// StateSuffix compacts link freshness into a short row suffix for
+// `space status` (e.g. " (2 unpushed)", " (stale)"). Empty when everything
+// is ok or no link data is available.
+func (r StatusResult) StateSuffix() string {
+	pending := 0
+	stale := false
+	unreachable := false
+	for _, l := range r.Links {
+		pending += l.PendingEdits
+		switch l.State {
+		case "stale":
+			stale = true
+		case "unreachable":
+			unreachable = true
+		}
+	}
+	switch {
+	case pending > 0:
+		return fmt.Sprintf(" (%d unpushed)", pending)
+	case stale:
+		return " (stale)"
+	case unreachable:
+		return " (unreachable)"
+	}
+	return ""
 }
 
 type SyncOptions struct {
@@ -134,21 +230,84 @@ type SyncResult struct {
 	Summary        string
 	DryRunCommands []string
 	Warnings       []string
+	// Warrens are per-warren outcomes from `warren sync --json` (S4).
+	Warrens []WarrenSync
+}
+
+// WarrenSync mirrors one entry of marmot's warren sync envelope
+// (testdata/contracts/warren_sync.v1.json). Field names are the stable
+// stave-consumed contract.
+type WarrenSync struct {
+	ID             string `json:"id"`
+	Fetched        bool   `json:"fetched"`
+	PreviousCommit string `json:"previous_commit"`
+	PinnedCommit   string `json:"pinned_commit"`
+	Updated        bool   `json:"updated"`
+	Error          string `json:"error,omitempty"`
 }
 
 type ProposeOptions struct {
 	StoreID string
-	Out     io.Writer
-	DryRun  bool
+	// SpacePath is the absolute space root. When set, providers run their
+	// subprocesses with this as the working directory so cwd-based workspace
+	// resolution (marmot reverse routes) targets the space, not stave's cwd.
+	SpacePath string
+	Out       io.Writer
+	DryRun    bool
 	// Force is reserved for contribute refusal overrides (not auto-push).
 	Force bool
+}
+
+// ContributedCounts mirrors marmot's den contribute `contributed` object.
+type ContributedCounts struct {
+	Added      int `json:"added"`
+	Updated    int `json:"updated"`
+	Superseded int `json:"superseded"`
+	Noop       int `json:"noop"`
 }
 
 type ProposeResult struct {
 	Summary        string
 	DryRunCommands []string
 	Warnings       []string
+	// RawJSON is the contribute envelope; ProposeRawJSON the propose envelope.
 	RawJSON        string
+	ProposeRawJSON string
+	// Handoff data parsed from the contribute/propose envelopes (G4): the user
+	// must learn what was contributed and what to push — stave never auto-pushes.
+	Branch           string
+	Commit           string
+	Committed        bool
+	Contributed      *ContributedCounts
+	PushCommand      string
+	Checkout         string
+	NothingToPropose bool
+}
+
+// PrintProposeOutcome renders contribute/propose handoff data for humans:
+// contributed counts, every warning (never silently dropped — especially
+// before a destroy), and the push command (or "nothing new to push").
+func PrintProposeOutcome(w io.Writer, res ProposeResult) {
+	if res.Contributed != nil {
+		c := res.Contributed
+		printf(w, "contributed: %d added, %d updated, %d superseded, %d noop\n", c.Added, c.Updated, c.Superseded, c.Noop)
+	}
+	if res.Branch != "" {
+		if res.Commit != "" {
+			printf(w, "branch: %s @ %s\n", res.Branch, res.Commit)
+		} else {
+			printf(w, "branch: %s\n", res.Branch)
+		}
+	}
+	for _, warn := range res.Warnings {
+		printf(w, "warning: %s\n", warn)
+	}
+	switch {
+	case res.PushCommand != "":
+		printf(w, "push with: %s\n", res.PushCommand)
+	case res.NothingToPropose:
+		printf(w, "nothing new to push\n")
+	}
 }
 
 type DetachOptions struct {
@@ -159,11 +318,21 @@ type DetachOptions struct {
 	NewSpacePath string
 	// RemoveRoute drops the reverse route without destroying the store.
 	RemoveRoute bool
-	Fate        MemoryFate
-	Force       bool
-	Owned       bool // caller must pass attachment.Owned; false never destroys
-	DryRun      bool
-	Out         io.Writer
+	// KeepSpaceWiring: other attachments of this provider remain on the
+	// space, so space-level wiring (space-local MCP configs) must be left in
+	// place — only detaching the provider's LAST attachment tears it down.
+	KeepSpaceWiring bool
+	// RepointRouteStoreID, when set (with KeepSpaceWiring), names a remaining
+	// attachment's store id: the provider re-points the space reverse route
+	// (and MCP config) at it so neither dangles at the detached store. The
+	// route maps one space path to exactly one store, so it must follow a
+	// surviving attachment.
+	RepointRouteStoreID string
+	Fate                MemoryFate
+	Force               bool
+	Owned               bool // caller must pass attachment.Owned; false never destroys
+	DryRun              bool
+	Out                 io.Writer
 }
 
 type DetachResult struct {

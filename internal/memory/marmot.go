@@ -5,10 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 )
 
 // SupportedJSONSchema is the marmot --json envelope schema this package negotiates.
@@ -22,6 +25,12 @@ type Marmot struct {
 	LookPath func(string) (string, error)
 	// Command builds an *exec.Cmd; defaults to exec.CommandContext.
 	Command func(ctx context.Context, name string, args ...string) *exec.Cmd
+
+	// S4 capability probes, cached per instance (one subprocess each, ever).
+	refProbeOnce  sync.Once
+	refProbeOK    bool
+	syncProbeOnce sync.Once
+	syncProbeOK   bool
 }
 
 func NewMarmot(binary string) *Marmot {
@@ -30,6 +39,11 @@ func NewMarmot(binary string) *Marmot {
 	}
 	return &Marmot{Binary: binary}
 }
+
+var (
+	_ Provider        = (*Marmot)(nil)
+	_ ReferenceLinker = (*Marmot)(nil)
+)
 
 func (m *Marmot) Name() string { return "marmot" }
 
@@ -93,26 +107,237 @@ func (m *Marmot) Probe(ctx context.Context) (ProbeResult, error) {
 	}, nil
 }
 
+// capabilityOutput runs the binary with args and returns combined
+// stdout+stderr regardless of exit code (marmot prints usage on stderr, and
+// e.g. `warren --help` exits nonzero on old builds). Empty when the binary
+// cannot be resolved or started.
+func (m *Marmot) capabilityOutput(ctx context.Context, args ...string) string {
+	path, err := m.lookPath(m.binary())
+	if err != nil {
+		return ""
+	}
+	cmd := m.command(ctx, path, args...)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	_ = cmd.Run()
+	return out.String()
+}
+
+// SupportsRefPassthrough reports whether the installed marmot has the P4
+// den surface: `den link` (--edit/--link) and `den create --ref`. Probe:
+// `marmot den --help` exits 0 on every den-capable build (S2 convention) and
+// its usage text lists the verbs/flags additively — the S4 surface is present
+// exactly when it mentions both the `link` verb and the `--ref` flag. Cached
+// per Marmot instance.
+func (m *Marmot) SupportsRefPassthrough(ctx context.Context) bool {
+	m.refProbeOnce.Do(func() {
+		out := m.capabilityOutput(ctx, "den", "--help")
+		m.refProbeOK = strings.Contains(out, "--ref") && strings.Contains(out, "link")
+	})
+	return m.refProbeOK
+}
+
+// SupportsWarrenSync reports whether the installed marmot has cache-backed
+// warrens (`warren add`/`warren sync`, P2). Probe: `marmot warren --help`
+// prints the subcommand list on stderr on every build (exit code varies);
+// the P2 surface is present exactly when it mentions `sync`. Cached per
+// Marmot instance.
+func (m *Marmot) SupportsWarrenSync(ctx context.Context) bool {
+	m.syncProbeOnce.Do(func() {
+		out := m.capabilityOutput(ctx, "warren", "--help")
+		m.syncProbeOK = strings.Contains(out, "sync")
+	})
+	return m.syncProbeOK
+}
+
 // DenCreateArgs builds the exact argv for `marmot den create` used by attach.
 // ALWAYS includes --no-pointer and --json. Never writes .marmot-vault into spaces.
 //
-// S2 only: --edit/--link/--ref are P4/S4 and MUST NOT be appended until the
-// installed marmot den create accepts them (otherwise attach fails hard with
-// invalid_args). Callers still receive those fields on AttachOptions for dry-run
-// notices; S4 will re-enable flag pass-through behind a capability probe.
-func DenCreateArgs(storeID, spacePath, lifetime string, editRefs, linkRefs []string, refSpecs []ReferenceSpec) []string {
+// passthrough=false is the S2 shape: --ref/--opt MUST NOT be appended when the
+// installed marmot den create does not accept them (otherwise attach fails
+// hard with invalid_args). passthrough=true (S4, gated on
+// SupportsRefPassthrough) appends one repeatable --ref name=,url=,ref= spec
+// per reference repo (marmot resolves them into links) and provider --opt
+// knobs as den create flags (k=true → bare --k, else --k v; sorted for a
+// deterministic argv).
+//
+// editRefs/linkRefs never appear here in either mode: --edit/--link belong to
+// `den link`, issued as separate calls after create (see DenLinkArgs).
+// Reference specs with an explicit marmotVault id are excluded — they bypass
+// resolution via a direct `den link --link <id>` — and "off" specs are
+// filtered before the seam.
+func DenCreateArgs(storeID, spacePath, lifetime string, editRefs, linkRefs []string, refSpecs []ReferenceSpec, opts map[string]string, passthrough bool) []string {
 	if lifetime == "" {
 		lifetime = "task"
 	}
 	_ = editRefs
 	_ = linkRefs
-	_ = refSpecs
-	return []string{
+	args := []string{
 		"den", "create", storeID,
 		"--lifetime", lifetime,
 		"--project", spacePath,
 		"--no-pointer",
-		"--json",
+	}
+	if passthrough {
+		for _, spec := range refSpecs {
+			if spec.MarmotVault != "" {
+				continue // "off" filtered upstream; explicit id → direct den link
+			}
+			args = append(args, "--ref", refSpecArg(spec))
+		}
+		keys := make([]string, 0, len(opts))
+		for k := range opts {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			if opts[k] == "true" {
+				args = append(args, "--"+k)
+				continue
+			}
+			args = append(args, "--"+k, opts[k])
+		}
+	}
+	return append(args, "--json")
+}
+
+// refSpecArg renders one ReferenceSpec in marmot's --ref machine grammar
+// (name=<n>,url=<u>,path=<p>,ref=<r>; empty components omitted).
+func refSpecArg(spec ReferenceSpec) string {
+	parts := make([]string, 0, 3)
+	if spec.Name != "" {
+		parts = append(parts, "name="+spec.Name)
+	}
+	if spec.URL != "" {
+		parts = append(parts, "url="+spec.URL)
+	}
+	if spec.Ref != "" {
+		parts = append(parts, "ref="+spec.Ref)
+	}
+	return strings.Join(parts, ",")
+}
+
+// ResolveArgs builds the argv for `marmot resolve` (S4 space add parity):
+// diagnostic resolution of one reference repo, sharing the exact resolver
+// den create --ref uses.
+func ResolveArgs(spec ReferenceSpec) []string {
+	args := []string{"resolve"}
+	if spec.Name != "" {
+		args = append(args, "--name", spec.Name)
+	}
+	if spec.URL != "" {
+		args = append(args, "--url", spec.URL)
+	}
+	if spec.Ref != "" {
+		args = append(args, "--ref", spec.Ref)
+	}
+	return append(args, "--json")
+}
+
+// LinkReference implements the optional ReferenceLinker seam for `space add`
+// parity (plan §3.6): resolve one newly added reference repo and, when it
+// resolves via warren-url, link it read-only onto the den. v1 policy:
+//   - config marmotVault id → direct `den link --link <id>` (skips resolution)
+//   - resolved via warren-url → `den link --link <warren>/<project>`
+//   - checkout-vault / none → notice only, no link (repo already added)
+//   - old binary (probe fails) → notice, degrade — attach parity with the S2 drop
+func (m *Marmot) LinkReference(ctx context.Context, opts LinkReferenceOptions) (LinkReferenceResult, error) {
+	bin := m.binary()
+	res := LinkReferenceResult{}
+	spec := opts.Spec
+	label := firstNonEmpty(spec.Name, spec.URL)
+	if spec.MarmotVault == "off" {
+		return res, nil // suppressed upstream; defensive
+	}
+	resolveArgs := ResolveArgs(spec)
+	directTarget := spec.MarmotVault // explicit vault id bypasses resolution
+	if opts.DryRun {
+		// Dry-run never invokes the binary (so it cannot probe or resolve):
+		// print the plan.
+		if directTarget == "" {
+			line := FormatCommand(bin, resolveArgs)
+			res.DryRunCommands = append(res.DryRunCommands, line)
+			printf(opts.Out, "dry-run: %s\n", line)
+			line = FormatCommand(bin, DenLinkArgs(opts.StoreID, "<warren>/<project>", false)) + " (when resolved via warren-url)"
+			res.DryRunCommands = append(res.DryRunCommands, line)
+			printf(opts.Out, "dry-run: %s\n", line)
+			return res, nil
+		}
+		line := FormatCommand(bin, DenLinkArgs(opts.StoreID, directTarget, false))
+		res.DryRunCommands = append(res.DryRunCommands, line)
+		printf(opts.Out, "dry-run: %s\n", line)
+		return res, nil
+	}
+	path, err := m.lookPath(bin)
+	if err != nil {
+		return res, &UnavailableError{Provider: "marmot", Err: err, Hint: "binary not found"}
+	}
+	// resolve + den link shipped together (P4): one probe gates both. Old
+	// binaries degrade with a notice — the reference repo is already added.
+	if !m.SupportsRefPassthrough(ctx) {
+		res.Notice = fmt.Sprintf("installed marmot lacks resolve/den link support; reference %s added without a memory link (upgrade marmot)", label)
+		printf(opts.Out, "notice: %s\n", res.Notice)
+		return res, nil
+	}
+	target := directTarget
+	resolvedVia := "explicit"
+	if target == "" {
+		env, rerr := m.runJSON(ctx, path, resolveArgs, opts.SpacePath)
+		if rerr != nil {
+			return res, fmt.Errorf("resolve %s: %w", label, rerr)
+		}
+		reportWarnings(opts.Out, &res.Warnings, env.Warnings)
+		resolvedVia = firstNonEmpty(env.ResolvedVia, "none")
+		switch resolvedVia {
+		case "warren-url":
+			target = env.Warren + "/" + env.Project
+		case "checkout-vault":
+			res.Link = AttachLink{ResolvedVia: resolvedVia}
+			res.Notice = fmt.Sprintf("reference %s resolves via checkout-vault (%s); v1 links only warren-url matches — link manually: marmot den link %s --link %s", label, env.VaultID, opts.StoreID, env.VaultID)
+			printf(opts.Out, "notice: %s\n", res.Notice)
+			return res, nil
+		default:
+			res.Link = AttachLink{ResolvedVia: "none"}
+			printf(opts.Out, "reference %s → no memory found\n", label)
+			return res, nil
+		}
+	}
+	linkEnv, lerr := m.runJSON(ctx, path, DenLinkArgs(opts.StoreID, target, false), opts.SpacePath)
+	if lerr != nil {
+		return res, fmt.Errorf("den link %s: %w", target, lerr)
+	}
+	mode := "link"
+	if linkEnv.Link != nil && linkEnv.Link.Mode != nil && *linkEnv.Link.Mode != "" {
+		mode = *linkEnv.Link.Mode
+	}
+	reportWarnings(opts.Out, &res.Warnings, linkEnv.Warnings)
+	res.Linked = true
+	res.Link = AttachLink{Ref: target, Mode: mode, ResolvedVia: resolvedVia}
+	if resolvedVia == "explicit" {
+		printf(opts.Out, "reference %s → %s (config marmotVault)\n", label, target)
+	} else {
+		printf(opts.Out, "reference %s → %s (%s)\n", label, target, resolvedVia)
+	}
+	return res, nil
+}
+
+// DenLinkArgs builds the argv for one `marmot den link` pass-through call.
+func DenLinkArgs(storeID, target string, edit bool) []string {
+	flag := "--link"
+	if edit {
+		flag = "--edit"
+	}
+	return []string{"den", "link", storeID, flag, target, "--json"}
+}
+
+// reportWarnings appends envelope warnings to a result's warning list AND
+// prints each with a "warning:" prefix — parsed warnings must never be
+// silently swallowed (F23).
+func reportWarnings(out io.Writer, dest *[]string, warnings []string) {
+	for _, w := range warnings {
+		*dest = append(*dest, w)
+		printf(out, "warning: %s\n", w)
 	}
 }
 
@@ -143,22 +368,52 @@ func (m *Marmot) Attach(ctx context.Context, opts AttachOptions) (AttachResult, 
 		Owned:    opts.UseID == "",
 	}
 
+	hasS4 := len(opts.EditRefs) > 0 || len(opts.LinkRefs) > 0 || len(opts.Opts) > 0 || len(opts.ReferenceSpecs) > 0
+
 	if opts.UseID != "" {
 		// Attach existing: no den create; still write MCP + reverse route if possible.
 		result.StoreID = opts.UseID
 		result.Owned = false
 		storeID = opts.UseID
+		// S4 content never passes through on attach-existing (there is no den
+		// create to carry --ref/--opt, and v1 does not issue den link here).
+		// The drop must NEVER be silent — every caller path (space create,
+		// review, memory attach) sees the notice via opts.Out (F23).
+		if hasS4 {
+			notice := "attached memory without --edit/--link/--ref: attach-existing reuses den " + storeID + " as-is (v1 does not link references on attach-existing)"
+			if !opts.DryRun && !m.SupportsRefPassthrough(ctx) {
+				notice = "attached memory without --edit/--link/--ref: installed marmot predates den link/--ref support"
+			}
+			result.Warnings = append(result.Warnings, notice)
+			printf(opts.Out, "notice: %s\n", notice)
+		}
+		// NOTE: --json must precede the positional den id — marmot's flag
+		// parsing stops at the first non-flag argument.
+		routeArgs := []string{"route", "add", "--project", opts.SpacePath, "--json", storeID}
 		if opts.DryRun {
 			line := FormatCommand(bin, []string{"den", "status", storeID, "--json"})
 			result.DryRunCommands = append(result.DryRunCommands, line)
 			printf(opts.Out, "dry-run: %s\n", line)
+			routeLine := FormatCommand(bin, routeArgs)
+			result.DryRunCommands = append(result.DryRunCommands, routeLine)
+			printf(opts.Out, "dry-run: %s\n", routeLine)
 			printf(opts.Out, "dry-run: write space-local MCP config (den: %s)\n", storeID)
 			printf(opts.Out, "dry-run: write memory attachment (marmot: %s, existing) to .stave.yaml\n", storeID)
 			return result, nil
 		}
 		// Verify den exists.
-		if _, err := m.runJSON(ctx, bin, []string{"den", "status", storeID, "--json"}); err != nil {
+		if _, err := m.runJSON(ctx, bin, []string{"den", "status", storeID, "--json"}, opts.SpacePath); err != nil {
 			return result, err
+		}
+		// Register the reverse route (space path → den id) so space-level route
+		// ops (archive relocation, detach route rm) and cwd-based resolution
+		// inside the space work for attach-existing too (G2). Marmot's route
+		// table maps one path to one id, so on multi-attach the route follows
+		// the most recently attached den.
+		if opts.SpacePath != "" {
+			if _, err := m.runJSON(ctx, bin, routeArgs, ""); err != nil {
+				return result, fmt.Errorf("register reverse route for existing den %s: %w", storeID, err)
+			}
 		}
 		if err := WriteSpaceMCPConfig(opts.SpacePath, bin, storeID); err != nil {
 			return result, err
@@ -171,12 +426,20 @@ func (m *Marmot) Attach(ctx context.Context, opts AttachOptions) (AttachResult, 
 	if lifetime == "" {
 		lifetime = "task"
 	}
-	args := DenCreateArgs(storeID, opts.SpacePath, lifetime, opts.EditRefs, opts.LinkRefs, opts.ReferenceSpecs)
-	line := FormatCommand(bin, args)
 
 	if opts.DryRun {
+		// Dry-run never invokes the binary, so it cannot probe: print the
+		// full S4 plan (a non-S4 marmot drops these at real attach time with
+		// a notice instead). With no S4 flags this is the S2 argv unchanged.
+		args := DenCreateArgs(storeID, opts.SpacePath, lifetime, opts.EditRefs, opts.LinkRefs, opts.ReferenceSpecs, opts.Opts, true)
+		line := FormatCommand(bin, args)
 		result.DryRunCommands = append(result.DryRunCommands, line)
 		printf(opts.Out, "dry-run: %s\n", line)
+		for _, lk := range denLinkPlan(storeID, opts) {
+			linkLine := FormatCommand(bin, lk.args)
+			result.DryRunCommands = append(result.DryRunCommands, linkLine)
+			printf(opts.Out, "dry-run: %s\n", linkLine)
+		}
 		printf(opts.Out, "dry-run: write space-local MCP config (den: %s)\n", storeID)
 		printf(opts.Out, "dry-run: write memory attachment (marmot: %s, owned) to .stave.yaml\n", storeID)
 		return result, nil
@@ -186,15 +449,70 @@ func (m *Marmot) Attach(ctx context.Context, opts AttachOptions) (AttachResult, 
 	if err != nil {
 		return result, &UnavailableError{Provider: "marmot", Err: err, Hint: "binary not found"}
 	}
-	envelope, err := m.runJSON(ctx, path, args)
+	// S4 pass-through is capability-gated: old binaries keep the byte-stable
+	// S2 argv, with a notice when flags are dropped. Attaches without any S4
+	// content skip the probe entirely (the argv is identical either way).
+	passthrough := hasS4 && m.SupportsRefPassthrough(ctx)
+	if hasS4 && !passthrough {
+		notice := "installed marmot lacks den link/--ref support; dropping --edit/--link/--ref/--opt (S2 attach — upgrade marmot for reference pass-through)"
+		result.Warnings = append(result.Warnings, notice)
+		printf(opts.Out, "notice: %s\n", notice)
+	}
+	args := DenCreateArgs(storeID, opts.SpacePath, lifetime, opts.EditRefs, opts.LinkRefs, opts.ReferenceSpecs, opts.Opts, passthrough)
+	envelope, err := m.runJSON(ctx, path, args, opts.SpacePath)
 	if err != nil {
 		return result, err
 	}
 	result.StoreID = firstNonEmpty(envelope.DenID, storeID)
 	result.StorePath = envelope.DenPath
-	result.Warnings = append(result.Warnings, envelope.Warnings...)
+	reportWarnings(opts.Out, &result.Warnings, envelope.Warnings)
 	if envelope.PointerWritten {
-		result.Warnings = append(result.Warnings, "marmot reported pointer_written=true; stave requested --no-pointer")
+		reportWarnings(opts.Out, &result.Warnings, []string{"marmot reported pointer_written=true; stave requested --no-pointer"})
+	}
+	if passthrough {
+		// Per-reference resolution: envelope links are the --ref outcomes in
+		// spec order (marmot resolves; stave only reports).
+		passed := make([]ReferenceSpec, 0, len(opts.ReferenceSpecs))
+		for _, spec := range opts.ReferenceSpecs {
+			if spec.MarmotVault == "" {
+				passed = append(passed, spec)
+			}
+		}
+		for i, l := range envelope.Links {
+			mode := ""
+			if l.Mode != nil {
+				mode = *l.Mode
+			}
+			result.Links = append(result.Links, AttachLink{Ref: l.Ref, Mode: mode, ResolvedVia: l.ResolvedVia})
+			label := l.Ref
+			if i < len(passed) {
+				label = firstNonEmpty(passed[i].Name, passed[i].URL, l.Ref)
+			}
+			if mode == "" {
+				printf(opts.Out, "reference %s → no memory found\n", label)
+			} else {
+				printf(opts.Out, "reference %s → %s (%s)\n", label, l.Ref, l.ResolvedVia)
+			}
+		}
+		// --edit/--link and marmotVault-forced links go through den link,
+		// AFTER create (they are den link verbs, not den create flags).
+		for _, lk := range denLinkPlan(result.StoreID, opts) {
+			linkEnv, lerr := m.runJSON(ctx, path, lk.args, opts.SpacePath)
+			if lerr != nil {
+				return result, fmt.Errorf("den link %s: %w", lk.target, lerr)
+			}
+			mode := lk.mode
+			if linkEnv.Link != nil && linkEnv.Link.Mode != nil && *linkEnv.Link.Mode != "" {
+				mode = *linkEnv.Link.Mode
+			}
+			result.Links = append(result.Links, AttachLink{Ref: lk.target, Mode: mode, ResolvedVia: "explicit"})
+			reportWarnings(opts.Out, &result.Warnings, linkEnv.Warnings)
+			if lk.label != "" {
+				printf(opts.Out, "reference %s → %s (config marmotVault)\n", lk.label, lk.target)
+			} else {
+				printf(opts.Out, "linked %s (mode=%s)\n", lk.target, mode)
+			}
+		}
 	}
 	if err := WriteSpaceMCPConfig(opts.SpacePath, path, result.StoreID); err != nil {
 		return result, fmt.Errorf("write space-local MCP config: %w", err)
@@ -203,17 +521,121 @@ func (m *Marmot) Attach(ctx context.Context, opts AttachOptions) (AttachResult, 
 	return result, nil
 }
 
+// denLinkCall is one planned `den link` pass-through invocation.
+type denLinkCall struct {
+	args   []string
+	target string
+	mode   string // expected mode for reporting; envelope wins when present
+	label  string // reference name for marmotVault-forced links
+}
+
+// denLinkPlan expands AttachOptions into the den link calls issued after den
+// create: --edit refs, --link refs, then reference repos whose config
+// marmotVault forces an explicit target (skipping resolution entirely).
+func denLinkPlan(storeID string, opts AttachOptions) []denLinkCall {
+	var calls []denLinkCall
+	for _, ref := range opts.EditRefs {
+		calls = append(calls, denLinkCall{args: DenLinkArgs(storeID, ref, true), target: ref, mode: "edit"})
+	}
+	for _, ref := range opts.LinkRefs {
+		calls = append(calls, denLinkCall{args: DenLinkArgs(storeID, ref, false), target: ref, mode: "link"})
+	}
+	for _, spec := range opts.ReferenceSpecs {
+		if spec.MarmotVault == "" || spec.MarmotVault == "off" {
+			continue
+		}
+		calls = append(calls, denLinkCall{
+			args:   DenLinkArgs(storeID, spec.MarmotVault, false),
+			target: spec.MarmotVault,
+			label:  firstNonEmpty(spec.Name, spec.URL),
+		})
+	}
+	return calls
+}
+
 func (m *Marmot) Status(ctx context.Context, opts StatusOptions) (StatusResult, error) {
 	bin := m.binary()
 	path, err := m.lookPath(bin)
 	if err != nil {
 		return StatusResult{}, &UnavailableError{Provider: "marmot", Err: err}
 	}
-	raw, err := m.runRaw(ctx, path, []string{"den", "status", opts.StoreID, "--json"})
+	// runJSONRaw like every other verb: structured refusals surface as
+	// RefusalError (not raw blobs) and the schema is negotiated. The raw JSON
+	// rides along for display. Binaries without link freshness fields still
+	// parse fine (additive envelope) and render an empty links list.
+	env, raw, err := m.runJSONRaw(ctx, path, []string{"den", "status", opts.StoreID, "--json"}, "")
 	if err != nil {
-		return StatusResult{}, err
+		return StatusResult{StoreID: opts.StoreID, RawJSON: string(raw)}, err
 	}
-	return StatusResult{StoreID: opts.StoreID, RawJSON: string(raw), Summary: string(raw)}, nil
+	result := StatusResult{StoreID: opts.StoreID, RawJSON: string(raw), Summary: string(raw), Warnings: env.Warnings}
+	result.StoreID = firstNonEmpty(env.DenID, opts.StoreID)
+	result.Lifetime = env.Lifetime
+	for _, l := range env.Links {
+		mode := ""
+		if l.Mode != nil {
+			mode = *l.Mode
+		}
+		pinned := ""
+		if l.PinnedCommit != nil {
+			pinned = *l.PinnedCommit
+		}
+		result.Links = append(result.Links, LinkStatus{
+			Ref:          l.Ref,
+			Mode:         mode,
+			PinnedCommit: pinned,
+			Ahead:        l.Ahead,
+			Behind:       l.Behind,
+			PendingEdits: l.PendingEdits,
+			State:        l.State,
+			SourceCommit: l.SourceCommit,
+		})
+	}
+	result.Summary = renderStatusSummary(result)
+	return result, nil
+}
+
+// renderStatusSummary compacts a parsed den status into per-link rows:
+//
+//	den t1 (task)
+//	  w/docs  edit  ahead 4 / behind 0 / 5 pending edits (unpushed)
+//	  w/billing  link  pinned abc1234  behind 3 (stale)  [vault from source 77aa88b]
+//	  auth-den  live  (ok)
+func renderStatusSummary(st StatusResult) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "den %s", st.StoreID)
+	if st.Lifetime != "" {
+		fmt.Fprintf(&b, " (%s)", st.Lifetime)
+	}
+	if len(st.Links) == 0 {
+		b.WriteString("  links: none")
+		return b.String()
+	}
+	for _, l := range st.Links {
+		fmt.Fprintf(&b, "\n%s  %s", l.Ref, firstNonEmpty(l.Mode, "unresolved"))
+		switch l.Mode {
+		case "edit":
+			fmt.Fprintf(&b, "  ahead %d / behind %d / %d pending edits", l.Ahead, l.Behind, l.PendingEdits)
+		case "link":
+			if l.PinnedCommit != "" {
+				fmt.Fprintf(&b, "  pinned %s", shortCommit(l.PinnedCommit))
+			}
+			fmt.Fprintf(&b, "  behind %d", l.Behind)
+		}
+		if l.State != "" {
+			fmt.Fprintf(&b, " (%s)", l.State)
+		}
+		if l.SourceCommit != "" {
+			fmt.Fprintf(&b, "  [vault snapshot from source commit %s]", shortCommit(l.SourceCommit))
+		}
+	}
+	return b.String()
+}
+
+func shortCommit(commit string) string {
+	if len(commit) > 7 {
+		return commit[:7]
+	}
+	return commit
 }
 
 func (m *Marmot) Sync(ctx context.Context, opts SyncOptions) (SyncResult, error) {
@@ -228,16 +650,58 @@ func (m *Marmot) Sync(ctx context.Context, opts SyncOptions) (SyncResult, error)
 	if err != nil {
 		return SyncResult{}, &UnavailableError{Provider: "marmot", Err: err}
 	}
-	if _, err := m.runRaw(ctx, path, args); err != nil {
-		// Soft: warren sync may not exist yet; surface status re-probe instead.
+	if !m.SupportsWarrenSync(ctx) {
+		// Old binary (probe-gated): report den status instead — the ONLY
+		// remaining soft fallback. New binaries surface real sync failures.
 		statusArgs := []string{"den", "status", opts.StoreID, "--json"}
-		raw, statusErr := m.runRaw(ctx, path, statusArgs)
+		raw, statusErr := m.runRaw(ctx, path, statusArgs, "")
 		if statusErr != nil {
-			return SyncResult{}, err
+			return SyncResult{}, fmt.Errorf("installed marmot lacks warren sync and den status failed: %w", statusErr)
 		}
-		return SyncResult{Summary: string(raw), Warnings: []string{fmt.Sprintf("warren sync unavailable: %v; reported den status", err)}}, nil
+		return SyncResult{Summary: string(raw), Warnings: []string{"installed marmot lacks warren sync; reported den status instead (upgrade marmot for cache-backed warren sync)"}}, nil
 	}
-	return SyncResult{Summary: "synced"}, nil
+	// Run warren sync and parse the envelope even on a nonzero exit: marmot
+	// exits 1 only when EVERY warren failed, and still prints the envelope.
+	raw, runErr := m.runRaw(ctx, path, args, "")
+	var env envelope
+	if jerr := json.Unmarshal(raw, &env); jerr != nil || env.Schema != SupportedJSONSchema {
+		if runErr != nil {
+			return SyncResult{}, runErr
+		}
+		return SyncResult{}, fmt.Errorf("decode marmot warren sync json: %v\n%s", jerr, raw)
+	}
+	if env.Error != nil {
+		return SyncResult{}, &RefusalError{Provider: "marmot", Code: env.Error.Code, Message: env.Error.Message, Hint: env.Error.Hint}
+	}
+	result := SyncResult{Warrens: env.Warrens, Warnings: env.Warnings}
+	failed := 0
+	for _, w := range env.Warrens {
+		switch {
+		case w.Error != "":
+			failed++
+			printf(opts.Out, "warren %s failed: %s\n", w.ID, w.Error)
+			result.Warnings = append(result.Warnings, fmt.Sprintf("warren %s: %s", w.ID, w.Error))
+		case w.Updated && w.PreviousCommit == "":
+			printf(opts.Out, "synced %s (pinned %s)\n", w.ID, shortCommit(w.PinnedCommit))
+		case w.Updated:
+			printf(opts.Out, "synced %s (updated %s → %s)\n", w.ID, shortCommit(w.PreviousCommit), shortCommit(w.PinnedCommit))
+		default:
+			printf(opts.Out, "synced %s (up to date at %s)\n", w.ID, shortCommit(w.PinnedCommit))
+		}
+	}
+	switch {
+	case len(env.Warrens) == 0:
+		result.Summary = "no cached warrens to sync"
+	case failed == len(env.Warrens):
+		// Mirror marmot's exit semantics: nonzero only when every warren failed.
+		result.Summary = fmt.Sprintf("all %d warrens failed to sync", failed)
+		return result, fmt.Errorf("warren sync: all %d warrens failed", failed)
+	case failed > 0:
+		result.Summary = fmt.Sprintf("synced %d/%d warrens (%d failed)", len(env.Warrens)-failed, len(env.Warrens), failed)
+	default:
+		result.Summary = fmt.Sprintf("synced %d warren(s)", len(env.Warrens))
+	}
+	return result, nil
 }
 
 func (m *Marmot) Propose(ctx context.Context, opts ProposeOptions) (ProposeResult, error) {
@@ -255,18 +719,47 @@ func (m *Marmot) Propose(ctx context.Context, opts ProposeOptions) (ProposeResul
 	if err != nil {
 		return ProposeResult{}, &UnavailableError{Provider: "marmot", Err: err}
 	}
-	raw, err := m.runRaw(ctx, path, contribute)
+	// runJSONRaw (not runRaw) so refusals surface as structured
+	// RefusalErrors with marmot's error code — same seam as Attach/Detach.
+	// opts.SpacePath (when known) becomes the subprocess cwd so marmot's
+	// reverse-route workspace resolution targets the space, not stave's cwd.
+	cEnv, raw, err := m.runJSONRaw(ctx, path, contribute, opts.SpacePath)
 	if err != nil {
 		return ProposeResult{}, err
 	}
-	if _, err := m.runRaw(ctx, path, propose); err != nil {
-		return ProposeResult{
-			RawJSON:  string(raw),
-			Summary:  "contributed; warren propose failed",
-			Warnings: []string{err.Error()},
-		}, err
+	// Parse BOTH envelopes (G4): contribute carries branch/commit/counts (and,
+	// additively, push_command/checkout); propose carries push_command and
+	// nothing_to_propose. None of it may be silently discarded.
+	result := ProposeResult{
+		RawJSON:     string(raw),
+		Branch:      cEnv.Branch,
+		Commit:      cEnv.Commit,
+		Committed:   cEnv.Committed,
+		Contributed: cEnv.Contributed,
+		Checkout:    cEnv.Checkout,
+		PushCommand: cEnv.PushCommand,
 	}
-	return ProposeResult{RawJSON: string(raw), Summary: "contributed and proposed (no auto-push)"}, nil
+	result.Warnings = append(result.Warnings, cEnv.Warnings...)
+	pEnv, praw, err := m.runJSONRaw(ctx, path, propose, opts.SpacePath)
+	result.ProposeRawJSON = string(praw)
+	if err != nil {
+		result.Summary = "contributed; warren propose failed"
+		result.Warnings = append(result.Warnings, err.Error())
+		return result, err
+	}
+	result.Warnings = append(result.Warnings, pEnv.Warnings...)
+	result.NothingToPropose = pEnv.NothingToPropose
+	if result.PushCommand == "" {
+		result.PushCommand = pEnv.PushCommand
+	}
+	if result.Branch == "" {
+		result.Branch = pEnv.Branch
+	}
+	if result.Commit == "" {
+		result.Commit = pEnv.Commit
+	}
+	result.Summary = "contributed and proposed (no auto-push)"
+	return result, nil
 }
 
 func (m *Marmot) Detach(ctx context.Context, opts DetachOptions) (DetachResult, error) {
@@ -282,21 +775,42 @@ func (m *Marmot) Detach(ctx context.Context, opts DetachOptions) (DetachResult, 
 		result.Warnings = append(result.Warnings, "attachment is not owned; forcing fate=keep (detach only)")
 	}
 
-	var cmds [][]string
+	// contribute/propose/destroy run with cwd = the space path (marmot resolves
+	// the warren-propose workspace from cwd via reverse routes). Route rewrite
+	// commands (fate keep) pass explicit --from/--project paths and may run
+	// after the space dir is gone, so they inherit stave's cwd. Route updates
+	// are tolerant: a missing route warns instead of aborting (the den itself
+	// is untouched either way).
+	execDir := ""
+	var cmds [][]string      // destructive/contribute commands — failure aborts
+	var routeCmds [][]string // space-level route updates — failure warns
 	switch fate {
 	case FateContribute:
-		cmds = append(cmds,
-			[]string{"den", "contribute", opts.StoreID, "--json"},
-			[]string{"warren", "propose", "--json"},
-			[]string{"den", "destroy", opts.StoreID, "--json"},
-		)
-		if opts.Force {
-			// inject --force before --json on destroy
-			last := cmds[len(cmds)-1]
-			cmds[len(cmds)-1] = []string{"den", "destroy", opts.StoreID, "--force", "--json"}
-			_ = last
+		execDir = opts.SpacePath
+		// Contribute + propose through the shared Propose flow so counts,
+		// warnings and the push command surface BEFORE the den is destroyed (G4).
+		pres, perr := m.Propose(ctx, ProposeOptions{
+			StoreID:   opts.StoreID,
+			SpacePath: opts.SpacePath,
+			DryRun:    opts.DryRun,
+			Out:       opts.Out,
+			Force:     opts.Force,
+		})
+		result.DryRunCommands = append(result.DryRunCommands, pres.DryRunCommands...)
+		result.Warnings = append(result.Warnings, pres.Warnings...)
+		if perr != nil {
+			return result, perr
 		}
+		if !opts.DryRun {
+			PrintProposeOutcome(opts.Out, pres)
+		}
+		destroy := []string{"den", "destroy", opts.StoreID, "--json"}
+		if opts.Force {
+			destroy = []string{"den", "destroy", opts.StoreID, "--force", "--json"}
+		}
+		cmds = append(cmds, destroy)
 	case FateDestroy:
+		execDir = opts.SpacePath
 		destroy := []string{"den", "destroy", opts.StoreID, "--json"}
 		if opts.Force {
 			destroy = []string{"den", "destroy", opts.StoreID, "--force", "--json"}
@@ -306,10 +820,17 @@ func (m *Marmot) Detach(ctx context.Context, opts DetachOptions) (DetachResult, 
 		result.Kept = true
 		// D6: marmot route set-project --from <old> --to <new> (not positional args).
 		if opts.NewSpacePath != "" && opts.SpacePath != "" {
-			cmds = append(cmds, []string{"route", "set-project", "--from", opts.SpacePath, "--to", opts.NewSpacePath, "--json"})
+			routeCmds = append(routeCmds, []string{"route", "set-project", "--from", opts.SpacePath, "--to", opts.NewSpacePath, "--json"})
 		} else if opts.RemoveRoute && opts.SpacePath != "" {
-			cmds = append(cmds, []string{"route", "rm", "--project", opts.SpacePath, "--json"})
+			routeCmds = append(routeCmds, []string{"route", "rm", "--project", opts.SpacePath, "--json"})
 		}
+	}
+	// Sibling attachments remain on the space (any fate): the reverse route
+	// maps the space to exactly ONE den, so re-point it at a surviving den
+	// instead of leaving it dangling at the detached/destroyed one. route add
+	// upserts, so this is safe even when the route already targets a survivor.
+	if opts.RepointRouteStoreID != "" && opts.SpacePath != "" && opts.NewSpacePath == "" {
+		routeCmds = append(routeCmds, []string{"route", "add", "--project", opts.SpacePath, "--json", opts.RepointRouteStoreID})
 	}
 
 	for _, args := range cmds {
@@ -323,24 +844,61 @@ func (m *Marmot) Detach(ctx context.Context, opts DetachOptions) (DetachResult, 
 		if err != nil {
 			return result, &UnavailableError{Provider: "marmot", Err: err}
 		}
-		if _, err := m.runJSON(ctx, path, args); err != nil {
+		env, err := m.runJSON(ctx, path, args, execDir)
+		if err != nil {
 			return result, err
+		}
+		reportWarnings(opts.Out, &result.Warnings, env.Warnings)
+	}
+	for _, args := range routeCmds {
+		line := FormatCommand(bin, args)
+		result.DryRunCommands = append(result.DryRunCommands, line)
+		if opts.DryRun {
+			printf(opts.Out, "dry-run: %s\n", line)
+			continue
+		}
+		path, err := m.lookPath(bin)
+		if err != nil {
+			return result, &UnavailableError{Provider: "marmot", Err: err}
+		}
+		if _, err := m.runJSON(ctx, path, args, ""); err != nil {
+			warn := fmt.Sprintf("route update failed (den untouched; repair with 'marmot %s'): %v", strings.Join(args[:len(args)-1], " "), err)
+			result.Warnings = append(result.Warnings, warn)
+			printf(opts.Out, "warning: %s\n", warn)
 		}
 	}
 	if opts.DryRun {
 		// Archive path moves (NewSpacePath set) keep MCP configs with the
-		// space; only true detach/destroy strips them.
+		// space; only detaching the provider's LAST attachment strips them
+		// (KeepSpaceWiring means siblings remain and still need them).
 		if opts.SpacePath != "" && opts.NewSpacePath == "" {
-			result.DryRunCommands = append(result.DryRunCommands, "remove space-local context-marmot MCP config")
-			printf(opts.Out, "dry-run: remove space-local context-marmot MCP config\n")
+			switch {
+			case !opts.KeepSpaceWiring:
+				result.DryRunCommands = append(result.DryRunCommands, "remove space-local context-marmot MCP config")
+				printf(opts.Out, "dry-run: remove space-local context-marmot MCP config\n")
+			case opts.RepointRouteStoreID != "":
+				line := fmt.Sprintf("re-point space-local context-marmot MCP config at den %s", opts.RepointRouteStoreID)
+				result.DryRunCommands = append(result.DryRunCommands, line)
+				printf(opts.Out, "dry-run: %s\n", line)
+			}
 		}
 		return result, nil
 	}
-	// Strip generated MCP bindings when the attachment is leaving the space
-	// (not when only rewriting reverse routes for archive).
+	// Strip generated MCP bindings when the PROVIDER is leaving the space
+	// (not when only rewriting reverse routes for archive, and not while
+	// sibling attachments still rely on them). When siblings remain, rewrite
+	// the config so `serve --den` targets a surviving den instead of the
+	// detached one.
 	if opts.SpacePath != "" && opts.NewSpacePath == "" {
-		if err := RemoveSpaceMCPConfig(opts.SpacePath); err != nil {
-			result.Warnings = append(result.Warnings, fmt.Sprintf("mcp cleanup: %v", err))
+		switch {
+		case !opts.KeepSpaceWiring:
+			if err := RemoveSpaceMCPConfig(opts.SpacePath); err != nil {
+				result.Warnings = append(result.Warnings, fmt.Sprintf("mcp cleanup: %v", err))
+			}
+		case opts.RepointRouteStoreID != "":
+			if err := WriteSpaceMCPConfig(opts.SpacePath, bin, opts.RepointRouteStoreID); err != nil {
+				result.Warnings = append(result.Warnings, fmt.Sprintf("mcp re-point: %v", err))
+			}
 		}
 	}
 	if fate == FateDestroy || fate == FateContribute {
@@ -365,44 +923,96 @@ type envelope struct {
 	Warnings       []string `json:"warnings"`
 	Destroyed      bool     `json:"destroyed"`
 	Kept           bool     `json:"kept"`
-	Error          *struct {
+	// S4 additive fields. Links carries both shapes: den create --ref
+	// outcomes ({ref, mode|null, resolved_via}) and den status freshness rows
+	// ({ref, mode, pinned_commit|null, ahead, behind, pending_edits, state,
+	// source_commit}). Link is den link's single-link object; Warrens is the
+	// warren sync per-warren result list; Lifetime rides den status.
+	Lifetime string         `json:"lifetime"`
+	Links    []envelopeLink `json:"links"`
+	Link     *envelopeLink  `json:"link"`
+	Warrens  []WarrenSync   `json:"warrens"`
+	// `marmot resolve --json` fields (S4 space add parity,
+	// testdata/contracts/resolve.v1.json): how a reference repo would resolve
+	// into a den link. ResolvedVia is warren-url|checkout-vault|none.
+	ResolvedVia string `json:"resolved_via"`
+	Warren      string `json:"warren"`
+	Project     string `json:"project"`
+	Detail      string `json:"detail"`
+	// Contribute/propose handoff fields (G4). push_command/checkout are
+	// additive on contribute — parsed opportunistically.
+	Branch           string             `json:"branch"`
+	Commit           string             `json:"commit"`
+	Committed        bool               `json:"committed"`
+	Contributed      *ContributedCounts `json:"contributed"`
+	PushCommand      string             `json:"push_command"`
+	Checkout         string             `json:"checkout"`
+	NothingToPropose bool               `json:"nothing_to_propose"`
+	Error            *struct {
 		Code    string `json:"code"`
 		Message string `json:"message"`
 		Hint    string `json:"hint"`
 	} `json:"error"`
 }
 
-func (m *Marmot) runJSON(ctx context.Context, path string, args []string) (envelope, error) {
-	raw, err := m.runRaw(ctx, path, args)
+// envelopeLink is the union of marmot's link JSON shapes (see envelope.Links).
+type envelopeLink struct {
+	Ref          string  `json:"ref"`
+	Mode         *string `json:"mode"`
+	ResolvedVia  string  `json:"resolved_via"`
+	PinnedCommit *string `json:"pinned_commit"`
+	Ahead        int     `json:"ahead"`
+	Behind       int     `json:"behind"`
+	PendingEdits int     `json:"pending_edits"`
+	State        string  `json:"state"`
+	SourceCommit string  `json:"source_commit"`
+	Target       string  `json:"target"`
+}
+
+func (m *Marmot) runJSON(ctx context.Context, path string, args []string, dir string) (envelope, error) {
+	env, _, err := m.runJSONRaw(ctx, path, args, dir)
+	return env, err
+}
+
+// runJSONRaw runs a --json marmot verb and returns the parsed envelope plus
+// the raw stdout bytes (for RawJSON passthrough fields).
+func (m *Marmot) runJSONRaw(ctx context.Context, path string, args []string, dir string) (envelope, []byte, error) {
+	raw, err := m.runRaw(ctx, path, args, dir)
 	if err != nil {
 		// Try to parse structured error from stdout.
 		var env envelope
 		if json.Unmarshal(raw, &env) == nil && env.Error != nil {
-			return env, &RefusalError{Provider: "marmot", Code: env.Error.Code, Message: env.Error.Message, Hint: env.Error.Hint}
+			return env, raw, &RefusalError{Provider: "marmot", Code: env.Error.Code, Message: env.Error.Message, Hint: env.Error.Hint}
 		}
-		return envelope{}, err
+		return envelope{}, raw, err
 	}
 	var env envelope
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return envelope{}, fmt.Errorf("decode marmot json: %w\n%s", err, raw)
+		return envelope{}, raw, fmt.Errorf("decode marmot json: %w\n%s", err, raw)
 	}
 	if env.Schema != SupportedJSONSchema {
 		if env.Schema == 0 {
-			return env, fmt.Errorf("decode marmot json: missing schema field (want %d)", SupportedJSONSchema)
+			return env, raw, fmt.Errorf("decode marmot json: missing schema field (want %d)", SupportedJSONSchema)
 		}
 		if env.Schema > SupportedJSONSchema {
-			return env, &UnsupportedError{Provider: "marmot", Feature: fmt.Sprintf("json schema %d", env.Schema), Hint: fmt.Sprintf("stave supports schema <= %d", SupportedJSONSchema)}
+			return env, raw, &UnsupportedError{Provider: "marmot", Feature: fmt.Sprintf("json schema %d", env.Schema), Hint: fmt.Sprintf("stave supports schema <= %d", SupportedJSONSchema)}
 		}
-		return env, fmt.Errorf("decode marmot json: unsupported schema %d (want %d)", env.Schema, SupportedJSONSchema)
+		return env, raw, fmt.Errorf("decode marmot json: unsupported schema %d (want %d)", env.Schema, SupportedJSONSchema)
 	}
 	if env.Error != nil {
-		return env, &RefusalError{Provider: "marmot", Code: env.Error.Code, Message: env.Error.Message, Hint: env.Error.Hint}
+		return env, raw, &RefusalError{Provider: "marmot", Code: env.Error.Code, Message: env.Error.Message, Hint: env.Error.Hint}
 	}
-	return env, nil
+	return env, raw, nil
 }
 
-func (m *Marmot) runRaw(ctx context.Context, path string, args []string) ([]byte, error) {
+// runRaw executes the binary. When dir is non-empty the subprocess runs with
+// that working directory (the space path), so marmot's cwd-based workspace
+// resolution (reverse routes) targets the space regardless of stave's own cwd.
+func (m *Marmot) runRaw(ctx context.Context, path string, args []string, dir string) ([]byte, error) {
 	cmd := m.command(ctx, path, args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -421,11 +1031,11 @@ func (m *Marmot) runRaw(ctx context.Context, path string, args []string) ([]byte
 	return out, nil
 }
 
-// WriteSpaceMCPConfig writes harness MCP configs pointing at the den.
-// Never writes .marmot-vault. Uses den id via `marmot serve --den <id>` when
-// the binary supports it; falls back to path-less `marmot serve` + reverse route.
-// When MARMOT_HOME is set, it is embedded in each server env so MCP clients
-// started without that env still resolve the same dens root.
+// WriteSpaceMCPConfig writes harness MCP configs pointing at the den via
+// `marmot serve --den <id>` (supported by every binary that passes the den
+// probe). Never writes .marmot-vault. When MARMOT_HOME is set, it is embedded
+// in each server env so MCP clients started without that env still resolve
+// the same dens root.
 func WriteSpaceMCPConfig(spacePath, binary, storeID string) error {
 	if spacePath == "" {
 		return fmt.Errorf("space path required for MCP config")
