@@ -78,8 +78,9 @@ func TestCreateWithMemoryOldMarmotPrintsDropNotice(t *testing.T) {
 			}
 			// …and the drop must be announced on the space-create output.
 			rendered := out.String()
-			if !strings.Contains(rendered, "notice:") ||
-				!(strings.Contains(rendered, "dropping --edit/--link/--ref") || strings.Contains(rendered, "attached memory without --edit/--link/--ref")) {
+			hasDropDetail := strings.Contains(rendered, "dropping --edit/--link/--ref") ||
+				strings.Contains(rendered, "attached memory without --edit/--link/--ref")
+			if !strings.Contains(rendered, "notice:") || !hasDropDetail {
 				t.Fatalf("drop notice missing from space create output:\n%s", rendered)
 			}
 			if !strings.Contains(rendered, "upgrade marmot") && !strings.Contains(rendered, "predates den link/--ref support") {
