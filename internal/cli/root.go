@@ -2023,12 +2023,20 @@ func (a *app) runSummon(cmd *cobra.Command, cfg config.Config, spaceID string, s
 }
 
 func (a *app) printPlannedSummon(cmd *cobra.Command, cfg config.Config, spaceID string, summoner string, specPath string, agentArgs []string) error {
+	return a.printPlannedSummonWithPrompt(cmd, cfg, spaceID, summoner, specPath, agentArgs, "")
+}
+
+func (a *app) printPlannedSummonWithPrompt(cmd *cobra.Command, cfg config.Config, spaceID string, summoner string, specPath string, agentArgs []string, prompt string) error {
 	spacePath := filepath.Join(cfg.AgentWorkDir, spaceID)
 	plannedSpec := ""
 	if specPath != "" {
 		plannedSpec = "spec"
 	}
-	invocation, err := summon.BuildInvocation(cfg, spacePath, summon.ResolveName(cfg, summoner), summon.Prompt(spacePath, plannedSpec), agentArgs...)
+	resolvedSummoner := summon.ResolveName(cfg, summoner)
+	if prompt == "" {
+		prompt = summon.Prompt(spacePath, plannedSpec)
+	}
+	invocation, err := summon.BuildInvocation(cfg, spacePath, resolvedSummoner, prompt, agentArgs...)
 	if err != nil {
 		return err
 	}

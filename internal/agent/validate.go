@@ -24,10 +24,17 @@ type plannedSpace struct {
 	paths   map[string]bool
 	// branches holds bare branch names ("stave/<id>/<repo>").
 	branches map[string]bool
+	// members holds saga members registered by earlier saga_add operations.
+	// On-disk members are read from the manifest when needed.
+	members map[string]bool
 }
 
 func newPlannedSpace() *plannedSpace {
-	return &plannedSpace{paths: map[string]bool{}, branches: map[string]bool{}}
+	return &plannedSpace{
+		paths:    map[string]bool{},
+		branches: map[string]bool{},
+		members:  map[string]bool{},
+	}
 }
 
 // plannedCreated reports whether the plan creates space id.
@@ -76,6 +83,13 @@ func recordPlannedOp(planned map[string]*plannedSpace, op Operation) {
 			branch = space.DefaultBranch(op.SpaceID, op.Repo)
 		}
 		record.branches[branch] = true
+	case OpSagaAdd:
+		record := planned[op.SagaID]
+		if record == nil {
+			record = newPlannedSpace()
+			planned[op.SagaID] = record
+		}
+		record.members[op.SpaceID] = true
 	}
 }
 
@@ -298,6 +312,13 @@ func validateOperation(cfg config.Config, op Operation, plannedSpaces map[string
 			if err := config.ValidateName("member id", id); err != nil {
 				return err
 			}
+			member, err := sagaMemberExists(cfg, plannedSpaces, op.SagaID, id)
+			if err != nil {
+				return err
+			}
+			if !member {
+				return fmt.Errorf("after member %q is not a member of saga %q", id, op.SagaID)
+			}
 		}
 	case OpReposList:
 		return nil
@@ -450,6 +471,34 @@ func validateSagaOnDisk(cfg config.Config, id string) error {
 		return fmt.Errorf("space %q is not a saga", id)
 	}
 	return nil
+}
+
+// sagaMemberExists reports whether memberID is available as an after target:
+// either it is already in the on-disk saga roster, or an earlier validated
+// saga_add operation in this plan registered it. The current operation is not
+// recorded until validation succeeds, which keeps forward references from
+// passing full-plan preflight.
+func sagaMemberExists(cfg config.Config, planned map[string]*plannedSpace, sagaID, memberID string) (bool, error) {
+	record := planned[sagaID]
+	if record != nil && record.members[memberID] {
+		return true, nil
+	}
+	if record != nil && record.created {
+		return false, nil
+	}
+	manifest, err := space.LoadManifest(filepath.Join(cfg.AgentWorkDir, sagaID))
+	if err != nil {
+		return false, err
+	}
+	if manifest.Saga == nil {
+		return false, fmt.Errorf("space %q is not a saga", sagaID)
+	}
+	for _, member := range manifest.Saga.Members {
+		if member.ID == memberID {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func spaceExists(cfg config.Config, id string) bool {

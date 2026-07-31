@@ -1078,18 +1078,6 @@ func WriteSpaceMCPConfig(spacePath, binary, storeID string) error {
 		server["env"] = map[string]string{"MARMOT_HOME": home}
 	}
 
-	// Claude Code / generic: .mcp.json
-	claude := map[string]any{"mcpServers": map[string]any{"context-marmot": server}}
-	if err := writeJSONAtomic(filepath.Join(spacePath, ".mcp.json"), claude); err != nil {
-		return err
-	}
-	// Cursor: .cursor/mcp.json
-	if err := os.MkdirAll(filepath.Join(spacePath, ".cursor"), 0o755); err != nil {
-		return err
-	}
-	if err := writeJSONAtomic(filepath.Join(spacePath, ".cursor", "mcp.json"), claude); err != nil {
-		return err
-	}
 	// VS Code: .vscode/mcp.json (servers key)
 	vsServer := map[string]any{
 		"type":    "stdio",
@@ -1099,16 +1087,35 @@ func WriteSpaceMCPConfig(spacePath, binary, storeID string) error {
 	if env, ok := server["env"]; ok {
 		vsServer["env"] = env
 	}
-	vscode := map[string]any{
-		"servers": map[string]any{
-			"context-marmot": vsServer,
-		},
+	// Preflight every existing JSON file before writing any of them. A malformed
+	// user config must stop the update without being overwritten or leaving the
+	// other harness configs partially updated.
+	jsonConfigs := []struct {
+		path   string
+		mapKey string
+		server map[string]any
+		doc    map[string]any
+	}{
+		{path: filepath.Join(spacePath, ".mcp.json"), mapKey: "mcpServers", server: server},
+		{path: filepath.Join(spacePath, ".cursor", "mcp.json"), mapKey: "mcpServers", server: server},
+		{path: filepath.Join(spacePath, ".vscode", "mcp.json"), mapKey: "servers", server: vsServer},
 	}
-	if err := os.MkdirAll(filepath.Join(spacePath, ".vscode"), 0o755); err != nil {
-		return err
+	for i := range jsonConfigs {
+		doc, err := mergeJSONMCPServer(jsonConfigs[i].path, jsonConfigs[i].mapKey, jsonConfigs[i].server)
+		if err != nil {
+			return err
+		}
+		jsonConfigs[i].doc = doc
 	}
-	if err := writeJSONAtomic(filepath.Join(spacePath, ".vscode", "mcp.json"), vscode); err != nil {
-		return err
+	for _, dir := range []string{filepath.Join(spacePath, ".cursor"), filepath.Join(spacePath, ".vscode")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	for _, config := range jsonConfigs {
+		if err := writeJSONAtomic(config.path, config.doc); err != nil {
+			return err
+		}
 	}
 	// Codex: .codex/config.toml section
 	var env map[string]string
@@ -1120,6 +1127,38 @@ func WriteSpaceMCPConfig(spacePath, binary, storeID string) error {
 	}
 	// Invariant: never create .marmot-vault
 	return nil
+}
+
+// mergeJSONMCPServer loads one harness JSON config and replaces only its
+// context-marmot server entry. Unrelated servers and top-level settings are
+// preserved. Existing malformed or schema-incompatible documents are rejected
+// so a write never destroys user configuration it cannot safely merge.
+func mergeJSONMCPServer(path, mapKey string, server map[string]any) (map[string]any, error) {
+	doc := make(map[string]any)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return nil, err
+		}
+	} else {
+		if err := json.Unmarshal(data, &doc); err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+		if doc == nil {
+			return nil, fmt.Errorf("%s: expected a JSON object", path)
+		}
+	}
+	servers := make(map[string]any)
+	if existing, present := doc[mapKey]; present {
+		var ok bool
+		servers, ok = existing.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("%s: %q must be a JSON object", path, mapKey)
+		}
+	}
+	servers["context-marmot"] = server
+	doc[mapKey] = servers
+	return doc, nil
 }
 
 func writeCodexMCP(spacePath, binary string, args []string, env map[string]string) error {

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Nurozen/stave/internal/config"
 	"github.com/Nurozen/stave/internal/space"
 	"github.com/spf13/cobra"
 )
@@ -210,6 +211,76 @@ func TestCLISagaCreateDryRunTouchesNothing(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(home, "stave", "agent-work", "epic-dry")); !os.IsNotExist(err) {
 		t.Fatalf("dry-run created the saga directory: %v", err)
+	}
+}
+
+func TestCLISagaCreateDryRunSummonMatchesSagaPrompt(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	runCLI(t, "setup")
+
+	codex := runCLI(t, "saga", "create", "epic-codex", "--dry-run", "--summon", "codex")
+	for _, want := range []string{"saga workspace", "stave saga status epic-codex --json", "coordinates member spaces"} {
+		if !strings.Contains(codex, want) {
+			t.Fatalf("Codex saga dry-run prompt missing %q:\n%s", want, codex)
+		}
+	}
+	if strings.Contains(codex, "editable repositories at the top level") {
+		t.Fatalf("Codex saga dry-run used generic workspace prompt:\n%s", codex)
+	}
+
+	claude := runCLI(t, "saga", "create", "epic-claude", "--memory", ".", "--dry-run", "--summon", "claude")
+	for _, want := range []string{"/stave-saga", "Persistent memory is available", "den: epic-claude"} {
+		if !strings.Contains(claude, want) {
+			t.Fatalf("Claude saga dry-run prompt missing %q:\n%s", want, claude)
+		}
+	}
+}
+
+func TestPlannedSagaMemoriesIncludesAmbientDefault(t *testing.T) {
+	cfg, err := config.Default()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Memory.Default = true
+	memories, err := plannedSagaMemories(*cfg, "epic-ambient", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(memories) != 1 || memories[0].ID != "epic-ambient" || !memories[0].Owned {
+		t.Fatalf("planned ambient saga memories = %#v", memories)
+	}
+}
+
+func TestCLISagaDryRunExecutesReadOnlyGitProbes(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	src := createGitRepo(t, "repo-a")
+	runCLI(t, "setup")
+	runCLI(t, "repos", "add", "repo-a", src)
+	runCLI(t, "saga", "create", "epic-probe")
+	runCLI(t, "space", "create", "probe-member", "--saga", "epic-probe", "-e", "repo-a")
+
+	worktree := filepath.Join(home, "stave", "agent-work", "probe-member", "repo-a")
+	if err := os.WriteFile(filepath.Join(worktree, "committed.txt"), []byte("ahead\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, worktree, "add", "committed.txt")
+	runGit(t, worktree, "-c", "user.name=Test User", "-c", "user.email=test@example.test", "commit", "-m", "ahead")
+
+	sync := runCLI(t, "saga", "sync", "epic-probe", "--dry-run")
+	if strings.Contains(sync, "drift unknown") || !strings.Contains(sync, "edit repo-a: ahead 1, behind 0 versus origin/main") {
+		t.Fatalf("saga sync dry-run did not use live drift probes:\n%s", sync)
+	}
+
+	if err := os.WriteFile(filepath.Join(worktree, "dirty.txt"), []byte("dirty\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	archive := runCLI(t, "saga", "archive", "epic-probe", "--dry-run")
+	for _, want := range []string{"dry-run: would refuse:", "dirty editable worktrees", "dry-run: saga archive plan"} {
+		if !strings.Contains(archive, want) {
+			t.Fatalf("saga archive dry-run missing %q:\n%s", want, archive)
+		}
 	}
 }
 

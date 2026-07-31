@@ -141,6 +141,17 @@ func Prompt(spacePath string, specPath string) string {
 	return PromptForKind(spacePath, specPath, "")
 }
 
+// SagaPromptForPlan renders the prompt a newly-created saga will receive.
+// Unlike defaultPrompt it does not inspect the filesystem: saga create
+// previews run before the manifest and embedded skill exist, but the live
+// path guarantees that the skill is installed before summoning.
+func SagaPromptForPlan(spacePath, specPath, summoner string, memories []space.MemoryManifest) string {
+	if summoner == Claude {
+		return skillPrompt(SagaSkillName, memories)
+	}
+	return sagaStancePrompt(spacePath, specPath, memories)
+}
+
 // ReviewSkillName is the project-level Claude Code skill that stave review
 // installs into each review space (embedded in the stave binary).
 const ReviewSkillName = "pr-teach"

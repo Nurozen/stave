@@ -609,6 +609,25 @@ func TestSagaStatusJSONContract(t *testing.T) {
 	}
 }
 
+func TestSagaStatusJSONEmptyMembersIsArray(t *testing.T) {
+	svc, _, _ := testService(t)
+	ctx := context.Background()
+	if err := svc.CreateSaga(ctx, SagaCreateOptions{ID: "epic-js-empty"}); err != nil {
+		t.Fatal(err)
+	}
+	status, err := svc.SagaStatus(ctx, "epic-js-empty")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(status)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"members":[]`) {
+		t.Fatalf("empty saga members must marshal as an array:\n%s", data)
+	}
+}
+
 // TestSagaSyncReportsMergeFindings: sync runs the status merge detection over
 // the freshly fetched refs, prints human summaries, and persists nothing.
 func TestSagaSyncReportsMergeFindings(t *testing.T) {

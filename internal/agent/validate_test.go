@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -257,6 +258,83 @@ func TestValidatePlanSagaOperations(t *testing.T) {
 	for _, plan := range badPlans {
 		if err := ValidatePlan(cfg, plan); err == nil {
 			t.Fatalf("ValidatePlan(%#v) succeeded unexpectedly", plan)
+		}
+	}
+}
+
+func TestValidatePlanSagaAddRejectsUnknownAfterMembersBeforeExecution(t *testing.T) {
+	cfg := testConfig(t)
+	saveTestSaga(t, cfg, "story-1", space.SagaMember{ID: "member-0"})
+
+	tests := []struct {
+		name string
+		plan Plan
+		op   int
+	}{
+		{
+			name: "existing saga",
+			plan: Plan{Operations: []Operation{
+				{Type: OpSagaAdd, SagaID: "story-1", SpaceID: "ex-1", After: []string{"ghost-member"}},
+			}},
+			op: 1,
+		},
+		{
+			name: "saga and members created in plan",
+			plan: Plan{Operations: []Operation{
+				{Type: OpSagaCreate, SagaID: "story-2"},
+				{Type: OpSpaceCreate, SpaceID: "m-1"},
+				{Type: OpSagaAdd, SagaID: "story-2", SpaceID: "m-1"},
+				{Type: OpSpaceCreate, SpaceID: "m-2"},
+				{Type: OpSagaAdd, SagaID: "story-2", SpaceID: "m-2", After: []string{"ghost-member"}},
+			}},
+			op: 5,
+		},
+		{
+			name: "forward reference to later addition",
+			plan: Plan{Operations: []Operation{
+				{Type: OpSagaCreate, SagaID: "story-2"},
+				{Type: OpSpaceCreate, SpaceID: "m-1"},
+				{Type: OpSpaceCreate, SpaceID: "m-2"},
+				{Type: OpSagaAdd, SagaID: "story-2", SpaceID: "m-2", After: []string{"m-1"}},
+				{Type: OpSagaAdd, SagaID: "story-2", SpaceID: "m-1"},
+			}},
+			op: 4,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidatePlan(cfg, tt.plan)
+			if err == nil {
+				t.Fatal("ValidatePlan() succeeded unexpectedly")
+			}
+			want := fmt.Sprintf("operation %d (saga_add): after member", tt.op)
+			if !strings.Contains(err.Error(), want) || !strings.Contains(err.Error(), "is not a member of saga") {
+				t.Fatalf("ValidatePlan() error = %q, want %q and membership failure", err, want)
+			}
+		})
+	}
+}
+
+func TestValidatePlanSagaAddAcceptsExistingAndEarlierPlannedAfterMembers(t *testing.T) {
+	cfg := testConfig(t)
+	saveTestSaga(t, cfg, "story-1", space.SagaMember{ID: "member-0"})
+
+	plans := []Plan{
+		{Operations: []Operation{
+			{Type: OpSagaAdd, SagaID: "story-1", SpaceID: "ex-1", After: []string{"member-0"}},
+		}},
+		{Operations: []Operation{
+			{Type: OpSagaCreate, SagaID: "story-2"},
+			{Type: OpSpaceCreate, SpaceID: "m-1"},
+			{Type: OpSagaAdd, SagaID: "story-2", SpaceID: "m-1"},
+			{Type: OpSpaceCreate, SpaceID: "m-2"},
+			{Type: OpSagaAdd, SagaID: "story-2", SpaceID: "m-2", After: []string{"m-1"}},
+		}},
+	}
+	for _, plan := range plans {
+		if err := ValidatePlan(cfg, plan); err != nil {
+			t.Fatalf("ValidatePlan(%#v) error = %v", plan, err)
 		}
 	}
 }

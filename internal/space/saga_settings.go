@@ -81,10 +81,10 @@ func writeClaudeAdditionalDirectories(spacePath string, dirs []string) error {
 	return fsio.WriteFileAtomic(path, append(data, '\n'), 0o644)
 }
 
-// writeCodexWritableRoots merges a [sandbox_workspace_write] writable_roots
-// section into .codex/config.toml, replacing only that section and keeping
-// unrelated TOML content byte-stable (the same section-replace approach as
-// internal/memory's codex MCP config writer).
+// writeCodexWritableRoots merges writable_roots into the
+// [sandbox_workspace_write] table in .codex/config.toml. The writable_roots
+// entry is stave-owned, but sibling entries in that table (for example
+// network_access) and unrelated TOML content are preserved.
 func writeCodexWritableRoots(spacePath string, roots []string) error {
 	dir := filepath.Join(spacePath, ".codex")
 	if err := os.MkdirAll(dir, config.DefaultDirMode); err != nil {
@@ -97,25 +97,135 @@ func writeCodexWritableRoots(spacePath string, roots []string) error {
 	} else if !os.IsNotExist(err) {
 		return err
 	}
-	cleaned := stripTOMLSection(existing, codexWritableRootsSection)
-	var b strings.Builder
-	b.WriteString(cleaned)
-	if cleaned != "" && !strings.HasSuffix(cleaned, "\n") {
-		b.WriteString("\n")
-	}
-	if cleaned != "" {
-		b.WriteString("\n")
-	}
-	fmt.Fprintf(&b, "[%s]\n", codexWritableRootsSection)
-	b.WriteString("writable_roots = [")
+	var value strings.Builder
+	value.WriteString("[")
 	for i, root := range roots {
 		if i > 0 {
-			b.WriteString(", ")
+			value.WriteString(", ")
 		}
-		fmt.Fprintf(&b, "%q", root)
+		fmt.Fprintf(&value, "%q", root)
 	}
-	b.WriteString("]\n")
-	return fsio.WriteFileAtomic(path, []byte(b.String()), 0o644)
+	value.WriteString("]")
+	merged := replaceTOMLTableEntry(existing, codexWritableRootsSection, "writable_roots", value.String())
+	return fsio.WriteFileAtomic(path, []byte(merged), 0o644)
+}
+
+// replaceTOMLTableEntry replaces key inside [section], or creates the missing
+// entry/table. It deliberately edits lines instead of re-encoding the TOML so
+// all content outside the stave-owned entry remains byte-stable. A prior
+// multi-line array value is consumed through its closing bracket.
+func replaceTOMLTableEntry(src, section, key, value string) string {
+	lines := strings.Split(src, "\n")
+	sectionStart := -1
+	sectionEnd := len(lines)
+	for i, line := range lines {
+		header, arrayTable, ok := tomlTableHeader(line)
+		if !ok {
+			continue
+		}
+		if sectionStart < 0 {
+			if !arrayTable && header == section {
+				sectionStart = i
+			}
+			continue
+		}
+		sectionEnd = i
+		break
+	}
+
+	entry := key + " = " + value
+	if sectionStart < 0 {
+		var b strings.Builder
+		b.WriteString(src)
+		if src != "" && !strings.HasSuffix(src, "\n") {
+			b.WriteByte('\n')
+		}
+		if src != "" {
+			b.WriteByte('\n')
+		}
+		fmt.Fprintf(&b, "[%s]\n%s\n", section, entry)
+		return b.String()
+	}
+
+	for i := sectionStart + 1; i < sectionEnd; i++ {
+		if !tomlEntryHasKey(lines[i], key) {
+			continue
+		}
+		end := i + 1
+		depth, sawArray := tomlArrayDepth(lines[i])
+		for sawArray && depth > 0 && end < sectionEnd {
+			delta, _ := tomlArrayDepth(lines[end])
+			depth += delta
+			end++
+		}
+		updated := make([]string, 0, len(lines)-(end-i)+1)
+		updated = append(updated, lines[:i]...)
+		updated = append(updated, entry)
+		updated = append(updated, lines[end:]...)
+		return strings.Join(updated, "\n")
+	}
+
+	updated := make([]string, 0, len(lines)+1)
+	updated = append(updated, lines[:sectionEnd]...)
+	updated = append(updated, entry)
+	updated = append(updated, lines[sectionEnd:]...)
+	return strings.Join(updated, "\n")
+}
+
+func tomlTableHeader(line string) (name string, arrayTable, ok bool) {
+	trim := strings.TrimSpace(line)
+	if strings.HasPrefix(trim, "[[") && strings.HasSuffix(trim, "]]") {
+		return strings.TrimSpace(trim[2 : len(trim)-2]), true, true
+	}
+	if strings.HasPrefix(trim, "[") && strings.HasSuffix(trim, "]") {
+		return strings.TrimSpace(trim[1 : len(trim)-1]), false, true
+	}
+	return "", false, false
+}
+
+func tomlEntryHasKey(line, key string) bool {
+	trim := strings.TrimSpace(line)
+	if !strings.HasPrefix(trim, key) {
+		return false
+	}
+	rest := strings.TrimSpace(strings.TrimPrefix(trim, key))
+	return strings.HasPrefix(rest, "=")
+}
+
+// tomlArrayDepth counts unquoted square brackets before an inline comment.
+// It is intentionally narrow: writable_roots is defined as an array value.
+func tomlArrayDepth(line string) (depth int, sawArray bool) {
+	inString := false
+	escaped := false
+	for _, r := range line {
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if r == '\\' {
+				escaped = true
+				continue
+			}
+			if r == '"' {
+				inString = false
+			}
+			continue
+		}
+		switch r {
+		case '"':
+			inString = true
+		case '#':
+			return depth, sawArray
+		case '[':
+			depth++
+			sawArray = true
+		case ']':
+			depth--
+			sawArray = true
+		}
+	}
+	return depth, sawArray
 }
 
 // stripTOMLSection removes [section] (and nested [section.*]) tables from a

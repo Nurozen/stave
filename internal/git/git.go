@@ -23,7 +23,8 @@ type Runner interface {
 }
 
 type RunOptions struct {
-	Dir string
+	Dir      string
+	ReadOnly bool
 }
 
 type Result struct {
@@ -137,7 +138,7 @@ func (c *Client) CheckoutDetached(ctx context.Context, worktreePath, ref string)
 }
 
 func (c *Client) BranchExists(ctx context.Context, bareRepo, branch string) (bool, error) {
-	_, err := c.run(ctx, "--git-dir", bareRepo, "show-ref", "--verify", "--quiet", "refs/heads/"+strings.TrimPrefix(branch, "refs/heads/"))
+	_, err := c.probe(ctx, "--git-dir", bareRepo, "show-ref", "--verify", "--quiet", "refs/heads/"+strings.TrimPrefix(branch, "refs/heads/"))
 	if err == nil {
 		return true, nil
 	}
@@ -150,7 +151,7 @@ func (c *Client) BranchExists(ctx context.Context, bareRepo, branch string) (boo
 // IsAncestor reports whether ancestor is an ancestor of descendant in the
 // bare repo. A missing ref (git exit 128) is returned as an error, not false.
 func (c *Client) IsAncestor(ctx context.Context, bareRepo, ancestor, descendant string) (bool, error) {
-	_, err := c.run(ctx, "--git-dir", bareRepo, "merge-base", "--is-ancestor", ancestor, descendant)
+	_, err := c.probe(ctx, "--git-dir", bareRepo, "merge-base", "--is-ancestor", ancestor, descendant)
 	if err == nil {
 		return true, nil
 	}
@@ -164,7 +165,7 @@ func (c *Client) IsAncestor(ctx context.Context, bareRepo, ancestor, descendant 
 // ref (refs/heads/..., refs/remotes/origin/...) verbatim; unlike BranchExists
 // it does not force the refs/heads/ namespace.
 func (c *Client) RefExists(ctx context.Context, bareRepo, fullRef string) (bool, error) {
-	_, err := c.run(ctx, "--git-dir", bareRepo, "show-ref", "--verify", "--quiet", fullRef)
+	_, err := c.probe(ctx, "--git-dir", bareRepo, "show-ref", "--verify", "--quiet", fullRef)
 	if err == nil {
 		return true, nil
 	}
@@ -175,11 +176,11 @@ func (c *Client) RefExists(ctx context.Context, bareRepo, fullRef string) (bool,
 }
 
 func (c *Client) RemoteDefaultBranch(ctx context.Context, bareRepo string) (string, error) {
-	out, err := c.Output(ctx, "--git-dir", bareRepo, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
+	out, err := c.probeOutput(ctx, "--git-dir", bareRepo, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
 	if err == nil && strings.TrimSpace(out) != "" {
 		return strings.TrimPrefix(strings.TrimSpace(out), "origin/"), nil
 	}
-	out, err = c.Output(ctx, "--git-dir", bareRepo, "remote", "show", "origin")
+	out, err = c.probeOutput(ctx, "--git-dir", bareRepo, "remote", "show", "origin")
 	if err != nil {
 		return "", err
 	}
@@ -193,7 +194,7 @@ func (c *Client) RemoteDefaultBranch(ctx context.Context, bareRepo string) (stri
 }
 
 func (c *Client) IsDirty(ctx context.Context, worktreePath string) (bool, string, error) {
-	out, err := c.OutputIn(ctx, worktreePath, "status", "--porcelain=v1")
+	out, err := c.probeOutputIn(ctx, worktreePath, "status", "--porcelain=v1")
 	if err != nil {
 		return false, "", err
 	}
@@ -201,7 +202,7 @@ func (c *Client) IsDirty(ctx context.Context, worktreePath string) (bool, string
 }
 
 func (c *Client) AheadBehind(ctx context.Context, worktreePath, baseRef string) (ahead, behind int, err error) {
-	out, err := c.OutputIn(ctx, worktreePath, "rev-list", "--left-right", "--count", baseRef+"...HEAD")
+	out, err := c.probeOutputIn(ctx, worktreePath, "rev-list", "--left-right", "--count", baseRef+"...HEAD")
 	if err != nil {
 		return 0, 0, err
 	}
@@ -238,6 +239,27 @@ func (c *Client) run(ctx context.Context, args ...string) (Result, error) {
 	return c.runWithOptions(ctx, args, RunOptions{})
 }
 
+// probe and probeIn execute read-only git queries even when DryRun is set.
+// A dry-run must suppress mutations, not the observations used to produce an
+// accurate plan (dirty guards, drift, ref existence, and ancestry).
+func (c *Client) probe(ctx context.Context, args ...string) (Result, error) {
+	return c.runWithOptions(ctx, args, RunOptions{ReadOnly: true})
+}
+
+func (c *Client) probeIn(ctx context.Context, dir string, args ...string) (Result, error) {
+	return c.runWithOptions(ctx, args, RunOptions{Dir: dir, ReadOnly: true})
+}
+
+func (c *Client) probeOutput(ctx context.Context, args ...string) (string, error) {
+	result, err := c.probe(ctx, args...)
+	return result.Stdout, err
+}
+
+func (c *Client) probeOutputIn(ctx context.Context, dir string, args ...string) (string, error) {
+	result, err := c.probeIn(ctx, dir, args...)
+	return result.Stdout, err
+}
+
 func (c *Client) runWithOptions(ctx context.Context, args []string, opts RunOptions) (Result, error) {
 	if c == nil {
 		c = New()
@@ -248,7 +270,7 @@ func (c *Client) runWithOptions(ctx context.Context, args []string, opts RunOpti
 	if c.runner == nil {
 		c.runner = execRunner{}
 	}
-	if c.DryRun {
+	if c.DryRun && !opts.ReadOnly {
 		if c.Logf != nil {
 			prefix := ""
 			if opts.Dir != "" {

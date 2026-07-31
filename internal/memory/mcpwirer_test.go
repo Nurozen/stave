@@ -16,6 +16,7 @@ import (
 func seedMultiServerMCPConfigs(t *testing.T, dir string) {
 	t.Helper()
 	mcp := map[string]any{
+		"settings": map[string]any{"preserve": true},
 		"mcpServers": map[string]any{
 			"context-marmot": map[string]any{"command": "marmot", "args": []string{"serve", "--den", "gone"}},
 			"other":          map[string]any{"command": "other"},
@@ -32,6 +33,7 @@ func seedMultiServerMCPConfigs(t *testing.T, dir string) {
 		t.Fatal(err)
 	}
 	vs := map[string]any{
+		"inputs": []any{map[string]any{"id": "keep-input"}},
 		"servers": map[string]any{
 			"context-marmot": map[string]any{"command": "marmot"},
 			"keep-me":        map[string]any{"command": "x"},
@@ -121,6 +123,116 @@ func TestMarmotWriteMCPConfigWritesAllFourWithDenID(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, ".marmot-vault")); !os.IsNotExist(err) {
 		t.Fatal(".marmot-vault must never be created")
+	}
+}
+
+func TestWriteSpaceMCPConfigReplacesOnlyMarmotEntries(t *testing.T) {
+	dir := t.TempDir()
+	seedMultiServerMCPConfigs(t, dir)
+
+	if err := WriteSpaceMCPConfig(dir, "/opt/marmot", "den-new"); err != nil {
+		t.Fatal(err)
+	}
+	// Exercise re-add/update as a second write: the generated entry must be
+	// replaced while every unrelated server and setting survives both writes.
+	if err := WriteSpaceMCPConfig(dir, "/opt/marmot", "den-newer"); err != nil {
+		t.Fatal(err)
+	}
+
+	checks := []struct {
+		rel       string
+		mapKey    string
+		otherName string
+	}{
+		{rel: ".mcp.json", mapKey: "mcpServers", otherName: "other"},
+		{rel: filepath.Join(".cursor", "mcp.json"), mapKey: "mcpServers", otherName: "other"},
+		{rel: filepath.Join(".vscode", "mcp.json"), mapKey: "servers", otherName: "keep-me"},
+	}
+	for _, check := range checks {
+		raw, err := os.ReadFile(filepath.Join(dir, check.rel))
+		if err != nil {
+			t.Fatalf("%s: %v", check.rel, err)
+		}
+		var doc map[string]any
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			t.Fatalf("%s: %v", check.rel, err)
+		}
+		servers, ok := doc[check.mapKey].(map[string]any)
+		if !ok {
+			t.Fatalf("%s missing %s object: %#v", check.rel, check.mapKey, doc)
+		}
+		if _, ok := servers[check.otherName]; !ok {
+			t.Fatalf("%s lost unrelated server %q: %#v", check.rel, check.otherName, doc)
+		}
+		if check.mapKey == "mcpServers" {
+			settings, ok := doc["settings"].(map[string]any)
+			if !ok || settings["preserve"] != true {
+				t.Fatalf("%s lost unrelated top-level settings: %#v", check.rel, doc)
+			}
+		} else if inputs, ok := doc["inputs"].([]any); !ok || len(inputs) != 1 {
+			t.Fatalf("%s lost unrelated top-level inputs: %#v", check.rel, doc)
+		}
+		marmot, ok := servers["context-marmot"].(map[string]any)
+		if !ok {
+			t.Fatalf("%s missing context-marmot: %#v", check.rel, doc)
+		}
+		args, _ := marmot["args"].([]any)
+		if len(args) != 3 || args[2] != "den-newer" {
+			t.Fatalf("%s context-marmot was not replaced: %#v", check.rel, marmot)
+		}
+		if strings.Contains(string(raw), "gone") {
+			t.Fatalf("%s retained an old den binding: %s", check.rel, raw)
+		}
+	}
+	if raw, err := os.ReadFile(filepath.Join(dir, ".codex", "config.toml")); err != nil {
+		t.Fatal(err)
+	} else if !strings.Contains(string(raw), "[mcp_servers.other]") || !strings.Contains(string(raw), "den-newer") {
+		t.Fatalf("codex update lost unrelated config or new binding: %s", raw)
+	}
+}
+
+func TestWriteSpaceMCPConfigRejectsMalformedJSONWithoutPartialWrites(t *testing.T) {
+	for _, malformedRel := range []string{
+		".mcp.json",
+		filepath.Join(".cursor", "mcp.json"),
+		filepath.Join(".vscode", "mcp.json"),
+	} {
+		t.Run(malformedRel, func(t *testing.T) {
+			dir := t.TempDir()
+			seedMultiServerMCPConfigs(t, dir)
+			malformedPath := filepath.Join(dir, malformedRel)
+			malformed := []byte("{not-json\n")
+			if err := os.WriteFile(malformedPath, malformed, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			before := make(map[string][]byte)
+			for _, rel := range []string{
+				".mcp.json",
+				filepath.Join(".cursor", "mcp.json"),
+				filepath.Join(".vscode", "mcp.json"),
+				filepath.Join(".codex", "config.toml"),
+			} {
+				raw, err := os.ReadFile(filepath.Join(dir, rel))
+				if err != nil {
+					t.Fatal(err)
+				}
+				before[rel] = raw
+			}
+
+			err := WriteSpaceMCPConfig(dir, "/opt/marmot", "den-new")
+			if err == nil || !strings.Contains(err.Error(), malformedRel) {
+				t.Fatalf("expected path-specific malformed JSON error, got %v", err)
+			}
+			for rel, want := range before {
+				got, readErr := os.ReadFile(filepath.Join(dir, rel))
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				if string(got) != string(want) {
+					t.Fatalf("%s changed after preflight failure\nwant: %s\n got: %s", rel, want, got)
+				}
+			}
+		})
 	}
 }
 

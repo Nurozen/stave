@@ -31,7 +31,7 @@ func TestSagaAgentSettingsMaintained(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(codexPath), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	toml := "[profile]\nname = \"x\"\n\n[sandbox_workspace_write]\nwritable_roots = [\"/stale\"]\n\n[other]\nkey = 1\n"
+	toml := "[profile]\nname = \"x\"\n\n[sandbox_workspace_write]\nnetwork_access = true\nwritable_roots = [\n  \"/stale\",\n]\n\n[other]\nkey = 1\n"
 	if err := os.WriteFile(codexPath, []byte(toml), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -76,6 +76,7 @@ func TestSagaAgentSettingsMaintained(t *testing.T) {
 	tomlGot := string(got)
 	for _, want := range []string{
 		"[profile]", "name = \"x\"", "[other]", "key = 1", "[sandbox_workspace_write]",
+		"network_access = true",
 		fmt.Sprintf("writable_roots = [%q, %q]", svc.SpacePath("set-1"), svc.SpacePath("set-2")),
 	} {
 		if !strings.Contains(tomlGot, want) {
@@ -104,6 +105,9 @@ func TestSagaAgentSettingsMaintained(t *testing.T) {
 	}
 	if strings.Contains(string(got), svc.SpacePath("set-1")) || !strings.Contains(string(got), svc.SpacePath("set-2")) {
 		t.Fatalf("post-remove writable_roots wrong:\n%s", got)
+	}
+	if !strings.Contains(string(got), "network_access = true") {
+		t.Fatalf("post-remove network_access setting lost:\n%s", got)
 	}
 
 	// A saga without pre-existing files gets minimal ones on first change.

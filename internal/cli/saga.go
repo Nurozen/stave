@@ -5,6 +5,7 @@ import (
 	"io"
 	"strings"
 
+	"github.com/Nurozen/stave/internal/config"
 	"github.com/Nurozen/stave/internal/memory"
 	"github.com/Nurozen/stave/internal/space"
 	"github.com/Nurozen/stave/internal/summon"
@@ -84,7 +85,17 @@ func (a *app) sagaCreateCommand() *cobra.Command {
 				if summonName == "" {
 					return nil
 				}
-				return a.printPlannedSummon(cmd, svc.Config, sagaID, summonName, spec, agentArgs)
+				plannedMemories, err := plannedSagaMemories(svc.Config, sagaID, memories)
+				if err != nil {
+					return err
+				}
+				plannedSpec := ""
+				if spec != "" {
+					plannedSpec = "spec"
+				}
+				spacePath := svc.SpacePath(sagaID)
+				prompt := summon.SagaPromptForPlan(spacePath, plannedSpec, summon.ResolveName(svc.Config, summonName), plannedMemories)
+				return a.printPlannedSummonWithPrompt(cmd, svc.Config, sagaID, summonName, spec, agentArgs, prompt)
 			}
 			if err := summon.InstallSagaSkill(svc.SpacePath(sagaID)); err != nil {
 				return err
@@ -105,6 +116,25 @@ func (a *app) sagaCreateCommand() *cobra.Command {
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print operations without changing state")
 	cmd.Flags().SetInterspersed(false)
 	return cmd
+}
+
+func plannedSagaMemories(cfg config.Config, sagaID string, rawSpecs []string) ([]space.MemoryManifest, error) {
+	if len(rawSpecs) == 0 && cfg.Memory.Default {
+		rawSpecs = []string{"."}
+	}
+	planned := make([]space.MemoryManifest, 0, len(rawSpecs))
+	for _, raw := range rawSpecs {
+		parsed, err := memory.ParseMemorySpec(raw, cfg.Memory.Provider)
+		if err != nil {
+			return nil, err
+		}
+		id := parsed.Spec
+		if parsed.Fresh {
+			id = sagaID
+		}
+		planned = append(planned, space.MemoryManifest{Provider: parsed.Provider, ID: id, Owned: parsed.Fresh})
+	}
+	return planned, nil
 }
 
 // sagaListRow is the typed --json row: every space with its kind and saga join.

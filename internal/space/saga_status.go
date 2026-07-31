@@ -373,7 +373,7 @@ func (s Service) SagaStatus(ctx context.Context, sagaID string) (SagaStatus, err
 	for _, member := range manifest.Saga.Members {
 		roster[member.ID] = true
 	}
-	status := SagaStatus{SagaID: sagaID}
+	status := SagaStatus{SagaID: sagaID, Members: make([]SagaMemberStatus, 0)}
 	for _, member := range sagaTopoOrder(manifest.Saga.Members) {
 		row := SagaMemberStatus{ID: member.ID, After: append([]string(nil), member.After...)}
 		row.State, row.Error = s.resolveMemberState(member)

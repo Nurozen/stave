@@ -382,6 +382,45 @@ func TestDryRunLogsCommandsWithoutCallingRunner(t *testing.T) {
 	}
 }
 
+func TestDryRunExecutesReadOnlyProbesWithoutLoggingThem(t *testing.T) {
+	runner := &fakeRunner{results: []Result{
+		{Stdout: " M file.txt\n"},
+		{Stdout: "2\t3\n"},
+	}}
+	var logs []string
+	client := New(
+		WithRunner(runner),
+		WithDryRun(true, func(format string, args ...any) {
+			logs = append(logs, strings.TrimSpace(fmt.Sprintf(format, args...)))
+		}),
+	)
+
+	dirty, output, err := client.IsDirty(context.Background(), "/tmp/wt")
+	if err != nil || !dirty || !strings.Contains(output, "file.txt") {
+		t.Fatalf("IsDirty(dry-run probe) = %v %q %v", dirty, output, err)
+	}
+	ahead, behind, err := client.AheadBehind(context.Background(), "/tmp/wt", "origin/main")
+	if err != nil || ahead != 3 || behind != 2 {
+		t.Fatalf("AheadBehind(dry-run probe) = ahead %d behind %d err %v", ahead, behind, err)
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("read-only probes did not execute: %#v", runner.calls)
+	}
+	if len(logs) != 0 {
+		t.Fatalf("read-only probes were presented as planned mutations: %#v", logs)
+	}
+
+	if err := client.FetchAllPrune(context.Background(), "/tmp/repo.git"); err != nil {
+		t.Fatalf("FetchAllPrune(dry-run) error = %v", err)
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("mutating dry-run command executed: %#v", runner.calls)
+	}
+	if len(logs) != 1 || !strings.Contains(logs[0], "fetch --all --prune") {
+		t.Fatalf("mutating dry-run command log = %#v", logs)
+	}
+}
+
 func TestGitErrorFormattingAndExecRunner(t *testing.T) {
 	cause := errors.New("exit")
 	err := &GitError{Args: []string{"status"}, ExitCode: 7, Stderr: " fatal\n", Err: cause}

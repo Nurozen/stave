@@ -531,3 +531,17 @@ func TestInstallSagaSkillWritesEmbeddedSkill(t *testing.T) {
 		t.Fatalf("installed skill missing frontmatter name: %q", string(data)[:120])
 	}
 }
+
+func TestSagaPromptForPlanMatchesGuaranteedPostCreateState(t *testing.T) {
+	spacePath := filepath.Join(t.TempDir(), "epic")
+	memories := []space.MemoryManifest{{ID: "epic-den"}}
+
+	claude := SagaPromptForPlan(spacePath, "spec", Claude, memories)
+	if !strings.Contains(claude, "/stave-saga") || !strings.Contains(claude, "den: epic-den") {
+		t.Fatalf("Claude planned saga prompt = %q", claude)
+	}
+	codex := SagaPromptForPlan(spacePath, "spec", Codex, memories)
+	if !strings.Contains(codex, "saga workspace") || !strings.Contains(codex, "stave saga status epic --json") || !strings.Contains(codex, "den: epic-den") {
+		t.Fatalf("Codex planned saga prompt = %q", codex)
+	}
+}
