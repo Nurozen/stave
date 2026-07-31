@@ -147,6 +147,33 @@ func (c *Client) BranchExists(ctx context.Context, bareRepo, branch string) (boo
 	return false, err
 }
 
+// IsAncestor reports whether ancestor is an ancestor of descendant in the
+// bare repo. A missing ref (git exit 128) is returned as an error, not false.
+func (c *Client) IsAncestor(ctx context.Context, bareRepo, ancestor, descendant string) (bool, error) {
+	_, err := c.run(ctx, "--git-dir", bareRepo, "merge-base", "--is-ancestor", ancestor, descendant)
+	if err == nil {
+		return true, nil
+	}
+	if IsExitCode(err, 1) {
+		return false, nil
+	}
+	return false, err
+}
+
+// RefExists reports whether fullRef exists in the bare repo. It takes a full
+// ref (refs/heads/..., refs/remotes/origin/...) verbatim; unlike BranchExists
+// it does not force the refs/heads/ namespace.
+func (c *Client) RefExists(ctx context.Context, bareRepo, fullRef string) (bool, error) {
+	_, err := c.run(ctx, "--git-dir", bareRepo, "show-ref", "--verify", "--quiet", fullRef)
+	if err == nil {
+		return true, nil
+	}
+	if IsExitCode(err, 1) {
+		return false, nil
+	}
+	return false, err
+}
+
 func (c *Client) RemoteDefaultBranch(ctx context.Context, bareRepo string) (string, error) {
 	out, err := c.Output(ctx, "--git-dir", bareRepo, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
 	if err == nil && strings.TrimSpace(out) != "" {

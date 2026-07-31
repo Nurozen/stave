@@ -14,6 +14,11 @@ Use a portal when you want to:
 Portal metadata is written to `.stave-portal.yaml` in the space root. If you do
 not pass a `portal-id`, Stave uses `default`.
 
+A portal covers exactly one space directory. On a saga that means the saga
+space alone — its members are sibling spaces with their own roots, so each
+needs its own portal. Saga-scoped portals that carry the whole roster are a
+planned extension.
+
 ## Quick Start: Local Container
 
 Start with an existing space:

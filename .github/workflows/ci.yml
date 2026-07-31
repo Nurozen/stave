@@ -30,6 +30,11 @@ jobs:
       - name: Build
         run: go build ./...
 
+      - name: Build (windows cross-compile)
+        run: go build ./...
+        env:
+          GOOS: windows
+
       - name: Vet
         run: go vet ./...
 

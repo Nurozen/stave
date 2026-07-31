@@ -25,13 +25,16 @@ func TestParsePlanTextAndCommands(t *testing.T) {
 
 func TestEquivalentCommands(t *testing.T) {
 	tests := map[string]Operation{
-		"stave space add ex api -e -b develop":  {Type: OpSpaceAdd, SpaceID: "ex", Repo: "api", Mode: "edit", Base: "develop"},
-		"stave space add ex docs -r -b main":    {Type: OpSpaceAdd, SpaceID: "ex", Repo: "docs", Mode: "reference", Base: "main"},
-		"stave space sync ex --references-only": {Type: OpSpaceSync, SpaceID: "ex", ReferencesOnly: true},
-		"stave space status ex":                 {Type: OpSpaceStatus, SpaceID: "ex"},
-		"stave repos list":                      {Type: OpReposList},
-		"stave repos sync api":                  {Type: OpReposSync, Repo: "api"},
-		"stave summon ex --with cursor":         {Type: OpSummon, SpaceID: "ex", Summoner: "cursor"},
+		"stave space add ex api -e -b develop":                           {Type: OpSpaceAdd, SpaceID: "ex", Repo: "api", Mode: "edit", Base: "develop"},
+		"stave space add ex docs -r -b main":                             {Type: OpSpaceAdd, SpaceID: "ex", Repo: "docs", Mode: "reference", Base: "main"},
+		"stave space sync ex --references-only":                          {Type: OpSpaceSync, SpaceID: "ex", ReferencesOnly: true},
+		"stave space status ex":                                          {Type: OpSpaceStatus, SpaceID: "ex"},
+		"stave repos list":                                               {Type: OpReposList},
+		"stave repos sync api":                                           {Type: OpReposSync, Repo: "api"},
+		"stave summon ex --with cursor":                                  {Type: OpSummon, SpaceID: "ex", Summoner: "cursor"},
+		"stave saga create story -s /tmp/spec.md -r web:main --memory .": {Type: OpSagaCreate, SagaID: "story", SpecPath: "/tmp/spec.md", References: []RepoRef{{Name: "web", Ref: "main"}}, Memories: []string{"."}},
+		"stave saga status story":                                        {Type: OpSagaStatus, SagaID: "story"},
+		"stave saga add story m-2 --after m-1":                           {Type: OpSagaAdd, SagaID: "story", SpaceID: "m-2", After: []string{"m-1"}},
 		"stave portal init container ex dev --image 'image with spaces' --container-root '/workspace/ex $1'":                                                                                                           {Type: OpPortalInit, SpaceID: "ex", PortalID: "dev", Driver: "docker", Image: "image with spaces", ContainerRoot: "/workspace/ex $1"},
 		"stave portal attach ssh ex 'host name' dev --remote-root ~/stave/ex --identity '~/.ssh/id key' --known-hosts /tmp/known_hosts --strict-host-key yes --sync rsync":                                             {Type: OpPortalAttach, SpaceID: "ex", PortalID: "dev", Driver: "ssh", Host: "host name", RemoteRoot: "~/stave/ex", IdentityPath: "~/.ssh/id key", KnownHostsPath: "/tmp/known_hosts", StrictHostKey: "yes", SyncMode: "rsync"},
 		"stave portal attach ec2 ex i-123 dev --remote-root ~/stave/ex --port 2222 --identity ~/.ssh/aws --known-hosts /tmp/aws_known_hosts --strict-host-key yes --sync rsync --host 203.0.113.10 --region us-west-2": {Type: OpPortalAttach, SpaceID: "ex", PortalID: "dev", Driver: "ec2-attach", InstanceID: "i-123", Host: "203.0.113.10", Port: 2222, Region: "us-west-2", RemoteRoot: "~/stave/ex", IdentityPath: "~/.ssh/aws", KnownHostsPath: "/tmp/aws_known_hosts", StrictHostKey: "yes", SyncMode: "rsync"},

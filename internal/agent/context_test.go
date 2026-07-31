@@ -127,6 +127,53 @@ func TestBuildContextSortsSpacesAndSummarizesPortals(t *testing.T) {
 	}
 }
 
+func TestBuildContextIncludesSagaRoster(t *testing.T) {
+	cfg := executorConfig(t)
+	writeExecutorSpace(t, cfg, "plain")
+	spacePath := filepath.Join(cfg.AgentWorkDir, "story")
+	if err := os.MkdirAll(spacePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := space.SaveManifest(spacePath, space.Manifest{
+		ID:        "story",
+		Kind:      space.KindSaga,
+		CreatedAt: time.Now().UTC(),
+		Saga: &space.SagaManifest{Members: []space.SagaMember{
+			{ID: "m-1"},
+			{ID: "m-2", After: []string{"m-1"}, PRs: []space.SagaPR{{Repo: "api", Number: 41}}},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, err := BuildContext(cfg)
+	if err != nil {
+		t.Fatalf("BuildContext error = %v", err)
+	}
+	var story, plain *SpaceContext
+	for i := range ctx.Spaces {
+		switch ctx.Spaces[i].ID {
+		case "story":
+			story = &ctx.Spaces[i]
+		case "plain":
+			plain = &ctx.Spaces[i]
+		}
+	}
+	if story == nil || story.Saga == nil || len(story.Saga.Members) != 2 {
+		t.Fatalf("saga context = %#v", ctx.Spaces)
+	}
+	second := story.Saga.Members[1]
+	if second.ID != "m-2" || len(second.After) != 1 || second.After[0] != "m-1" {
+		t.Fatalf("member after edges = %#v", second)
+	}
+	if len(second.PRs) != 1 || second.PRs[0].Repo != "api" || second.PRs[0].Number != 41 {
+		t.Fatalf("member PR identities = %#v", second.PRs)
+	}
+	if plain == nil || plain.Saga != nil {
+		t.Fatalf("plain space context = %#v", plain)
+	}
+}
+
 func TestPortalSummariesSortsPortalsAndProviders(t *testing.T) {
 	cfg := executorConfig(t)
 	spacePath := filepath.Join(cfg.AgentWorkDir, "multi")

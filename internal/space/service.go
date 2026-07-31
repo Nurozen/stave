@@ -14,6 +14,7 @@ import (
 
 	"github.com/Nurozen/stave/internal/config"
 	"github.com/Nurozen/stave/internal/fsio"
+	"github.com/Nurozen/stave/internal/gh"
 	"github.com/Nurozen/stave/internal/git"
 	"github.com/Nurozen/stave/internal/memory"
 )
@@ -27,6 +28,8 @@ type Git interface {
 	WorktreePrune(context.Context, string) error
 	CheckoutDetached(context.Context, string, string) error
 	BranchExists(context.Context, string, string) (bool, error)
+	IsAncestor(context.Context, string, string, string) (bool, error)
+	RefExists(context.Context, string, string) (bool, error)
 	IsDirty(context.Context, string) (bool, string, error)
 	AheadBehind(context.Context, string, string) (int, int, error)
 }
@@ -44,12 +47,23 @@ type Service struct {
 	// HasPortal, when set, reports whether a space has any portal attached
 	// (memory is local-summon-only in v1 — attach prints a notice).
 	HasPortal func(spaceID string) bool
+	// PRLookup, when set, is the layer-2 merge probe: it lists the pull
+	// requests whose head is headBranch in the repo cloned from cloneURL. nil
+	// skips PR-based detection entirely (merge awareness degrades to commit
+	// ancestry). The CLI wires it to internal/gh.
+	PRLookup func(ctx context.Context, cloneURL, headBranch string) ([]gh.PR, error)
 }
 
 type InitOptions struct {
 	ID       string
 	Kind     string
 	SpecPath string
+	// Saga, when set, is written into the initial manifest so a saga space is
+	// born v2 rather than upgraded after the fact. Only CreateSaga sets it.
+	Saga *SagaManifest
+	// viaSaga marks calls composed by CreateSaga; Kind == KindSaga is rejected
+	// on any other path (impostor prevention).
+	viaSaga bool
 }
 
 type RepoSpec struct {
@@ -69,6 +83,27 @@ type CreateOptions struct {
 	// SkipAmbientMemory disables ambient memory.default attach (tests / explicit off).
 	SkipAmbientMemory bool
 	DryRun            bool
+	// SagaID enrolls the new space as a member of that saga. Preflight,
+	// creation and registration then run under ONE membership + per-saga lock
+	// hold (see createInSaga). Named SagaID because Saga below already carries
+	// the saga's own roster on the CreateSaga path.
+	SagaID string
+	// After lists the member ids the new member lands behind (requires
+	// SagaID). It also drives the default-base rule: an edit spec with no
+	// explicit base stacks on the branch of the single --after predecessor
+	// editing the same repo.
+	After []string
+	// Saga mirrors InitOptions.Saga (only CreateSaga sets it).
+	Saga *SagaManifest
+	// viaSaga marks calls composed by CreateSaga (see InitOptions.viaSaga).
+	viaSaga bool
+	// sagaLockHeld marks that the caller (CreateSaga) already holds the
+	// per-saga lock, so composed writers must not re-acquire it (fsio.WithLock
+	// flock is non-reentrant across fds even within one process).
+	sagaLockHeld bool
+	// ownedMemoryLifetime is passed to AttachMemories.Lifetime (the fresh,
+	// owned store's provider lifetime; "durable" for the saga-owned den).
+	ownedMemoryLifetime string
 }
 
 type AddOptions struct {
@@ -89,11 +124,21 @@ type AddOptions struct {
 	// den link) so the den gains a read-only link (S4 §3.6 space add parity).
 	// Soft: link failures print a notice, the repo is added regardless.
 	LinkMemory bool
+	// sagaLockHeld: the caller already holds this space's per-saga lock, so
+	// the saga-manifest lock wiring must not re-acquire it (non-reentrant).
+	sagaLockHeld bool
 }
 
 type SyncOptions struct {
 	SpaceID        string
 	ReferencesOnly bool
+	// SkipFetch skips the per-repo FetchAllPrune. SagaSync sets it after its
+	// own deduplicated fetch pass so shared bare repos fetch exactly once.
+	SkipFetch bool
+	// DryRun skips the generated-file writes (the CLAUDE.md link and
+	// AGENTS.md); git-level dry-run printing is the injected client's job,
+	// matching every other verb.
+	DryRun bool
 }
 
 type ArchiveOptions struct {
@@ -103,6 +148,11 @@ type ArchiveOptions struct {
 	// MemoryFate: keep (default) or contribute (contribute-then-keep).
 	// destroy is invalid for archive — use Destroy with FateDestroy.
 	MemoryFate memory.MemoryFate // empty → keep
+	// exemptDependentSpaces lists sibling space ids whose stacked bases must
+	// not refuse this teardown: saga lifecycle retires them in the same
+	// operation. Deliberately unexported — never set by the CLI; an EXTERNAL
+	// dependent still refuses without Force.
+	exemptDependentSpaces []string
 }
 
 // MemoryFate values: keep | destroy | contribute (default keep).
@@ -111,6 +161,8 @@ type DestroyOptions struct {
 	Force      bool
 	DryRun     bool
 	MemoryFate memory.MemoryFate // empty → keep
+	// exemptDependentSpaces: see ArchiveOptions.exemptDependentSpaces.
+	exemptDependentSpaces []string
 }
 
 // AttachMemoryOptions is the service-level entry for stave memory attach
@@ -127,6 +179,12 @@ type AttachMemoryOptions struct {
 	Strict     bool // true for explicit attach/--memory; false for ambient
 	RawSpec    string
 	References []RepoSpec // S4: pass raw url/path/ref through seam
+	// Lifetime is passed to memory.AttachOptions.Lifetime ("task" default,
+	// "durable" for the saga-owned den).
+	Lifetime string
+	// sagaLockHeld: the caller already holds this space's per-saga lock
+	// (see AddOptions.sagaLockHeld).
+	sagaLockHeld bool
 }
 
 type Status struct {
@@ -169,6 +227,31 @@ func DefaultBranch(spaceID, repoName string) string {
 	return fmt.Sprintf("stave/%s/%s", spaceID, repoName)
 }
 
+// ResolveBaseRef expands base sugar and canonicalizes stave branch spellings:
+//   - "space:<id>" resolves to the edit branch that space owns for repoName
+//     ("refs/heads/stave/<id>/<repoName>"); an invalid id is an error.
+//   - bare "stave/..." and "origin/stave/..." bases rewrite to
+//     "refs/heads/stave/..." with changed=true so callers can warn:
+//     normalizeRemoteRef would otherwise mint "origin/stave/...", which never
+//     resolves because stave never pushes its branches.
+//   - everything else passes through unchanged.
+func ResolveBaseRef(base, repoName string) (resolved string, changed bool, err error) {
+	base = strings.TrimSpace(base)
+	if id, ok := strings.CutPrefix(base, "space:"); ok {
+		if err := config.ValidateSpaceID(id); err != nil {
+			return "", false, fmt.Errorf("base %q: %w", base, err)
+		}
+		return "refs/heads/" + DefaultBranch(id, repoName), false, nil
+	}
+	if branch, ok := strings.CutPrefix(base, "origin/"); ok && strings.HasPrefix(branch, "stave/") {
+		return "refs/heads/" + branch, true, nil
+	}
+	if strings.HasPrefix(base, "stave/") {
+		return "refs/heads/" + base, true, nil
+	}
+	return base, false, nil
+}
+
 func NewService(cfg config.Config, gitClient Git, out io.Writer) Service {
 	if gitClient == nil {
 		gitClient = git.New()
@@ -179,6 +262,9 @@ func NewService(cfg config.Config, gitClient Git, out io.Writer) Service {
 func (s Service) InitSpace(ctx context.Context, opts InitOptions) error {
 	if err := config.ValidateName("space id", opts.ID); err != nil {
 		return err
+	}
+	if opts.Kind == KindSaga && !opts.viaSaga {
+		return fmt.Errorf("kind %q is reserved; use 'stave saga create'", KindSaga)
 	}
 	spacePath := s.SpacePath(opts.ID)
 	_, statErr := os.Stat(spacePath)
@@ -198,6 +284,15 @@ func (s Service) InitSpace(ctx context.Context, opts InitOptions) error {
 		}
 		if manifest.ID != opts.ID {
 			return fmt.Errorf("existing manifest id %q does not match %q", manifest.ID, opts.ID)
+		}
+		// Adoption never crosses the saga boundary: a plain create must not
+		// "succeed" against a saga manifest (or vice versa) — the concurrent
+		// same-ID creation race resolves to one winner and one clean error.
+		if (manifest.Saga != nil) != (opts.Saga != nil) {
+			if manifest.Saga != nil {
+				return fmt.Errorf("space %q already exists as a saga", opts.ID)
+			}
+			return fmt.Errorf("space %q already exists and is not a saga", opts.ID)
 		}
 		if err := ensureClaudeLink(spacePath); err != nil {
 			return err
@@ -230,8 +325,12 @@ func (s Service) InitSpace(ctx context.Context, opts InitOptions) error {
 		CreatedAt: s.now(),
 		SpecPath:  specPath,
 		Repos:     []RepoManifest{},
+		Saga:      opts.Saga,
 	}
-	if err := SaveManifest(spacePath, manifest); err != nil {
+	if err := saveManifestExclusive(spacePath, manifest); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("space %q was created concurrently by another process", opts.ID)
+		}
 		return err
 	}
 	if err := s.writeAgents(spacePath, manifest); err != nil {
@@ -242,21 +341,27 @@ func (s Service) InitSpace(ctx context.Context, opts InitOptions) error {
 }
 
 func (s Service) Create(ctx context.Context, opts CreateOptions) error {
+	if len(opts.After) > 0 && opts.SagaID == "" {
+		return fmt.Errorf("--after requires --saga")
+	}
+	if opts.SagaID != "" {
+		return s.createInSaga(ctx, opts)
+	}
 	if opts.DryRun {
 		return s.createDryRun(ctx, opts)
 	}
-	if err := s.InitSpace(ctx, InitOptions{ID: opts.ID, Kind: opts.Kind, SpecPath: opts.SpecPath}); err != nil {
+	if err := s.InitSpace(ctx, InitOptions{ID: opts.ID, Kind: opts.Kind, SpecPath: opts.SpecPath, Saga: opts.Saga, viaSaga: opts.viaSaga}); err != nil {
 		return err
 	}
 	for _, spec := range opts.Edits {
-		if err := s.AddRepo(ctx, AddOptions{SpaceID: opts.ID, RepoName: spec.Name, Mode: ModeEdit, Base: spec.Ref, DryRun: opts.DryRun}); err != nil {
+		if err := s.AddRepo(ctx, AddOptions{SpaceID: opts.ID, RepoName: spec.Name, Mode: ModeEdit, Base: spec.Ref, DryRun: opts.DryRun, sagaLockHeld: opts.sagaLockHeld}); err != nil {
 			return err
 		}
 	}
 	for _, spec := range opts.References {
 		// LinkMemory is a no-op here (memory attaches AFTER the repo loop and
 		// passes the references itself); set for uniform semantics.
-		if err := s.AddRepo(ctx, AddOptions{SpaceID: opts.ID, RepoName: spec.Name, Mode: ModeReference, Ref: spec.Ref, DryRun: opts.DryRun, LinkMemory: true}); err != nil {
+		if err := s.AddRepo(ctx, AddOptions{SpaceID: opts.ID, RepoName: spec.Name, Mode: ModeReference, Ref: spec.Ref, DryRun: opts.DryRun, LinkMemory: true, sagaLockHeld: opts.sagaLockHeld}); err != nil {
 			return err
 		}
 	}
@@ -287,7 +392,11 @@ func (s Service) createDryRun(ctx context.Context, opts CreateOptions) error {
 		if !ok {
 			return fmt.Errorf("repo %q is not registered", spec.Name)
 		}
-		baseRef := normalizeRemoteRef(firstNonEmpty(spec.Ref, repoCfg.DefaultBranch, s.Config.DefaultBase))
+		resolvedBase, _, err := ResolveBaseRef(spec.Ref, spec.Name)
+		if err != nil {
+			return err
+		}
+		baseRef := normalizeRemoteRef(firstNonEmpty(resolvedBase, repoCfg.DefaultBranch, s.Config.DefaultBase))
 		s.printf("dry-run: fetch %s\n", repoCfg.BareRepoPath)
 		s.printf("dry-run: add edit worktree %s from %s at %s\n", DefaultBranch(opts.ID, spec.Name), baseRef, filepath.Join(spacePath, spec.Name))
 	}
@@ -307,11 +416,13 @@ func (s Service) createDryRun(ctx context.Context, opts CreateOptions) error {
 // attachMemoriesAfterCreate runs explicit --memory specs and/or ambient default.
 func (s Service) attachMemoriesAfterCreate(ctx context.Context, opts CreateOptions) error {
 	return s.AttachMemories(ctx, AttachMemoriesOptions{
-		SpaceID:     opts.ID,
-		Specs:       opts.Memories,
-		References:  opts.References,
-		SkipAmbient: opts.SkipAmbientMemory,
-		DryRun:      opts.DryRun,
+		SpaceID:      opts.ID,
+		Specs:        opts.Memories,
+		References:   opts.References,
+		SkipAmbient:  opts.SkipAmbientMemory,
+		DryRun:       opts.DryRun,
+		Lifetime:     opts.ownedMemoryLifetime,
+		sagaLockHeld: opts.sagaLockHeld,
 	})
 }
 
@@ -328,6 +439,11 @@ type AttachMemoriesOptions struct {
 	References  []RepoSpec
 	SkipAmbient bool
 	DryRun      bool
+	// Lifetime is applied only to FRESH specs — the stores this space will own
+	// ("durable" for the saga-owned den). Attach-existing specs never carry it.
+	Lifetime string
+	// sagaLockHeld: the caller already holds this space's per-saga lock.
+	sagaLockHeld bool
 }
 
 // AttachMemories runs explicit memory specs and/or the ambient default with
@@ -358,12 +474,22 @@ func (s Service) AttachMemories(ctx context.Context, opts AttachMemoriesOptions)
 		}
 	}
 	for _, raw := range specs {
+		lifetime := ""
+		if opts.Lifetime != "" {
+			// Lifetime applies only to fresh (to-be-owned) stores; a parse
+			// failure is surfaced by AttachMemory itself.
+			if parsed, err := memory.ParseMemorySpec(raw, s.defaultMemoryProvider()); err == nil && parsed.Fresh {
+				lifetime = opts.Lifetime
+			}
+		}
 		if err := s.AttachMemory(ctx, AttachMemoryOptions{
-			SpaceID:    opts.SpaceID,
-			RawSpec:    raw,
-			DryRun:     opts.DryRun,
-			Strict:     strict,
-			References: opts.References,
+			SpaceID:      opts.SpaceID,
+			RawSpec:      raw,
+			DryRun:       opts.DryRun,
+			Strict:       strict,
+			References:   opts.References,
+			Lifetime:     lifetime,
+			sagaLockHeld: opts.sagaLockHeld,
 		}); err != nil {
 			if !strict {
 				s.printf("notice: ambient memory attach failed: %v\n", err)
@@ -383,6 +509,15 @@ func (s Service) AttachMemory(ctx context.Context, opts AttachMemoryOptions) err
 		return err
 	}
 	spacePath := s.SpacePath(opts.SpaceID)
+	// Saga spaces serialize manifest writers under the per-saga lock; re-run
+	// under it (re-loading inside) unless the caller already holds it.
+	if !opts.DryRun && !opts.sagaLockHeld {
+		if probe, err := LoadManifest(spacePath); err == nil && probe.Saga != nil {
+			locked := opts
+			locked.sagaLockHeld = true
+			return s.withSagaLock(opts.SpaceID, func() error { return s.AttachMemory(ctx, locked) })
+		}
+	}
 	providerName := opts.Provider
 	useID := opts.UseID
 	name := opts.Name
@@ -479,6 +614,7 @@ func (s Service) AttachMemory(ctx context.Context, opts AttachMemoryOptions) err
 		StoreID:        opts.SpaceID,
 		UseID:          useID,
 		Name:           name,
+		Lifetime:       opts.Lifetime,
 		EditRefs:       opts.EditRefs,
 		LinkRefs:       opts.LinkRefs,
 		ReferenceSpecs: refSpecs,
@@ -585,6 +721,18 @@ func (s Service) AddRepo(ctx context.Context, opts AddOptions) error {
 	if err != nil {
 		return err
 	}
+	if manifest.Saga != nil {
+		if opts.Mode == ModeEdit {
+			return fmt.Errorf("saga space %q holds no edit worktrees; add the repo to a member space instead", opts.SpaceID)
+		}
+		// Saga spaces serialize manifest writers under the per-saga lock;
+		// re-run under it (re-loading inside) unless the caller holds it.
+		if !opts.DryRun && !opts.sagaLockHeld {
+			locked := opts
+			locked.sagaLockHeld = true
+			return s.withSagaLock(opts.SpaceID, func() error { return s.AddRepo(ctx, locked) })
+		}
+	}
 	if !opts.DryRun {
 		if err := ensureClaudeLink(spacePath); err != nil {
 			return err
@@ -601,7 +749,15 @@ func (s Service) AddRepo(ctx context.Context, opts AddOptions) error {
 	var entry RepoManifest
 	switch opts.Mode {
 	case ModeEdit:
-		baseRef := normalizeRemoteRef(firstNonEmpty(opts.Base, repoCfg.DefaultBranch, s.Config.DefaultBase))
+		resolvedBase, baseChanged, err := ResolveBaseRef(opts.Base, opts.RepoName)
+		if err != nil {
+			return err
+		}
+		baseIsSugar := strings.HasPrefix(opts.Base, "space:")
+		if baseChanged && !opts.DryRun {
+			s.printf("notice: base %q canonicalized to %q (stave branches live only in the bare repo; %q would never resolve)\n", opts.Base, resolvedBase, "origin/"+strings.TrimPrefix(resolvedBase, "refs/heads/"))
+		}
+		baseRef := normalizeRemoteRef(firstNonEmpty(resolvedBase, repoCfg.DefaultBranch, s.Config.DefaultBase))
 		branch := firstNonEmpty(opts.Branch, DefaultBranch(opts.SpaceID, opts.RepoName))
 		repoPath := opts.RepoName
 		if manifest.HasPath(repoPath) {
@@ -613,6 +769,16 @@ func (s Service) AddRepo(ctx context.Context, opts AddOptions) error {
 		}
 		worktreePath := filepath.Join(spacePath, repoPath)
 		if !opts.DryRun {
+			if baseIsSugar {
+				baseBranch := strings.TrimPrefix(baseRef, "refs/heads/")
+				baseExists, err := s.Git.BranchExists(ctx, repoCfg.BareRepoPath, baseBranch)
+				if err != nil {
+					return err
+				}
+				if !baseExists {
+					return fmt.Errorf("base %q: space %q has no branch %q for repo %q", opts.Base, strings.TrimPrefix(opts.Base, "space:"), baseBranch, opts.RepoName)
+				}
+			}
 			exists, err := s.Git.BranchExists(ctx, repoCfg.BareRepoPath, branch)
 			if err != nil {
 				return err
@@ -624,6 +790,12 @@ func (s Service) AddRepo(ctx context.Context, opts AddOptions) error {
 			}
 			if err != nil {
 				return err
+			}
+			if exists {
+				s.printf("warning: branch %q already exists; the worktree adopted its current head, so the requested base/start-point was ignored and the recorded base %s is aspirational\n", branch, baseRef)
+				if ahead, behind, driftErr := s.Git.AheadBehind(ctx, worktreePath, baseRef); driftErr == nil {
+					s.printf("warning: adopted branch is ahead %d, behind %d versus %s\n", ahead, behind, baseRef)
+				}
 			}
 		} else {
 			s.printf("dry-run: add edit worktree %s from %s at %s\n", branch, startPoint, worktreePath)
@@ -708,20 +880,27 @@ func (s Service) linkMemoryOnAdd(ctx context.Context, spacePath string, manifest
 }
 
 func (s Service) Sync(ctx context.Context, opts SyncOptions) error {
-	spacePath := s.SpacePath(opts.SpaceID)
+	spacePath, err := s.resolveSpacePath(opts.SpaceID)
+	if err != nil {
+		return err
+	}
 	manifest, err := LoadManifest(spacePath)
 	if err != nil {
 		return err
 	}
-	if err := ensureClaudeLink(spacePath); err != nil {
-		return err
+	if !opts.DryRun {
+		if err := ensureClaudeLink(spacePath); err != nil {
+			return err
+		}
 	}
 	for _, repo := range manifest.Repos {
 		if opts.ReferencesOnly && repo.Mode != ModeReference {
 			continue
 		}
-		if err := s.Git.FetchAllPrune(ctx, repo.BareRepoPath); err != nil {
-			return err
+		if !opts.SkipFetch {
+			if err := s.Git.FetchAllPrune(ctx, repo.BareRepoPath); err != nil {
+				return err
+			}
 		}
 		worktreePath := filepath.Join(spacePath, repo.Path)
 		switch repo.Mode {
@@ -747,11 +926,17 @@ func (s Service) Sync(ctx context.Context, opts SyncOptions) error {
 			s.printf("edit %s: ahead %d, behind %d versus %s\n", repo.Name, ahead, behind, repo.Base)
 		}
 	}
+	if opts.DryRun {
+		return nil
+	}
 	return s.writeAgents(spacePath, manifest)
 }
 
 func (s Service) Status(ctx context.Context, spaceID string) (Status, error) {
-	spacePath := s.SpacePath(spaceID)
+	spacePath, err := s.resolveSpacePath(spaceID)
+	if err != nil {
+		return Status{}, err
+	}
 	manifest, err := LoadManifest(spacePath)
 	if err != nil {
 		return Status{}, err
@@ -782,14 +967,77 @@ func (s Service) Status(ctx context.Context, spaceID string) (Status, error) {
 	return status, nil
 }
 
+// Retarget updates the recorded Base of an edit repo — the ref drift reports
+// against — without touching the worktree. Base sugar ("space:<id>") and
+// stave branch spellings resolve exactly as they do for AddRepo; resolved
+// stave branches must exist in the bare repo before the manifest is rewritten.
+// dryRun previews the retarget without checking branches or saving.
+func (s Service) Retarget(ctx context.Context, spaceID, repoName, base string, dryRun bool) error {
+	spacePath, err := s.resolveSpacePath(spaceID)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(base) == "" {
+		return fmt.Errorf("a base ref is required")
+	}
+	manifest, err := LoadManifest(spacePath)
+	if err != nil {
+		return err
+	}
+	repo, idx, ok := manifest.FindRepo(repoName)
+	if !ok {
+		return fmt.Errorf("repo %q not found in space %q", repoName, spaceID)
+	}
+	if repo.Mode != ModeEdit {
+		return fmt.Errorf("repo %q is reference-only", repoName)
+	}
+	resolved, changed, err := ResolveBaseRef(base, repoName)
+	if err != nil {
+		return err
+	}
+	if changed && !dryRun {
+		s.printf("notice: base %q canonicalized to %q (stave branches live only in the bare repo; %q would never resolve)\n", base, resolved, "origin/"+strings.TrimPrefix(resolved, "refs/heads/"))
+	}
+	baseRef := normalizeRemoteRef(resolved)
+	if dryRun {
+		s.printf("dry-run: retarget %s repo %s to base %s\n", spaceID, repoName, baseRef)
+		return nil
+	}
+	if strings.HasPrefix(baseRef, "refs/heads/stave/") {
+		baseBranch := strings.TrimPrefix(baseRef, "refs/heads/")
+		exists, err := s.Git.BranchExists(ctx, repo.BareRepoPath, baseBranch)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return fmt.Errorf("base %q: branch %q does not exist in %s", base, baseBranch, repo.BareRepoPath)
+		}
+	}
+	manifest.Repos[idx].Base = baseRef
+	if err := SaveManifest(spacePath, manifest); err != nil {
+		return err
+	}
+	if err := s.writeAgents(spacePath, manifest); err != nil {
+		return err
+	}
+	s.printf("retargeted %s repo %s to base %s\n", spaceID, repoName, baseRef)
+	return nil
+}
+
 func (s Service) Archive(ctx context.Context, opts ArchiveOptions) error {
-	spacePath := s.SpacePath(opts.SpaceID)
+	spacePath, err := s.resolveSpacePath(opts.SpaceID)
+	if err != nil {
+		return err
+	}
 	manifest, err := LoadManifest(spacePath)
 	if err != nil {
 		return err
 	}
 	if !opts.Force {
-		if err := s.ensureNoDirtyEdits(ctx, spacePath, manifest); err != nil {
+		if err := s.guardRefusal(s.ensureNoDirtyEdits(ctx, spacePath, manifest), opts.DryRun); err != nil {
+			return err
+		}
+		if err := s.guardRefusal(s.ensureNoDependentSpaces(opts.SpaceID, manifest, opts.exemptDependentSpaces), opts.DryRun); err != nil {
 			return err
 		}
 	}
@@ -898,13 +1146,19 @@ func (s Service) relocateMemoryRoutes(ctx context.Context, oldPath, newPath stri
 }
 
 func (s Service) Destroy(ctx context.Context, opts DestroyOptions) error {
-	spacePath := s.SpacePath(opts.SpaceID)
+	spacePath, err := s.resolveSpacePath(opts.SpaceID)
+	if err != nil {
+		return err
+	}
 	manifest, err := LoadManifest(spacePath)
 	if err != nil {
 		return err
 	}
 	if !opts.Force {
-		if err := s.ensureNoDirtyEdits(ctx, spacePath, manifest); err != nil {
+		if err := s.guardRefusal(s.ensureNoDirtyEdits(ctx, spacePath, manifest), opts.DryRun); err != nil {
+			return err
+		}
+		if err := s.guardRefusal(s.ensureNoDependentSpaces(opts.SpaceID, manifest, opts.exemptDependentSpaces), opts.DryRun); err != nil {
 			return err
 		}
 	}
@@ -987,8 +1241,26 @@ func (s Service) applyMemoryFate(ctx context.Context, spacePath string, manifest
 }
 
 // DetachMemory removes one attachment from the manifest after provider Detach.
+// Saga spaces serialize manifest writers under the per-saga lock; callers that
+// already hold it (lifecycle walks) use detachMemoryLocked instead.
 func (s Service) DetachMemory(ctx context.Context, spaceID, alias string, fate memory.MemoryFate, force, dryRun bool) error {
-	spacePath := s.SpacePath(spaceID)
+	spacePath, err := s.resolveSpacePath(spaceID)
+	if err != nil {
+		return err
+	}
+	if !dryRun {
+		if probe, err := LoadManifest(spacePath); err == nil && probe.Saga != nil {
+			return s.withSagaLock(spaceID, func() error {
+				return s.detachMemoryLocked(ctx, spacePath, spaceID, alias, fate, force, dryRun)
+			})
+		}
+	}
+	return s.detachMemoryLocked(ctx, spacePath, spaceID, alias, fate, force, dryRun)
+}
+
+// detachMemoryLocked is DetachMemory's body, entered with any required saga
+// lock already held (it re-loads the manifest under that lock).
+func (s Service) detachMemoryLocked(ctx context.Context, spacePath, spaceID, alias string, fate memory.MemoryFate, force, dryRun bool) error {
 	manifest, err := LoadManifest(spacePath)
 	if err != nil {
 		return err
@@ -1063,7 +1335,10 @@ func (s Service) DetachMemory(ctx context.Context, spaceID, alias string, fate m
 
 // ProposeMemory runs provider Propose (contribute + warren propose) for an attachment.
 func (s Service) ProposeMemory(ctx context.Context, spaceID, alias string, dryRun bool) error {
-	spacePath := s.SpacePath(spaceID)
+	spacePath, err := s.resolveSpacePath(spaceID)
+	if err != nil {
+		return err
+	}
 	manifest, err := LoadManifest(spacePath)
 	if err != nil {
 		return err
@@ -1095,7 +1370,10 @@ func (s Service) ProposeMemory(ctx context.Context, spaceID, alias string, dryRu
 
 // SyncMemory runs provider Sync for an attachment.
 func (s Service) SyncMemory(ctx context.Context, spaceID, alias string, dryRun bool) error {
-	spacePath := s.SpacePath(spaceID)
+	spacePath, err := s.resolveSpacePath(spaceID)
+	if err != nil {
+		return err
+	}
 	manifest, err := LoadManifest(spacePath)
 	if err != nil {
 		return err
@@ -1135,7 +1413,10 @@ func (s Service) SyncMemory(ctx context.Context, spaceID, alias string, dryRun b
 
 // MemoryStatus prints provider status for one or all attachments.
 func (s Service) MemoryStatus(ctx context.Context, spaceID, alias string) error {
-	spacePath := s.SpacePath(spaceID)
+	spacePath, err := s.resolveSpacePath(spaceID)
+	if err != nil {
+		return err
+	}
 	manifest, err := LoadManifest(spacePath)
 	if err != nil {
 		return err
@@ -1198,7 +1479,11 @@ func (s Service) MemoryStateSuffix(ctx context.Context, mem MemoryManifest) stri
 // ListMemories prints attachment records for one space or all spaces.
 func (s Service) ListMemories(spaceID string) error {
 	if spaceID != "" {
-		manifest, err := LoadManifest(s.SpacePath(spaceID))
+		spacePath, err := s.resolveSpacePath(spaceID)
+		if err != nil {
+			return err
+		}
+		manifest, err := LoadManifest(spacePath)
 		if err != nil {
 			return err
 		}
@@ -1211,7 +1496,7 @@ func (s Service) ListMemories(spaceID string) error {
 		}
 		return nil
 	}
-	entries, err := os.ReadDir(s.Config.AgentWorkDir)
+	spaces, err := s.ListSpaces()
 	if err != nil {
 		if os.IsNotExist(err) {
 			s.printf("no spaces\n")
@@ -1220,17 +1505,13 @@ func (s Service) ListMemories(spaceID string) error {
 		return err
 	}
 	found := false
-	for _, entry := range entries {
-		if !entry.IsDir() || entry.Name() == ".archive" {
-			continue
-		}
-		manifest, err := LoadManifest(filepath.Join(s.Config.AgentWorkDir, entry.Name()))
-		if err != nil || len(manifest.Memories) == 0 {
+	for _, entry := range spaces {
+		if entry.Err != nil || len(entry.Manifest.Memories) == 0 {
 			continue
 		}
 		found = true
-		for _, mem := range manifest.Memories {
-			s.printf("%s\t%s\t%s\towned=%v\n", manifest.ID, mem.Name, mem.Provider+":"+mem.ID, mem.Owned)
+		for _, mem := range entry.Manifest.Memories {
+			s.printf("%s\t%s\t%s\towned=%v\n", entry.Manifest.ID, mem.Name, mem.Provider+":"+mem.ID, mem.Owned)
 		}
 	}
 	if !found {
@@ -1239,8 +1520,56 @@ func (s Service) ListMemories(spaceID string) error {
 	return nil
 }
 
+// SpaceEntry is one row from ListSpaces: a directory under AgentWorkDir that
+// holds a .stave.yaml. Err records a read/parse failure — the entry is still
+// returned so callers can fail closed on unreadable spaces.
+type SpaceEntry struct {
+	ID       string
+	Path     string
+	Manifest *Manifest
+	Err      error
+}
+
+// ListSpaces enumerates spaces under AgentWorkDir. Directories without a
+// .stave.yaml are not spaces and are skipped entirely; a manifest that exists
+// but cannot be read or parsed yields an entry with Err set. The ReadDir
+// error (including a missing AgentWorkDir) is returned verbatim.
+func (s Service) ListSpaces() ([]SpaceEntry, error) {
+	entries, err := os.ReadDir(s.Config.AgentWorkDir)
+	if err != nil {
+		return nil, err
+	}
+	var spaces []SpaceEntry
+	for _, entry := range entries {
+		if !entry.IsDir() || entry.Name() == ".archive" {
+			continue
+		}
+		path := filepath.Join(s.Config.AgentWorkDir, entry.Name())
+		manifest, err := LoadManifest(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue // no .stave.yaml — not a space
+			}
+			spaces = append(spaces, SpaceEntry{ID: entry.Name(), Path: path, Err: err})
+			continue
+		}
+		spaces = append(spaces, SpaceEntry{ID: entry.Name(), Path: path, Manifest: &manifest})
+	}
+	return spaces, nil
+}
+
 func (s Service) SpacePath(id string) string {
 	return filepath.Join(s.Config.AgentWorkDir, id)
+}
+
+// resolveSpacePath validates id before joining it under AgentWorkDir so verbs
+// taking a raw space id can never traverse outside the work dir. Callers that
+// validate the id themselves keep using the exported SpacePath.
+func (s Service) resolveSpacePath(id string) (string, error) {
+	if err := config.ValidateSpaceID(id); err != nil {
+		return "", err
+	}
+	return s.SpacePath(id), nil
 }
 
 func (s Service) ensureNoDirtyEdits(ctx context.Context, spacePath string, manifest Manifest) error {
@@ -1263,7 +1592,74 @@ func (s Service) ensureNoDirtyEdits(ctx context.Context, spacePath string, manif
 	return nil
 }
 
+// ensureNoDependentSpaces refuses archive/destroy when a sibling space's
+// manifest records a Base on one of this space's edit branches (stacked via
+// "space:<id>" sugar or an explicit stave/... base). Matches are scoped to the
+// same canonical BareRepoPath — same-named branches in different repos must
+// not alias (mirroring resolveBaseOwner's scoping). Fails closed: a sibling
+// whose manifest cannot be read also refuses, because it may hide such a
+// dependency. --force overrides. Siblings in exempt are retired by the same
+// saga lifecycle operation and never refuse.
+func (s Service) ensureNoDependentSpaces(spaceID string, manifest Manifest, exempt []string) error {
+	spellings := map[string]map[string]string{} // canonical bare path → base spelling → branch
+	for _, repo := range manifest.Repos {
+		if repo.Mode != ModeEdit || repo.Branch == "" {
+			continue
+		}
+		key := canonicalRepoPath(repo.BareRepoPath)
+		byBase := spellings[key]
+		if byBase == nil {
+			byBase = map[string]string{}
+			spellings[key] = byBase
+		}
+		byBase["refs/heads/"+repo.Branch] = repo.Branch
+		byBase["origin/"+repo.Branch] = repo.Branch
+		byBase[repo.Branch] = repo.Branch
+	}
+	if len(spellings) == 0 {
+		return nil
+	}
+	siblings, err := s.ListSpaces()
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	exemptSet := make(map[string]bool, len(exempt))
+	for _, id := range exempt {
+		exemptSet[id] = true
+	}
+	for _, sibling := range siblings {
+		if sibling.ID == spaceID || exemptSet[sibling.ID] {
+			continue
+		}
+		if sibling.Err != nil {
+			return fmt.Errorf("space %q has an unreadable manifest (%v); cannot verify it does not stack on %q (use --force to override)", sibling.ID, sibling.Err, spaceID)
+		}
+		for _, repo := range sibling.Manifest.Repos {
+			if branch, ok := spellings[canonicalRepoPath(repo.BareRepoPath)][repo.Base]; ok {
+				return fmt.Errorf("space %q repo %q stacks on branch %q of space %q (use --force to override)", sibling.ID, repo.Name, branch, spaceID)
+			}
+		}
+	}
+	return nil
+}
+
+// guardRefusal downgrades a would-refuse guard error to a printed dry-run
+// diagnostic so previews keep going; real runs keep the hard refusal.
+func (s Service) guardRefusal(err error, dryRun bool) error {
+	if err == nil || !dryRun {
+		return err
+	}
+	s.printf("dry-run: would refuse: %v\n", err)
+	return nil
+}
+
 func (s Service) writeAgents(spacePath string, manifest Manifest) error {
+	if manifest.Saga != nil {
+		return s.writeSagaAgents(spacePath, manifest)
+	}
 	var b strings.Builder
 	b.WriteString("# Stave Workspace Instructions\n\n")
 	b.WriteString("- Top-level repository folders are editable worktrees for this space.\n")
@@ -1276,25 +1672,123 @@ func (s Service) writeAgents(spacePath string, manifest Manifest) error {
 		fmt.Fprintf(&b, "- Persistent memory is available via the context-marmot MCP tools (den: %s).\n", mem.ID)
 	}
 	b.WriteString("\n")
-	if len(manifest.Repos) > 0 {
-		b.WriteString("## Repositories\n")
-		for _, repo := range manifest.Repos {
-			fmt.Fprintf(&b, "- `%s`: %s at `%s`\n", repo.Name, repo.Mode, repo.Path)
-			instructionsPath := filepath.Join(repo.Path, AgentsName)
-			info, err := os.Stat(filepath.Join(spacePath, instructionsPath))
-			switch {
-			case err == nil && !info.IsDir():
-				markdownPath := filepath.ToSlash(instructionsPath)
-				fmt.Fprintf(&b, "  - Read [`%s`](%s) for repository-specific instructions.\n", markdownPath, markdownPath)
-			case err != nil && !errors.Is(err, os.ErrNotExist):
-				return err
-			}
-		}
+	if err := writeRepoSection(&b, spacePath, manifest); err != nil {
+		return err
 	}
+	b.WriteString(s.memberSagaSection(manifest))
 	if err := ensureClaudeLink(spacePath); err != nil {
 		return err
 	}
 	return fsio.WriteFileAtomic(filepath.Join(spacePath, AgentsName), []byte(b.String()), 0o644)
+}
+
+// writeRepoSection renders the '## Repositories' block with nested
+// instruction links; shared by the ordinary and saga templates.
+func writeRepoSection(b *strings.Builder, spacePath string, manifest Manifest) error {
+	if len(manifest.Repos) == 0 {
+		return nil
+	}
+	b.WriteString("## Repositories\n")
+	for _, repo := range manifest.Repos {
+		fmt.Fprintf(b, "- `%s`: %s at `%s`\n", repo.Name, repo.Mode, repo.Path)
+		instructionsPath := filepath.Join(repo.Path, AgentsName)
+		info, err := os.Stat(filepath.Join(spacePath, instructionsPath))
+		switch {
+		case err == nil && !info.IsDir():
+			markdownPath := filepath.ToSlash(instructionsPath)
+			fmt.Fprintf(b, "  - Read [`%s`](%s) for repository-specific instructions.\n", markdownPath, markdownPath)
+		case err != nil && !errors.Is(err, os.ErrNotExist):
+			return err
+		}
+	}
+	return nil
+}
+
+// writeSagaAgents renders a saga space's AGENTS.md: the member graph in topo
+// order plus the coordination doctrine. Deliberately NO branches and NO stack
+// bases — those are volatile (a retarget would strand them in prose); live
+// state always comes from `stave saga status`.
+func (s Service) writeSagaAgents(spacePath string, manifest Manifest) error {
+	var b strings.Builder
+	fmt.Fprintf(&b, "# Stave Saga: %s\n\n", manifest.ID)
+	b.WriteString("- This space coordinates the saga's member spaces; it holds no editable worktrees of its own.\n")
+	if manifest.SpecPath != "" {
+		fmt.Fprintf(&b, "- Read `%s/` before starting; it holds the saga's task or review context.\n", manifest.SpecPath)
+	}
+	for _, mem := range manifest.Memories {
+		fmt.Fprintf(&b, "- Persistent memory is available via the context-marmot MCP tools (den: %s).\n", mem.ID)
+	}
+	b.WriteString("\n## Members\n")
+	if len(manifest.Saga.Members) == 0 {
+		b.WriteString("- none yet; enroll spaces with `stave saga add`.\n")
+	}
+	for i, member := range sagaTopoOrder(manifest.Saga.Members) {
+		fmt.Fprintf(&b, "%d. `%s` (../%s)", i+1, member.ID, member.ID)
+		if len(member.After) > 0 {
+			fmt.Fprintf(&b, " — after: %s", strings.Join(member.After, ", "))
+		}
+		b.WriteString("\n")
+	}
+	fmt.Fprintf(&b, "\nFor live state run: stave saga status %s --json\n", manifest.ID)
+	b.WriteString("\n")
+	if err := writeRepoSection(&b, spacePath, manifest); err != nil {
+		return err
+	}
+	if len(manifest.Repos) > 0 {
+		b.WriteString("\n")
+	}
+	b.WriteString("## Doctrine\n")
+	b.WriteString("- Work happens inside member directories via separate per-member summons; this space only coordinates.\n")
+	b.WriteString("- Before editing inside a member, read that member's AGENTS.md.\n")
+	b.WriteString("- Never rebase or retarget a member without being asked.\n")
+	if err := ensureClaudeLink(spacePath); err != nil {
+		return err
+	}
+	return fsio.WriteFileAtomic(filepath.Join(spacePath, AgentsName), []byte(b.String()), 0o644)
+}
+
+// memberSagaSection renders the '## Saga' block appended to a member space's
+// AGENTS.md: the owning saga (reverse-lookup over ListSpaces), the member's
+// own stacked bases (member-local data only) and the coordination pointer.
+// Any scan failure degrades to no section — membership rendering must never
+// break ordinary space writes.
+func (s Service) memberSagaSection(manifest Manifest) string {
+	if manifest.ID == "" {
+		return ""
+	}
+	spaces, err := s.ListSpaces()
+	if err != nil {
+		return ""
+	}
+	sagaID := ""
+	for _, entry := range spaces {
+		if entry.Err != nil || entry.Manifest.Saga == nil {
+			continue
+		}
+		for _, member := range entry.Manifest.Saga.Members {
+			if member.ID == manifest.ID {
+				sagaID = entry.ID
+				break
+			}
+		}
+		if sagaID != "" {
+			break
+		}
+	}
+	if sagaID == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\n## Saga\n")
+	fmt.Fprintf(&b, "- This space is a member of saga `%s` (`../%s`).\n", sagaID, sagaID)
+	for _, repo := range manifest.Repos {
+		if repo.Mode != ModeEdit || repo.Base == "" {
+			continue
+		}
+		fmt.Fprintf(&b, "- `%s` stacks on base `%s`; drift reports against it.\n", repo.Name, repo.Base)
+	}
+	fmt.Fprintf(&b, "- Coordinate via `stave saga status %s --json`.\n", sagaID)
+	return b.String()
 }
 
 func ensureClaudeLink(spacePath string) error {

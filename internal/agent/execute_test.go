@@ -228,7 +228,7 @@ func TestExecutorExecuteOperationErrors(t *testing.T) {
 	executor := Executor{Config: cfg}
 
 	tests := []Operation{
-		{Type: OpPortalStatus, SpaceID: "ex-1", PortalID: "local"},
+		{Type: "portal_teleport", SpaceID: "ex-1", PortalID: "local"},
 		{Type: "not_real"},
 	}
 	for _, op := range tests {
@@ -238,25 +238,122 @@ func TestExecutorExecuteOperationErrors(t *testing.T) {
 	}
 }
 
-func TestExecutePlanReportsErrorAndStops(t *testing.T) {
+// TestExecutePlanRunsPortalReadOps guards preflight/validation parity: every
+// read-only portal operation ValidatePlan accepts must clear the capability
+// preflight and execute, not be refused wholesale.
+func TestExecutePlanRunsPortalReadOps(t *testing.T) {
 	cfg := executorConfig(t)
-	executor := Executor{Config: cfg}
+	writeExecutorSpace(t, cfg, "ex-1")
+	saveExecutorPortal(t, cfg, "ex-1", "local", portal.DriverDocker)
+	runner := &executorPortalRunner{}
+	var out bytes.Buffer
+	executor := Executor{Config: cfg, PortalRunner: runner, Out: &out}
+
+	plan := Plan{Operations: []Operation{
+		{Type: OpPortalList, SpaceID: "ex-1"},
+		{Type: OpPortalStatus, SpaceID: "ex-1", PortalID: "local"},
+		{Type: OpPortalDoctor, SpaceID: "ex-1", PortalID: "local"},
+		{Type: OpPortalInspect, SpaceID: "ex-1", PortalID: "local"},
+		{Type: OpPortalAuthStatus, SpaceID: "ex-1", PortalID: "local", Provider: "codex"},
+		{Type: OpPortalLogs, SpaceID: "ex-1", PortalID: "local", Tail: 10},
+	}}
+	if err := ValidatePlan(cfg, plan); err != nil {
+		t.Fatalf("ValidatePlan error = %v", err)
+	}
+	results, err := executor.ExecutePlan(context.Background(), plan)
+	if err != nil {
+		t.Fatalf("ExecutePlan error = %v", err)
+	}
+	if len(results) != len(plan.Operations) {
+		t.Fatalf("results = %#v", results)
+	}
+	for _, result := range results {
+		if !result.Executed {
+			t.Fatalf("operation %s was not executed: %#v", result.Operation.Type, result)
+		}
+	}
+	got := out.String()
+	for _, needle := range []string{`"portals"`, `"status"`, `"doctor"`, `"inspect"`, `"auth"`, "docker logs --tail 10"} {
+		if !strings.Contains(got, needle) {
+			t.Fatalf("portal read output missing %q:\n%s", needle, got)
+		}
+	}
+}
+
+// TestExecutableOperationsCoverValidatedOps pins the preflight map to the full
+// set of operation types ValidatePlan can accept, so validation and the
+// execution capability preflight can never disagree again.
+func TestExecutableOperationsCoverValidatedOps(t *testing.T) {
+	validated := []string{
+		OpSpaceCreate, OpSpaceAdd, OpSpaceSync, OpSpaceStatus,
+		OpReposList, OpReposSync, OpSummon,
+		OpSagaCreate, OpSagaStatus, OpSagaAdd,
+		OpPortalInit, OpPortalAttach, OpPortalConfigure,
+		OpPortalList, OpPortalStatus, OpPortalDoctor, OpPortalInspect, OpPortalAuthStatus, OpPortalLogs,
+		OpPortalAuthLogin, OpPortalAuthInherit, OpPortalAuthRevoke,
+		OpPortalUp, OpPortalSync, OpPortalSummon, OpPortalDown, OpPortalDetach, OpPortalDestroyPreview,
+	}
+	for _, op := range validated {
+		if !executableOperations[op] {
+			t.Errorf("operation %s passes validation but is missing from executableOperations", op)
+		}
+	}
+	if len(executableOperations) != len(validated) {
+		t.Errorf("executableOperations has %d entries, validation accepts %d; the sets must match", len(executableOperations), len(validated))
+	}
+}
+
+func TestExecutePlanPreflightFailsBeforeFirstMutation(t *testing.T) {
+	cfg := executorConfig(t)
+	cfg.Repos["api"] = config.Repository{Name: "api", URL: "https://example.test/api.git", BareRepoPath: filepath.Join(cfg.BareReposDir, "api.git"), DefaultBranch: "main"}
+	executor := Executor{Config: cfg, Git: git.New(git.WithRunner(&executorGitRunner{}))}
+
+	// A bogus operation anywhere in the plan fails the capability preflight
+	// BEFORE the first mutating operation runs.
+	results, err := executor.ExecutePlan(context.Background(), Plan{Operations: []Operation{
+		{Type: OpSpaceCreate, SpaceID: "ex-9", Edits: []RepoRef{{Name: "api"}}},
+		{Type: "space_obliterate"},
+	}})
+	if err == nil || !strings.Contains(err.Error(), "no executor") {
+		t.Fatalf("preflight err = %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("expected no results, got %#v", results)
+	}
+	if _, statErr := os.Stat(filepath.Join(cfg.AgentWorkDir, "ex-9")); !os.IsNotExist(statErr) {
+		t.Fatalf("space ex-9 was created before the preflight failure: %v", statErr)
+	}
+}
+
+func TestExecutorRunsSagaCreateAddAndStatus(t *testing.T) {
+	cfg := executorConfig(t)
+	writeExecutorSpace(t, cfg, "m-1")
+	var out bytes.Buffer
+	executor := Executor{Config: cfg, Git: git.New(git.WithRunner(&executorGitRunner{})), Out: &out}
 
 	results, err := executor.ExecutePlan(context.Background(), Plan{Operations: []Operation{
-		{Type: "not_real"},
-		{Type: OpReposList},
+		{Type: OpSagaCreate, SagaID: "story"},
+		{Type: OpSagaAdd, SagaID: "story", SpaceID: "m-1"},
+		{Type: OpSagaStatus, SagaID: "story"},
 	}})
-	if err == nil {
-		t.Fatal("expected ExecutePlan to return an error")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if len(results) != 1 {
-		t.Fatalf("expected execution to stop after first op, got %#v", results)
+	if len(results) != 3 || !results[0].Executed || !results[1].Executed || !results[2].Executed {
+		t.Fatalf("results = %#v", results)
 	}
-	if !results[0].Executed || results[0].Message == "" {
-		t.Fatalf("failed op should be marked executed with a message: %#v", results[0])
+	manifest, err := space.LoadManifest(filepath.Join(cfg.AgentWorkDir, "story"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(results[0].Message, "unsupported operation") {
-		t.Fatalf("message = %q", results[0].Message)
+	if manifest.Saga == nil || len(manifest.Saga.Members) != 1 || manifest.Saga.Members[0].ID != "m-1" {
+		t.Fatalf("saga manifest = %#v", manifest)
+	}
+	got := out.String()
+	for _, needle := range []string{"created space story", "added m-1 to saga story", "saga story (1 members)", "m-1 [live]"} {
+		if !strings.Contains(got, needle) {
+			t.Fatalf("executor output missing %q:\n%s", needle, got)
+		}
 	}
 }
 

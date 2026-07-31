@@ -9,6 +9,9 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: auto-tag-${{ github.event.workflow_run.head_branch }}
+
 jobs:
   tag:
     name: Bump version and tag
@@ -22,6 +25,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event.workflow_run.head_sha }}
 
       - name: Bump version and push tag
         id: tag

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/Nurozen/stave/internal/space"
 )
 
 func TestRedactTextPatterns(t *testing.T) {
@@ -50,6 +52,43 @@ func TestRedactRawJSONAndRunResult(t *testing.T) {
 		if strings.Contains(string(data), leak) {
 			t.Fatalf("redacted run result leaked %q: %s", leak, data)
 		}
+	}
+}
+
+func TestRedactAnyPreservesSagaStatusPayload(t *testing.T) {
+	payload := map[string]any{
+		"status": space.SagaStatus{
+			SagaID: "story",
+			Members: []space.SagaMemberStatus{{
+				ID:    "m-1",
+				After: []string{"m-0"},
+				Repos: []space.SagaRepoStatus{{Name: "api", Branch: "stave/m-1/api", Base: "origin/main", BaseHealth: space.BaseHealthMerged, MergedVia: space.MergedViaPR}},
+				PRs:   []space.SagaPRStatus{{Repo: "api", Number: 41, State: "MERGED", BaseRefName: "main"}},
+			}},
+			Notes: []space.SagaNote{{Kind: space.NoteKindSuggestion, Member: "m-1", Text: "consider retargeting dependents"}},
+		},
+		"note": "merge detection is ancestry-scoped in agent planning (no PR lookup)",
+	}
+	data, err := json.Marshal(redactAny(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, needle := range []string{
+		`"saga_id":"story"`,
+		`"after":["m-0"]`,
+		`"number":41`,
+		`"state":"MERGED"`,
+		`"merged_via":"pr"`,
+		`"base_ref_name":"main"`,
+		"ancestry-scoped",
+	} {
+		if !strings.Contains(text, needle) {
+			t.Fatalf("redacted saga payload lost %q: %s", needle, text)
+		}
+	}
+	if strings.Contains(text, redactedValue) {
+		t.Fatalf("saga payload was redacted unexpectedly: %s", text)
 	}
 }
 

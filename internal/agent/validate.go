@@ -12,20 +12,94 @@ import (
 	"github.com/Nurozen/stave/internal/summon"
 )
 
+// plannedSpace records what the plan's earlier operations promise about one
+// space so later operations can validate against state that does not exist on
+// disk yet: whether the plan creates it (and as what kind), the repo paths the
+// plan occupies inside it, and the edit-branch names the plan creates.
+type plannedSpace struct {
+	// created marks a space_create/saga_create earlier in the plan; a record
+	// without it only accumulates space_add effects on an on-disk space.
+	created bool
+	isSaga  bool
+	paths   map[string]bool
+	// branches holds bare branch names ("stave/<id>/<repo>").
+	branches map[string]bool
+}
+
+func newPlannedSpace() *plannedSpace {
+	return &plannedSpace{paths: map[string]bool{}, branches: map[string]bool{}}
+}
+
+// plannedCreated reports whether the plan creates space id.
+func plannedCreated(planned map[string]*plannedSpace, id string) bool {
+	record := planned[id]
+	return record != nil && record.created
+}
+
+// recordPlannedOp folds one already-validated operation into the planned-space
+// records. It is the single reducer shared by ValidatePlan and the
+// dispatcher's queue-time base-sugar preflight (plannedSpacesFromOps).
+func recordPlannedOp(planned map[string]*plannedSpace, op Operation) {
+	switch op.Type {
+	case OpSpaceCreate:
+		record := newPlannedSpace()
+		record.created = true
+		for _, ref := range op.Edits {
+			record.paths[ref.Name] = true
+			record.branches[space.DefaultBranch(op.SpaceID, ref.Name)] = true
+		}
+		for _, ref := range op.References {
+			record.paths[filepath.Join("references", ref.Name)] = true
+		}
+		planned[op.SpaceID] = record
+	case OpSagaCreate:
+		record := newPlannedSpace()
+		record.created = true
+		record.isSaga = true
+		for _, ref := range op.References {
+			record.paths[filepath.Join("references", ref.Name)] = true
+		}
+		planned[op.SagaID] = record
+	case OpSpaceAdd:
+		record := planned[op.SpaceID]
+		if record == nil {
+			record = newPlannedSpace()
+			planned[op.SpaceID] = record
+		}
+		if op.Mode == string(space.ModeReference) {
+			record.paths[filepath.Join("references", op.Repo)] = true
+			return
+		}
+		record.paths[op.Repo] = true
+		branch := op.Branch
+		if branch == "" {
+			branch = space.DefaultBranch(op.SpaceID, op.Repo)
+		}
+		record.branches[branch] = true
+	}
+}
+
+// plannedSpacesFromOps replays recordPlannedOp over a whole operation list.
+func plannedSpacesFromOps(ops []Operation) map[string]*plannedSpace {
+	planned := map[string]*plannedSpace{}
+	for _, op := range ops {
+		recordPlannedOp(planned, op)
+	}
+	return planned
+}
+
 func ValidatePlan(cfg config.Config, plan Plan) error {
 	if len(plan.Operations) == 0 {
 		return nil
 	}
-	plannedSpaces := map[string]bool{}
+	plannedSpaces := map[string]*plannedSpace{}
 	plannedPortals := map[string]string{}
 	plannedAuth := map[string]bool{}
 	for i, op := range plan.Operations {
 		if err := validateOperation(cfg, op, plannedSpaces, plannedPortals, plannedAuth); err != nil {
 			return fmt.Errorf("operation %d (%s): %w", i+1, op.Type, err)
 		}
-		if op.Type == OpSpaceCreate {
-			plannedSpaces[op.SpaceID] = true
-		}
+		recordPlannedOp(plannedSpaces, op)
 		if op.Type == OpPortalInit || op.Type == OpPortalAttach {
 			plannedPortals[portalPlanKey(op.SpaceID, op.PortalID)] = op.Driver
 		}
@@ -36,13 +110,16 @@ func ValidatePlan(cfg config.Config, plan Plan) error {
 	return nil
 }
 
-func validateOperation(cfg config.Config, op Operation, plannedSpaces map[string]bool, plannedPortals map[string]string, plannedAuth map[string]bool) error {
+func validateOperation(cfg config.Config, op Operation, plannedSpaces map[string]*plannedSpace, plannedPortals map[string]string, plannedAuth map[string]bool) error {
 	switch op.Type {
 	case OpSpaceCreate:
 		if err := config.ValidateName("space id", op.SpaceID); err != nil {
 			return err
 		}
-		if plannedSpaces[op.SpaceID] {
+		if op.Kind == space.KindSaga {
+			return fmt.Errorf("kind %q is reserved for sagas; use stave_saga_create", space.KindSaga)
+		}
+		if plannedCreated(plannedSpaces, op.SpaceID) {
 			return fmt.Errorf("space %q is already planned for creation", op.SpaceID)
 		}
 		if spaceExists(cfg, op.SpaceID) {
@@ -86,7 +163,8 @@ func validateOperation(cfg config.Config, op Operation, plannedSpaces map[string
 		if err := config.ValidateName("space id", op.SpaceID); err != nil {
 			return err
 		}
-		if !spaceExists(cfg, op.SpaceID) {
+		planned := plannedCreated(plannedSpaces, op.SpaceID)
+		if !spaceExists(cfg, op.SpaceID) && !planned {
 			return fmt.Errorf("space %q does not exist", op.SpaceID)
 		}
 		if _, ok := cfg.Repos[op.Repo]; !ok {
@@ -104,18 +182,37 @@ func validateOperation(cfg config.Config, op Operation, plannedSpaces map[string
 		if err := validateRefish("branch", op.Branch); err != nil {
 			return err
 		}
-		manifest, err := space.LoadManifest(filepath.Join(cfg.AgentWorkDir, op.SpaceID))
-		if err != nil {
-			return err
-		}
 		repoPath := op.Repo
 		if op.Mode == string(space.ModeReference) {
 			repoPath = filepath.Join("references", op.Repo)
 		}
+		if planned {
+			record := plannedSpaces[op.SpaceID]
+			if record.isSaga && op.Mode == string(space.ModeEdit) {
+				return fmt.Errorf("saga space %q holds no edit worktrees; add the repo to a member space instead", op.SpaceID)
+			}
+			if record.paths[repoPath] {
+				return fmt.Errorf("repo path %q already exists in space %q", repoPath, op.SpaceID)
+			}
+			return nil
+		}
+		manifest, err := space.LoadManifest(filepath.Join(cfg.AgentWorkDir, op.SpaceID))
+		if err != nil {
+			return err
+		}
+		if manifest.Saga != nil && op.Mode == string(space.ModeEdit) {
+			return fmt.Errorf("saga space %q holds no edit worktrees; add the repo to a member space instead", op.SpaceID)
+		}
 		if manifest.HasPath(repoPath) {
 			return fmt.Errorf("repo path %q already exists in space %q", repoPath, op.SpaceID)
 		}
+		if record := plannedSpaces[op.SpaceID]; record != nil && record.paths[repoPath] {
+			return fmt.Errorf("repo path %q is already planned for space %q", repoPath, op.SpaceID)
+		}
 	case OpSpaceSync, OpSpaceStatus:
+		if err := config.ValidateSpaceID(op.SpaceID); err != nil {
+			return err
+		}
 		if !spaceExists(cfg, op.SpaceID) {
 			return fmt.Errorf("space %q does not exist", op.SpaceID)
 		}
@@ -123,12 +220,84 @@ func validateOperation(cfg config.Config, op Operation, plannedSpaces map[string
 		if err := config.ValidateName("space id", op.SpaceID); err != nil {
 			return err
 		}
-		if !spaceExists(cfg, op.SpaceID) && !plannedSpaces[op.SpaceID] {
+		if !spaceExists(cfg, op.SpaceID) && !plannedCreated(plannedSpaces, op.SpaceID) {
 			return fmt.Errorf("space %q does not exist", op.SpaceID)
 		}
 		summoner := summon.ResolveName(cfg, op.Summoner)
 		if err := summon.ValidateSummoner(summoner); err != nil {
 			return err
+		}
+	case OpSagaCreate:
+		if err := config.ValidateName("space id", op.SagaID); err != nil {
+			return err
+		}
+		if plannedCreated(plannedSpaces, op.SagaID) {
+			return fmt.Errorf("space %q is already planned for creation", op.SagaID)
+		}
+		if spaceExists(cfg, op.SagaID) {
+			return fmt.Errorf("space %q already exists", op.SagaID)
+		}
+		if len(op.Edits) > 0 {
+			return fmt.Errorf("sagas hold no edit worktrees; create members with stave_space_create and register them with stave_saga_add")
+		}
+		paths := map[string]struct{}{}
+		for _, ref := range op.References {
+			if err := validateRepoRef(cfg, ref); err != nil {
+				return err
+			}
+			if err := recordPath(paths, filepath.Join("references", ref.Name)); err != nil {
+				return err
+			}
+		}
+		if op.SpecPath != "" {
+			if _, err := os.Stat(op.SpecPath); err != nil {
+				return fmt.Errorf("spec path %q: %w", op.SpecPath, err)
+			}
+		}
+		for _, raw := range op.Memories {
+			if err := validateMemorySpec(raw); err != nil {
+				return err
+			}
+		}
+	case OpSagaStatus:
+		if err := config.ValidateSpaceID(op.SagaID); err != nil {
+			return err
+		}
+		if record := plannedSpaces[op.SagaID]; record != nil && record.created {
+			if !record.isSaga {
+				return fmt.Errorf("space %q is not a saga", op.SagaID)
+			}
+			return nil
+		}
+		return validateSagaOnDisk(cfg, op.SagaID)
+	case OpSagaAdd:
+		if err := config.ValidateName("saga id", op.SagaID); err != nil {
+			return err
+		}
+		if err := config.ValidateName("space id", op.SpaceID); err != nil {
+			return err
+		}
+		if op.SagaID == op.SpaceID {
+			return fmt.Errorf("saga %q cannot be its own member", op.SagaID)
+		}
+		if record := plannedSpaces[op.SagaID]; record != nil && record.created {
+			if !record.isSaga {
+				return fmt.Errorf("space %q is created in this plan but is not a saga; use stave_saga_create", op.SagaID)
+			}
+		} else if err := validateSagaOnDisk(cfg, op.SagaID); err != nil {
+			return err
+		}
+		if record := plannedSpaces[op.SpaceID]; record != nil && record.created {
+			if record.isSaga {
+				return fmt.Errorf("space %q is itself a saga; sagas cannot be members", op.SpaceID)
+			}
+		} else if !spaceExists(cfg, op.SpaceID) {
+			return fmt.Errorf("space %q does not exist", op.SpaceID)
+		}
+		for _, id := range op.After {
+			if err := config.ValidateName("member id", id); err != nil {
+				return err
+			}
 		}
 	case OpReposList:
 		return nil
@@ -267,16 +436,35 @@ func validateRefish(label, value string) error {
 	return nil
 }
 
+// validateSagaOnDisk requires id to be an on-disk space whose manifest marks
+// it a saga.
+func validateSagaOnDisk(cfg config.Config, id string) error {
+	if !spaceExists(cfg, id) {
+		return fmt.Errorf("saga %q does not exist", id)
+	}
+	manifest, err := space.LoadManifest(filepath.Join(cfg.AgentWorkDir, id))
+	if err != nil {
+		return err
+	}
+	if manifest.Saga == nil {
+		return fmt.Errorf("space %q is not a saga", id)
+	}
+	return nil
+}
+
 func spaceExists(cfg config.Config, id string) bool {
+	if config.ValidateSpaceID(id) != nil {
+		return false
+	}
 	_, err := os.Stat(filepath.Join(cfg.AgentWorkDir, id, space.ManifestName))
 	return err == nil
 }
 
-func validatePortalSpace(cfg config.Config, id string, plannedSpaces map[string]bool) error {
+func validatePortalSpace(cfg config.Config, id string, plannedSpaces map[string]*plannedSpace) error {
 	if err := config.ValidateName("space id", id); err != nil {
 		return err
 	}
-	if !spaceExists(cfg, id) && !plannedSpaces[id] {
+	if !spaceExists(cfg, id) && !plannedCreated(plannedSpaces, id) {
 		return fmt.Errorf("space %q does not exist", id)
 	}
 	return nil

@@ -53,3 +53,21 @@ func TestBuildPromptEmbedsContextAndQuery(t *testing.T) {
 		t.Fatalf("context JSON is not indented: %q", user)
 	}
 }
+
+func TestBuildPromptIncludesSagaRules(t *testing.T) {
+	system, _, err := BuildPrompt(ProviderRequest{Query: "plan a saga"})
+	if err != nil {
+		t.Fatalf("BuildPrompt error = %v", err)
+	}
+	for _, needle := range []string{
+		"stave_saga_create",
+		"stave_saga_status",
+		"stave_saga_add",
+		"space:<id>",
+		"stave_explain_unsupported",
+	} {
+		if !strings.Contains(system, needle) {
+			t.Fatalf("system prompt missing %q", needle)
+		}
+	}
+}

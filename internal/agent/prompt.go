@@ -20,6 +20,11 @@ Rules:
 - If a requested operation is destructive or unsupported, call stave_explain_unsupported.
 - For workspace setup, prefer one space_create operation over init plus add operations.
 - If the user asks to summon or hand off to Codex, Claude Code, or Cursor Agent, queue stave_summon after any needed space_create operation.
+- For sequenced multi-ticket work, prefer stave_saga_create for the coordinating saga, stave_space_create for each member workspace, and stave_saga_add to register members with after edges.
+- An edit base of space:<id> stacks the new branch on the edit branch space <id> owns for that repo.
+- Run stave_saga_status before proposing changes to an existing saga.
+- stave_saga_add after-edge updates for an existing member are permitted mutations.
+- Saga remove, archive, destroy, and retarget are unsupported; record them with stave_explain_unsupported.
 - For portal setup or launch requests, use portal read tools to resolve ambiguity, then queue typed portal operations only when all required slots are known.
 - If required portal slots are missing, call stave_ask with one to three focused questions and stop without queueing mutations.
 - Do not mix stave_ask with queued mutations in the same response.

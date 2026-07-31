@@ -43,6 +43,7 @@ func NewMarmot(binary string) *Marmot {
 var (
 	_ Provider        = (*Marmot)(nil)
 	_ ReferenceLinker = (*Marmot)(nil)
+	_ MCPWirer        = (*Marmot)(nil)
 )
 
 func (m *Marmot) Name() string { return "marmot" }
@@ -320,6 +321,25 @@ func (m *Marmot) LinkReference(ctx context.Context, opts LinkReferenceOptions) (
 		printf(opts.Out, "reference %s → %s (%s)\n", label, target, resolvedVia)
 	}
 	return res, nil
+}
+
+// WriteMCPConfig implements the optional MCPWirer seam: it writes the four
+// space-local harness configs pointing `serve --den <storeID>` at the
+// resolved binary (embedding MARMOT_HOME exactly as attach does), reusing the
+// same rendering attach goes through.
+func (m *Marmot) WriteMCPConfig(_ context.Context, spacePath, storeID string) error {
+	bin := m.binary()
+	if path, err := m.lookPath(bin); err == nil {
+		bin = path
+	}
+	return WriteSpaceMCPConfig(spacePath, bin, storeID)
+}
+
+// RemoveMCPConfig implements the optional MCPWirer seam: it strips ONLY the
+// generated context-marmot entries via the entry-level cleanup detach uses,
+// preserving any other servers/settings.
+func (m *Marmot) RemoveMCPConfig(_ context.Context, spacePath string) error {
+	return RemoveSpaceMCPConfig(spacePath)
 }
 
 // DenLinkArgs builds the argv for one `marmot den link` pass-through call.

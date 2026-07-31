@@ -131,6 +131,57 @@ Server argv shape:
 }
 ```
 
+## Saga-shared dens
+
+A saga and its members share one den. The saga owns it; the members only point
+at it.
+
+```bash
+stave saga create checkout-rewrite --memory .
+stave space create checkout-api -e api --saga checkout-rewrite
+stave space create checkout-web -e web --saga checkout-rewrite --after checkout-api
+```
+
+The saga attaches through the ordinary flow above, with one difference: its
+owned store is created **durable**, not task-scoped —
+`marmot den create <id> --lifetime durable --project <saga-path> --no-pointer --json`
+— because the den outlives any single member. At most one fresh `--memory`
+spec is allowed per `saga create` (attach-existing specs are unlimited); a
+batch with two fresh specs is rejected before anything is created.
+
+Members get **MCP config only**. Joining a saga (via `space create --saga`, or
+`saga add` on an existing space) writes the same four space-local files —
+`.mcp.json`, `.cursor/mcp.json`, `.vscode/mcp.json`, `.codex/config.toml` —
+pointing `serve --den` at the *saga's* den id. Deliberately, a member gets:
+
+| Artifact | On the member |
+|----------|---------------|
+| Den | None created |
+| Attachment in `.stave.yaml` | **None** — the saga holds the record |
+| Reverse route in `routes.yml` | **None** — the saga owns the route |
+| MCP configs | Written, pointing at the saga den |
+
+So `stave memory list <member>` and the member's `space status` memory row stay
+empty: from the manifest's view the member has no memory, while its agents talk
+to the saga's den. `saga remove` strips the wiring again (`context-marmot`
+entries only, unrelated servers preserved).
+
+**A member's own den always wins.** Wiring happens only when the member has no
+memory attachment of its own, and the check runs after the member space is
+fully created — so a member that attached its own store, or picked one up
+ambiently from `memory.default: true`, keeps its own MCP configs untouched and
+is never repointed at the saga den. The same guard applies on removal: such a
+member never has its configs stripped by `saga remove`.
+
+### Concurrent serve
+
+Every space in a saga points `serve --den` at the same den id, so running
+harnesses in the saga and several members at once means several concurrent
+`marmot serve --den <same-id>` processes against one den. That is marmot's
+concurrency to manage, not Stave's, and it was already possible with
+`memory attach --use <den-id>` — but sagas make it the default topology rather
+than the exception.
+
 ## Detach and cleanup
 
 | Fate | Den | Reverse route | MCP configs |

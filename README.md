@@ -108,13 +108,23 @@ stave
 │   ├── sync <space-id>
 │   ├── propose <space-id>
 │   └── detach <space-id> [--keep|--destroy]
+├── saga
+│   ├── create <saga-id> [--memory ...] [--summon ...]
+│   ├── list [--json]
+│   ├── status <saga-id> [--json]
+│   ├── sync <saga-id>
+│   ├── add <saga-id> <space-id> [--after <member-id>]
+│   ├── remove <saga-id> <space-id>
+│   ├── archive <saga-id>
+│   └── destroy <saga-id> [--memory keep|destroy|contribute]
 └── space
     ├── init <space-id>
-    ├── create <space-id> [--memory ...]
+    ├── create <space-id> [--memory ...] [--saga <saga-id> [--after ...]]
     ├── add <space-id> <repo>
     ├── sync <space-id>
     ├── status <space-id>
     ├── archive <space-id>
+    ├── retarget <space-id> --repo <repo> --base <ref>
     └── destroy <space-id> [--memory keep|destroy|contribute]
 ```
 
@@ -148,6 +158,9 @@ stave space status ticket-482
 
 # Fetch remotes, refresh references, report edit drift
 stave space sync ticket-482
+
+# Stack a follow-up space on ticket-482's api branch
+stave space create ticket-483 -e api:space:ticket-482
 ```
 
 After the inscribed shell integration is loaded, the create command leaves the
@@ -256,6 +269,26 @@ agent-work/ticket-482/
     └── api/             # detached reference worktree
 ```
 
+A typical saga. The saga space itself holds no edit worktrees — its members are
+ordinary sibling spaces under `agent-work/`, joined by the roster in the saga's
+manifest rather than by nesting:
+
+```text
+agent-work/checkout-rewrite/     # the saga space
+├── .stave.yaml                  # manifest v2: member roster + after edges
+├── AGENTS.md                    # coordinator instructions (generated)
+├── CLAUDE.md -> AGENTS.md
+├── .claude/
+│   ├── settings.json            # member dirs as additionalDirectories
+│   └── skills/stave-saga/       # embedded coordinator skill
+├── .codex/config.toml           # member dirs as writable_roots
+├── spec/                        # optional spec file or tree
+└── references/                  # optional detached reference worktrees
+
+agent-work/checkout-api/         # member space (sibling, not nested)
+agent-work/checkout-web/         # member space, after: checkout-api
+```
+
 ## Commands
 
 Global flag on all commands: `--config <path>` (default `~/.config/stave/config.yaml`).
@@ -330,12 +363,15 @@ The agent uses provider-native tool calls, not a free-form JSON response. OpenAI
 | `stave_space_create` | Queue new space creation for confirmation |
 | `stave_space_add` | Queue adding a repo to an existing space for confirmation |
 | `stave_summon` | Queue launching Codex, Claude Code, or Cursor Agent in a space |
+| `stave_saga_create` | Queue creating a saga — a coordination space for sequenced multi-ticket work whose members are ordinary spaces (references become read-only context; no edit worktrees) |
+| `stave_saga_status` | Read one saga during planning: members in dependency order with lifecycle state, drift, and base health (merge detection is ancestry-scoped — no PR lookup) |
+| `stave_saga_add` | Queue registering a space as a saga member, optionally sequenced after other members; re-adding an existing member updates its `after` edges |
 | `stave_explain_unsupported` | Record unsupported/destructive requests as notes |
 | `stave_finish` | Finish planning with a summary, notes, and warnings |
 
 Read-only tools can run immediately while the model is planning. Mutating tools never apply changes inside the model loop; they only create a validated operation plan that Stave executes after confirmation, `--incant`, or `agent.autoIncant: true`. Summoning is interactive, so `--json` and non-interactive executions include the summon command but skip the launch.
 
-Destructive operations such as archive, destroy, repo removal, reset, delete, push, PR creation, issue tracker updates, and arbitrary shell commands are intentionally not executable by the agent in v1.
+Destructive operations such as archive, destroy, repo removal, reset, delete, push, PR creation, issue tracker updates, and arbitrary shell commands are intentionally not executable by the agent in v1. The same exclusion covers saga mutation beyond membership: saga archive, saga destroy, saga remove, and space retarget remain non-executable by the agent, which records such requests via `stave_explain_unsupported`.
 
 `stave agent configure` stores API keys in macOS Keychain when available. If Keychain is unavailable, config stores an environment-variable reference such as `env:OPENAI_API_KEY` or `env:ANTHROPIC_API_KEY`. Stave does not write plaintext API keys to `config.yaml` and does not edit shell startup files.
 
@@ -351,19 +387,26 @@ Current built-in model defaults are `gpt-5.5` for OpenAI and `claude-opus-4-7` f
 | `stave space sync <space-id>` | Fetch, update references, report edit drift |
 | `stave space status <space-id>` | Manifest, dirty state, ahead/behind |
 | `stave space archive <space-id>` | Remove worktrees; move space to `.archive/` |
+| `stave space retarget <space-id> --repo <repo> --base <ref>` | Repoint an edit repo's recorded base without touching the worktree (rewrites the manifest only) |
 | `stave space destroy <space-id>` | Remove worktrees and delete space directory |
+
+Space commands take a plain space ID. Relative-path spellings such as
+`.archive/<id>` (previously accepted by some read and lifecycle verbs) are no
+longer valid space IDs and are rejected.
 
 Space flags:
 
 | Flag | Commands | Meaning |
 |------|----------|---------|
-| `--kind`, `-k` | `init`, `create` | Label the space (e.g. `ticket`, `spike`, `audit`) |
+| `--kind`, `-k` | `init`, `create` | Free-form label for the space (e.g. `ticket`, `spike`, `audit`), with two reserved behavioral kinds: `review`, which `stave review` sets and which launches Claude into the `pr-teach` skill, and `saga`, which is rejected here — use `stave saga create` |
 | `--spec`, `-s` | `init`, `create` | Copy a spec file or directory into `spec/` |
-| `--edit`, `-e` | `create` | Editable worktree from base ref (`repo` or `repo:base`; repeatable) |
+| `--edit`, `-e` | `create` | Editable worktree from base ref (`repo` or `repo:base`; `base` may be `space:<id>` sugar; repeatable) |
 | `--reference`, `-r` | `create` | Detached reference worktree (`repo` or `repo:ref`; repeatable) |
+| `--saga` | `create` | Register the new space as a member of this saga |
+| `--after` | `create` | Member id the new space lands behind (requires `--saga`; repeatable) |
 | `--summon` | `create` | Launch `codex`, `claude`, or `cursor` after the space is created |
 | `--edit`, `-e` / `--reference`, `-r` | `add` | Mode (exactly one required) |
-| `--base`, `-b` | `add` | Base branch/ref for edits, or ref for references |
+| `--base`, `-b` | `add` | Base branch/ref for edits (`space:<id>` sugar accepted), or ref for references |
 | `--branch` | `add` | Branch name for editable repos |
 | `--no-fetch` | `add` | Skip fetching the bare repo before adding |
 | `--references-only` | `sync` | Only sync reference worktrees |
@@ -377,6 +420,178 @@ the selected agent before its launch prompt. For example,
 `stave space create ticket-482 --summon codex --yolo` launches Codex in yolo
 mode. Stave's own flags remain Stave-owned; use `--` before a colliding agent
 flag, such as `--summon codex -- --config agent.toml`.
+
+### Stacking spaces
+
+A follow-up space can base its edit branch on another space's edit branch
+instead of a remote branch. The base sugar `space:<id>` resolves to the edit
+branch that space owns for the same repo:
+
+```bash
+# First ticket branches from the remote default
+stave space create pay-1 -e api
+
+# Second ticket stacks on pay-1's api branch
+stave space create pay-2 -e api:space:pay-1
+```
+
+`pay-2`'s drift then reports against `pay-1`'s branch and live-tracks it: as
+`pay-1` gains commits, `stave space sync pay-2` shows how far `pay-2` is ahead
+of or behind its sibling.
+
+Two warnings to watch for:
+
+- **Canonicalization.** Hand-typed `stave/...` or `origin/stave/...` bases are
+  rewritten to `refs/heads/stave/...` with a notice. Stave branches live only
+  in the bare repo — Stave never pushes them — so the `origin/...` spelling
+  would never resolve.
+- **Stale-branch adoption.** If the edit branch already exists, the new
+  worktree adopts its current head; the requested base/start-point is ignored
+  and the recorded base is aspirational. Stave warns and reports how far the
+  adopted branch is ahead of or behind the requested base.
+
+When the base space's work merges, repoint the stacked space at the merged
+branch:
+
+```bash
+stave space retarget pay-2 --repo api --base origin/main
+```
+
+`retarget` rewrites only the recorded base in the manifest — the ref drift is
+measured against — without touching the worktree. `--repo` is required, the
+same base sugar and canonicalization apply, and a resolved `stave/...` base
+must exist in the bare repo. Archiving or destroying a space that a sibling
+still stacks on fails closed unless `--force` is given.
+
+### `stave saga`
+
+A **saga** is a coordinating space for work that spans several dependent
+spaces: one epic split across three tickets, or a migration whose web change
+cannot land before its API change. The saga space holds the spec, the roster of
+member spaces, and the ordering between them — but no edit worktrees of its
+own. The members are ordinary spaces that each own their branches; the saga
+records how they relate. The durable reference for the frozen `saga status
+--json` schema, base-health semantics, and merge awareness is
+[docs/saga.md](docs/saga.md).
+
+| Command | Description |
+|---------|-------------|
+| `stave saga create <saga-id>` | Create a saga space with an empty member roster |
+| `stave saga list` | List every space with its kind and saga membership |
+| `stave saga status <saga-id>` | Members in dependency order with state, drift, and topology notes |
+| `stave saga sync <saga-id>` | Fetch each shared bare repo once, then sync every live member |
+| `stave saga add <saga-id> <space-id>` | Register an existing space as a member |
+| `stave saga remove <saga-id> <space-id>` | Drop a member from the roster |
+| `stave saga archive <saga-id>` | Archive every member in reverse topological order, then the saga space |
+| `stave saga destroy <saga-id>` | Destroy every member in reverse topological order, then the saga space |
+
+Saga flags:
+
+| Flag | Commands | Meaning |
+|------|----------|---------|
+| `--spec`, `-s` | `create` | Copy a spec file or directory into the saga's `spec/` |
+| `--reference`, `-r` | `create` | Detached reference worktree (`repo` or `repo:ref`; repeatable) |
+| `--memory` | `create` | Attach memory: `[provider:]<spec>`; `.` creates a fresh store (repeatable, at most one fresh) |
+| `--summon` | `create` | Launch `codex`, `claude`, or `cursor` after the saga is created |
+| `--after` | `add` | Member id this space lands behind (repeatable) |
+| `--clear-after` | `add` | Reset the member's `after` edges before applying `--after` |
+| `--json` | `list`, `status` | Emit machine-readable JSON (for `status`, the frozen `SagaStatus` contract) |
+| `--force` | `archive`, `destroy` | Proceed despite dirty member worktrees, external spaces stacked on member branches, or (destroy) other spaces sharing the saga den |
+| `--memory` | `archive`, `destroy` | Saga den fate: `keep` (default) or `contribute` on archive; `keep`, `destroy`, or `contribute` on destroy |
+| `--dry-run` | `create`, `sync`, `add`, `remove`, `archive`, `destroy` | Print operations (for `archive`/`destroy`, the ordered teardown plan) without changing state |
+
+A saga takes shape in one of two directions — create the saga first and hang
+members off it, or register spaces you already have:
+
+```bash
+# Create the saga, then create members directly into it
+stave saga create checkout-rewrite -s ~/notes/checkout-epic.md
+stave space create checkout-api -e api --saga checkout-rewrite
+stave space create checkout-web -e web --saga checkout-rewrite --after checkout-api
+
+# Or adopt an existing space into an existing saga
+stave saga add checkout-rewrite billing-cleanup --after checkout-api
+
+# Where everything stands, in dependency order
+stave saga status checkout-rewrite
+
+# Fetch each bare repo once, sync every live member
+stave saga sync checkout-rewrite
+```
+
+`--after` records that `checkout-web` lands behind `checkout-api`, which orders
+the roster in `saga status` and lets it flag stacking that crosses the
+dependency graph. Ordering must stay acyclic and every `--after` target must
+already be a member — both are checked when the manifest is saved. `saga add`
+upserts: re-adding a member with no `--after` leaves its existing edges alone,
+a non-empty `--after` replaces them, and `--clear-after` resets them first.
+
+On `space create --saga … --after …`, an `--after` edge also picks the base for
+any `--edit` repo you did not give an explicit base to — the two members above
+edit different repos, so nothing is inferred there, but when a member follows a
+predecessor *into the same repo* its branch stacks on that predecessor's branch
+instead of the remote default:
+
+```bash
+stave space create api-part-2 -e api --saga checkout-rewrite --after checkout-api
+# api-part-2's api branch starts from stave/checkout-api/api, not origin/main
+```
+
+Its drift is then reported against its predecessor. The rule is deliberately
+conservative: exactly one predecessor editing the repo means stack on it, no
+predecessor editing it falls back to the usual default-base chain, and several
+predecessors editing it makes Stave refuse rather than guess — it asks for an
+explicit base (`-e <repo>:space:<id>`, the same sugar described under
+[Stacking spaces](#stacking-spaces)). The inference happens only at creation:
+`saga add` records edges on a space whose branches already exist and never
+repoints them — use `stave space retarget` for that.
+
+Two rejections keep the roles apart. `stave saga create` refuses `-e`/`--edit`,
+because a saga holds no edit worktrees — create a member instead. And
+`stave space init`/`create` refuse `-k saga`, because the kind is reserved for
+`stave saga create` (which sets it, and the member roster that goes with it).
+Anything after a literal `--` still forwards to the summoned agent as usual.
+
+`saga status` lists members in dependency order, each with its lifecycle state
+(`live`, `archived`, `missing`, or `corrupt`), its `after` predecessors, and —
+for live members — per-repo dirtiness, the recorded base, whether that base
+still exists, and ahead/behind drift. Notes call out topology problems worth
+knowing about, such as a member stacked on a branch owned by a space outside
+the saga, or on a member that is not one of its declared predecessors.
+
+`saga status` also takes `--json`, emitting the frozen `SagaStatus` contract
+(including merge detection); `saga sync` is human-readable output only.
+`saga list` already has
+`--json`, and it covers every space — not just saga members — so it doubles as
+the "what is joined to what" view.
+
+Because members are sibling directories rather than subdirectories of the
+saga, an agent summoned in the saga root would not normally be allowed to touch
+them. Stave keeps the harness settings at the saga root in step with the roster
+on every membership change: `.claude/settings.json` gains the member paths
+under `permissions.additionalDirectories`, and `.codex/config.toml` gains them
+under `sandbox_workspace_write.writable_roots`. Both edits are merge-aware —
+only Stave's own entry is rewritten, and the rest of an existing file survives.
+
+Every saga space ships with an embedded `stave-saga` skill (installed at
+`.claude/skills/stave-saga/` inside the space), a coordinator loop for driving
+members in order. Summoning Claude in a saga space launches straight into it —
+no setup and no personal skills required. Other summoners, and saga spaces
+that never received the skill, get a coordinator stance prompt instead. Pass
+`--prompt` to launch with something else.
+
+Memory attached to a saga is shared with its members: a member that has no
+memory of its own is given MCP configuration pointing at the saga's den, so
+every agent in the saga reads and writes one context store. See
+[`docs/memory.md`](docs/memory.md) for the full recipe.
+
+Single-space lifecycle stays out of saga state: `stave space archive` and
+`stave space destroy` refuse to act on a saga space (use `stave saga archive`
+or `stave saga destroy` to tear it down with its members) or on a registered
+member (use `stave saga remove` to drop it from the roster first). Pass
+`--force` to override the refusal and archive or destroy the space anyway —
+the roster is then left as-is and may reference a space that no longer
+exists.
 
 ### `stave summon`
 

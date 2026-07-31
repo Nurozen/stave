@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/Nurozen/stave/internal/config"
@@ -19,7 +20,9 @@ const (
 	// CurrentManifestVersion is the highest .stave.yaml schema version this
 	// binary understands. Load is permissive (older/missing versions load);
 	// Save refuses when the on-disk version is newer than this constant.
-	CurrentManifestVersion = 1
+	// The version actually stamped on a file is content-dependent (see
+	// Manifest.schemaVersion), so a saga-less space still writes version 1.
+	CurrentManifestVersion = 2
 )
 
 type RepoMode string
@@ -27,6 +30,10 @@ type RepoMode string
 const (
 	ModeEdit      RepoMode = "edit"
 	ModeReference RepoMode = "reference"
+
+	// KindSaga marks a space that coordinates member spaces rather than
+	// holding work of its own.
+	KindSaga = "saga"
 )
 
 // MemoryManifest is one durable attachment record in .stave.yaml.
@@ -48,6 +55,33 @@ type Manifest struct {
 	SpecPath  string           `yaml:"specPath,omitempty"`
 	Repos     []RepoManifest   `yaml:"repos"`
 	Memories  []MemoryManifest `yaml:"memories,omitempty"`
+	// Saga is set only on saga spaces; nil on every ordinary space.
+	Saga *SagaManifest `yaml:"saga,omitempty"`
+}
+
+// SagaManifest is the member roster of a saga space.
+type SagaManifest struct {
+	Members []SagaMember `yaml:"members"`
+}
+
+// SagaMember is one member space enrolled in a saga. After lists the ids of
+// members this one lands behind; the resulting graph must stay acyclic.
+type SagaMember struct {
+	ID    string   `yaml:"id"`
+	After []string `yaml:"after,omitempty"`
+	// CreatedAt is the member manifest's creation stamp captured when the
+	// member was added. It is compared with time.Time.Equal to detect a
+	// space that was destroyed and recreated under the same id, so a zero
+	// value reads as a mismatch.
+	CreatedAt time.Time `yaml:"createdAt,omitempty"`
+	PRs       []SagaPR  `yaml:"prs,omitempty"`
+}
+
+// SagaPR identifies a pull request opened for a member. Only identity is
+// recorded: merge state is always re-read from the forge, never persisted.
+type SagaPR struct {
+	Repo   string `yaml:"repo"`
+	Number int    `yaml:"number"`
 }
 
 type RepoManifest struct {
@@ -85,26 +119,40 @@ func LoadManifest(spacePath string) (Manifest, error) {
 
 // SaveManifest writes the manifest atomically. It refuses to overwrite an
 // on-disk file whose version is greater than CurrentManifestVersion, so a
-// newer binary's schema is never clobbered by an older one. New manifests
-// (no on-disk file) always write at CurrentManifestVersion.
+// newer binary's schema is never clobbered by an older one. The stamped
+// version is the lowest one that can express the manifest's own content, so
+// spaces that use no post-v1 field stay readable and writable by older stave
+// binaries.
 func SaveManifest(spacePath string, manifest Manifest) error {
-	path := filepath.Join(spacePath, ManifestName)
+	return saveManifestWithCeiling(filepath.Join(spacePath, ManifestName), manifest, CurrentManifestVersion)
+}
+
+// saveManifestWithCeiling is SaveManifest with the write ceiling injected, so
+// tests can drive an older binary's ceiling against a newer file.
+func saveManifestWithCeiling(path string, manifest Manifest, ceiling int) error {
+	onDiskVersion := 0
 	if existing, err := os.ReadFile(path); err == nil {
 		var onDisk Manifest
 		if err := yaml.Unmarshal(existing, &onDisk); err != nil {
 			return fmt.Errorf("read existing manifest for version check: %w", err)
 		}
-		if onDisk.Version > CurrentManifestVersion {
-			return &ErrManifestVersionTooNew{OnDisk: onDisk.Version, Current: CurrentManifestVersion}
+		if onDisk.Version > ceiling {
+			return &ErrManifestVersionTooNew{OnDisk: onDisk.Version, Current: ceiling}
 		}
+		onDiskVersion = onDisk.Version
 	} else if !os.IsNotExist(err) {
 		return err
 	}
 	if err := manifest.Validate(); err != nil {
 		return err
 	}
-	if manifest.Version == 0 {
-		manifest.Version = CurrentManifestVersion
+	// Never step a file back down: a version already reached on disk (or
+	// already carried by the manifest) stays, even if the content that
+	// required it has since been removed.
+	for _, v := range []int{manifest.schemaVersion(), onDiskVersion} {
+		if v > manifest.Version {
+			manifest.Version = v
+		}
 	}
 	data, err := yaml.Marshal(manifest)
 	if err != nil {
@@ -113,7 +161,35 @@ func SaveManifest(spacePath string, manifest Manifest) error {
 	return fsio.WriteFileAtomic(path, data, 0o644)
 }
 
-// Validate checks id/name charset for memory attachments (and space id when set).
+// saveManifestExclusive writes a brand-new manifest, failing with os.ErrExist
+// when one is already on disk. InitSpace uses it for the initial write so
+// concurrent same-ID creations (plain create vs saga create) get exactly one
+// winner instead of silently clobbering each other's manifests.
+func saveManifestExclusive(spacePath string, manifest Manifest) error {
+	if err := manifest.Validate(); err != nil {
+		return err
+	}
+	if v := manifest.schemaVersion(); v > manifest.Version {
+		manifest.Version = v
+	}
+	data, err := yaml.Marshal(manifest)
+	if err != nil {
+		return err
+	}
+	return fsio.WriteFileExclusive(filepath.Join(spacePath, ManifestName), data, 0o644)
+}
+
+// schemaVersion is the lowest schema version able to represent this
+// manifest's content.
+func (m Manifest) schemaVersion() int {
+	if m.Saga != nil {
+		return 2
+	}
+	return 1
+}
+
+// Validate checks id/name charset for memory attachments (and space id when
+// set), plus the saga roster's ids and after-graph when one is present.
 func (m Manifest) Validate() error {
 	if m.ID != "" {
 		if err := config.ValidateName("space id", m.ID); err != nil {
@@ -137,7 +213,73 @@ func (m Manifest) Validate() error {
 			}
 		}
 	}
+	if m.Saga != nil {
+		if err := validateSagaMembers(m.Saga.Members); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func validateSagaMembers(members []SagaMember) error {
+	byID := make(map[string]struct{}, len(members))
+	for i, member := range members {
+		if err := config.ValidateSpaceID(member.ID); err != nil {
+			return fmt.Errorf("saga.members[%d]: %w", i, err)
+		}
+		if _, dup := byID[member.ID]; dup {
+			return fmt.Errorf("saga.members[%d]: duplicate member %q", i, member.ID)
+		}
+		byID[member.ID] = struct{}{}
+	}
+	for i, member := range members {
+		for j, after := range member.After {
+			if _, ok := byID[after]; !ok {
+				return fmt.Errorf("saga.members[%d].after[%d]: %q is not a saga member", i, j, after)
+			}
+		}
+	}
+	if cycle := sagaCycle(members); len(cycle) > 0 {
+		return fmt.Errorf("saga.members: after cycle among %s", strings.Join(cycle, ", "))
+	}
+	return nil
+}
+
+// sagaCycle returns the member ids left unsettled by a Kahn toposort of the
+// after-graph, in roster order; empty means the graph is acyclic. Callers must
+// have already rejected duplicate ids and unknown after targets.
+func sagaCycle(members []SagaMember) []string {
+	pending := make(map[string]int, len(members))
+	unblocks := make(map[string][]string, len(members))
+	for _, member := range members {
+		pending[member.ID] = len(member.After)
+		for _, after := range member.After {
+			unblocks[after] = append(unblocks[after], member.ID)
+		}
+	}
+	ready := make([]string, 0, len(members))
+	for _, member := range members {
+		if pending[member.ID] == 0 {
+			ready = append(ready, member.ID)
+		}
+	}
+	for len(ready) > 0 {
+		id := ready[len(ready)-1]
+		ready = ready[:len(ready)-1]
+		for _, blocked := range unblocks[id] {
+			pending[blocked]--
+			if pending[blocked] == 0 {
+				ready = append(ready, blocked)
+			}
+		}
+	}
+	var stuck []string
+	for _, member := range members {
+		if pending[member.ID] > 0 {
+			stuck = append(stuck, member.ID)
+		}
+	}
+	return stuck
 }
 
 func (m Manifest) FindRepo(name string) (RepoManifest, int, bool) {

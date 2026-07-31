@@ -13,6 +13,7 @@ import (
 
 	"github.com/Nurozen/stave/internal/agent"
 	"github.com/Nurozen/stave/internal/config"
+	"github.com/Nurozen/stave/internal/gh"
 	"github.com/Nurozen/stave/internal/git"
 	"github.com/Nurozen/stave/internal/memory"
 	"github.com/Nurozen/stave/internal/portal"
@@ -29,6 +30,7 @@ type app struct {
 	secretStore     agent.SecretStore
 	summonLauncher  summon.Launcher
 	portalRunner    portal.Runner
+	ghRunner        gh.Runner // nil = gh.ExecRunner; tests inject fakes
 	isTerminal      func(*cobra.Command) bool
 }
 
@@ -63,6 +65,7 @@ func newRootCommand(a *app) *cobra.Command {
 		a.agentCommand(),
 		a.summonCommand(),
 		a.reviewCommand(),
+		a.sagaCommand(),
 	)
 	return cmd
 }
@@ -460,6 +463,7 @@ func (a *app) spaceCommand() *cobra.Command {
 		a.createCommand(),
 		a.addCommand(),
 		a.syncCommand(),
+		a.retargetCommand(),
 		a.statusCommand(),
 		a.archiveCommand(),
 		a.destroyCommand(),
@@ -475,6 +479,9 @@ func (a *app) initCommand() *cobra.Command {
 		Short: "Create an empty agent workspace",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if kind == space.KindSaga {
+				return fmt.Errorf("kind %q is reserved; use 'stave saga create'", space.KindSaga)
+			}
 			svc, err := a.service(cmd)
 			if err != nil {
 				return err
@@ -493,6 +500,8 @@ func (a *app) createCommand() *cobra.Command {
 	var edits []string
 	var references []string
 	var memories []string
+	var sagaID string
+	var after []string
 	var dryRun bool
 	var summonName string
 	cmd := &cobra.Command{
@@ -502,6 +511,9 @@ func (a *app) createCommand() *cobra.Command {
 			positionals, agentArgs, err := parsePassthroughArgs(cmd, args, 1, 1, func() bool { return summonName != "" })
 			if err != nil {
 				return err
+			}
+			if kind == space.KindSaga {
+				return fmt.Errorf("kind %q is reserved; use 'stave saga create'", space.KindSaga)
 			}
 			spaceID := positionals[0]
 			editSpecs, err := parseRepoSpecs(edits)
@@ -524,6 +536,8 @@ func (a *app) createCommand() *cobra.Command {
 				References: refSpecs,
 				Memories:   memories,
 				DryRun:     dryRun,
+				SagaID:     sagaID,
+				After:      after,
 			}); err != nil {
 				return err
 			}
@@ -544,9 +558,11 @@ func (a *app) createCommand() *cobra.Command {
 	}
 	cmd.Flags().StringVarP(&kind, "kind", "k", "", "space kind, such as ticket, spike, or audit")
 	cmd.Flags().StringVarP(&spec, "spec", "s", "", "path to a spec file or directory to copy into the space")
-	cmd.Flags().StringArrayVarP(&edits, "edit", "e", nil, "editable repo spec, optionally repo:base")
+	cmd.Flags().StringArrayVarP(&edits, "edit", "e", nil, "editable repo spec, repo[:base]; base may be space:<id> to stack on that space's branch")
 	cmd.Flags().StringArrayVarP(&references, "reference", "r", nil, "reference repo spec, optionally repo:ref")
 	cmd.Flags().StringArrayVar(&memories, "memory", nil, "attach memory: [provider:]<spec>; '.' = fresh task store (repeatable)")
+	cmd.Flags().StringVar(&sagaID, "saga", "", "register the new space as a member of this saga")
+	cmd.Flags().StringArrayVar(&after, "after", nil, "member id the new space lands behind (requires --saga; repeatable)")
 	cmd.Flags().StringVar(&summonName, "summon", "", "launch a summoner after creation (codex, claude, or cursor)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print operations without changing state")
 	cmd.Flags().SetInterspersed(false)
@@ -603,6 +619,16 @@ func (a *app) portalCommand() *cobra.Command {
 	return cmd
 }
 
+// printSagaPortalNote flags, best-effort, that a portal on a saga space covers
+// only the saga directory: members are sibling spaces on disk, so they sit
+// outside the portal's mounts. Manifest load errors are ignored — the init
+// itself surfaces them if they matter.
+func printSagaPortalNote(out io.Writer, svc portal.Service, spaceID string) {
+	if manifest, err := space.LoadManifest(svc.SpacePath(spaceID)); err == nil && manifest.Saga != nil {
+		fmt.Fprintln(out, "note: members are sibling spaces; this portal covers only the saga directory")
+	}
+}
+
 func (a *app) portalInitCommand() *cobra.Command {
 	var preset string
 	var yes bool
@@ -620,6 +646,7 @@ func (a *app) portalInitCommand() *cobra.Command {
 			if strings.HasPrefix(preset, "ssh-") {
 				return fmt.Errorf("preset %s attaches an external resource; use `stave portal attach ssh`", preset)
 			}
+			printSagaPortalNote(cmd.OutOrStdout(), svc, args[0])
 			kind := guidedPortalKind(preset)
 			reader := bufio.NewReader(cmd.InOrStdin())
 			if !yes && !dryRun && a.commandIsTerminal(cmd) && preset == "" {
@@ -682,6 +709,7 @@ func (a *app) portalInitContainerCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			printSagaPortalNote(cmd.OutOrStdout(), svc, args[0])
 			plan, err := svc.InitContainer(cmd.Context(), portal.InitContainerOptions{SpaceID: args[0], PortalID: optionalPortalID(args), Engine: portal.Driver(engine), Image: image, ContainerRoot: containerRoot, Preset: preset, DryRun: dryRun})
 			if err != nil {
 				return err
@@ -711,6 +739,7 @@ func (a *app) portalInitDevcontainerCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			printSagaPortalNote(cmd.OutOrStdout(), svc, args[0])
 			plan, err := svc.InitDevcontainer(cmd.Context(), portal.InitDevcontainerOptions{SpaceID: args[0], PortalID: optionalPortalID(args), DevcontainerPath: path, Service: service, ContainerRoot: containerRoot, ComposeFiles: composeFiles, Preset: preset, DryRun: dryRun})
 			if err != nil {
 				return err
@@ -1359,7 +1388,7 @@ func (a *app) addCommand() *cobra.Command {
 	}
 	cmd.Flags().BoolVarP(&edit, "edit", "e", false, "add as an editable top-level worktree")
 	cmd.Flags().BoolVarP(&reference, "reference", "r", false, "add as a detached reference worktree under references/")
-	cmd.Flags().StringVarP(&base, "base", "b", "", "base branch/ref for edit repos, or ref for reference repos")
+	cmd.Flags().StringVarP(&base, "base", "b", "", "base branch/ref for edit repos (may be space:<id> to stack on that space's branch), or ref for reference repos")
 	cmd.Flags().StringVar(&branch, "branch", "", "branch name for editable repos")
 	cmd.Flags().BoolVar(&noFetch, "no-fetch", false, "skip fetching the bare repo before adding the worktree")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print operations without changing state")
@@ -1382,6 +1411,34 @@ func (a *app) syncCommand() *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&referencesOnly, "references-only", false, "only sync reference worktrees")
+	return cmd
+}
+
+func (a *app) retargetCommand() *cobra.Command {
+	var repoName string
+	var base string
+	var dryRun bool
+	cmd := &cobra.Command{
+		Use:   "retarget <space-id>",
+		Short: "Update the base ref an edit repo reports drift against",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if repoName == "" {
+				return fmt.Errorf("--repo is required")
+			}
+			if base == "" {
+				return fmt.Errorf("--base is required")
+			}
+			svc, err := a.serviceWithDryRun(cmd, dryRun)
+			if err != nil {
+				return err
+			}
+			return svc.Retarget(cmd.Context(), args[0], repoName, base, dryRun)
+		},
+	}
+	cmd.Flags().StringVar(&repoName, "repo", "", "edit repo whose recorded base to update")
+	cmd.Flags().StringVarP(&base, "base", "b", "", "new base ref; base may be space:<id> to stack on that space's branch")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print operations without changing state")
 	return cmd
 }
 
@@ -1432,6 +1489,11 @@ func (a *app) archiveCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if !force {
+				if err := sagaLifecycleGuard(svc, args[0]); err != nil {
+					return err
+				}
+			}
 			return svc.Archive(cmd.Context(), space.ArchiveOptions{
 				SpaceID:    args[0],
 				Force:      force,
@@ -1440,7 +1502,7 @@ func (a *app) archiveCommand() *cobra.Command {
 			})
 		},
 	}
-	cmd.Flags().BoolVar(&force, "force", false, "archive even when editable worktrees are dirty")
+	cmd.Flags().BoolVar(&force, "force", false, "archive even when editable worktrees are dirty or other spaces stack on this space's branches")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print operations without changing state")
 	cmd.Flags().StringVar(&memoryFate, "memory", string(memory.FateKeep), "memory fate on archive: keep or contribute (contribute-then-keep; destroy is not allowed)")
 	return cmd
@@ -1463,6 +1525,11 @@ func (a *app) destroyCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if !force {
+				if err := sagaLifecycleGuard(svc, args[0]); err != nil {
+					return err
+				}
+			}
 			return svc.Destroy(cmd.Context(), space.DestroyOptions{
 				SpaceID:    args[0],
 				Force:      force,
@@ -1471,7 +1538,7 @@ func (a *app) destroyCommand() *cobra.Command {
 			})
 		},
 	}
-	cmd.Flags().BoolVar(&force, "force", false, "destroy even when editable worktrees are dirty")
+	cmd.Flags().BoolVar(&force, "force", false, "destroy even when editable worktrees are dirty or other spaces stack on this space's branches")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print operations without changing state")
 	cmd.Flags().StringVar(&memoryFate, "memory", string(memory.FateKeep), "owned memory fate: keep, destroy, or contribute (default keep)")
 	return cmd
@@ -1722,6 +1789,19 @@ func (a *app) serviceWithDryRun(cmd *cobra.Command, dryRun bool) (space.Service,
 		fmt.Fprintf(cmd.OutOrStdout(), format+"\n", args...)
 	}))
 	svc := space.NewService(*cfg, client, cmd.OutOrStdout())
+	// Layer-2 merge probe: live PR state through the real gh binary (nil
+	// ghRunner = gh.ExecRunner), wired ONLY at the CLI layer. Clone URLs
+	// that are not GitHub-shaped (local paths, other forges) skip the probe
+	// silently without touching gh; a missing or failing gh degrades inside
+	// the merge detector to ancestry only.
+	ghClient := &gh.Client{Runner: a.ghRunner}
+	svc.PRLookup = func(ctx context.Context, cloneURL, headBranch string) ([]gh.PR, error) {
+		host, owner, repo, ok := gh.ParseOwnerRepo(cloneURL)
+		if !ok {
+			return nil, nil
+		}
+		return ghClient.ListPRsByHead(ctx, host+"/"+owner+"/"+repo, headBranch)
+	}
 	// Portal notice for memory attach (local-summon-only v1).
 	svc.HasPortal = func(spaceID string) bool {
 		manifest, err := portal.LoadManifest(svc.SpacePath(spaceID))

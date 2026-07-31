@@ -3,9 +3,11 @@ package agent
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 
 	"github.com/Nurozen/stave/internal/config"
 	"github.com/Nurozen/stave/internal/git"
@@ -23,7 +25,49 @@ type Executor struct {
 	AllowInteractive bool
 }
 
+// executableOperations pins every operation type executeOperation can run.
+// ExecutePlan preflights whole plans against it so an unsupported operation
+// fails BEFORE the first mutation, never mid-plan.
+var executableOperations = map[string]bool{
+	OpSpaceCreate:          true,
+	OpSpaceAdd:             true,
+	OpSpaceSync:            true,
+	OpSpaceStatus:          true,
+	OpReposList:            true,
+	OpReposSync:            true,
+	OpSummon:               true,
+	OpSagaCreate:           true,
+	OpSagaStatus:           true,
+	OpSagaAdd:              true,
+	OpPortalInit:           true,
+	OpPortalAttach:         true,
+	OpPortalConfigure:      true,
+	OpPortalList:           true,
+	OpPortalStatus:         true,
+	OpPortalDoctor:         true,
+	OpPortalInspect:        true,
+	OpPortalAuthStatus:     true,
+	OpPortalLogs:           true,
+	OpPortalAuthLogin:      true,
+	OpPortalAuthInherit:    true,
+	OpPortalAuthRevoke:     true,
+	OpPortalUp:             true,
+	OpPortalSync:           true,
+	OpPortalSummon:         true,
+	OpPortalDown:           true,
+	OpPortalDetach:         true,
+	OpPortalDestroyPreview: true,
+}
+
 func (e Executor) ExecutePlan(ctx context.Context, plan Plan) ([]ExecutionResult, error) {
+	// Capability preflight: every operation must have an executor case before
+	// anything runs, so a plan can never mutate state and then die on an
+	// unsupported operation.
+	for _, op := range plan.Operations {
+		if !executableOperations[op.Type] {
+			return nil, fmt.Errorf("plan contains operation %q, which has no executor; nothing was executed", op.Type)
+		}
+	}
 	results := make([]ExecutionResult, 0, len(plan.Operations))
 	for _, op := range plan.Operations {
 		result := ExecutionResult{
@@ -122,6 +166,28 @@ func (e Executor) executeOperation(ctx context.Context, op Operation) error {
 			}
 		}
 		return nil
+	case OpSagaCreate:
+		if err := svc.CreateSaga(ctx, space.SagaCreateOptions{
+			ID:         op.SagaID,
+			SpecPath:   op.SpecPath,
+			References: repoRefsToSpecs(op.References),
+			Memories:   op.Memories,
+		}); err != nil {
+			return err
+		}
+		// Parity with `stave saga create`: every saga space carries the
+		// embedded stave-saga skill so summoned sessions run the coordinator
+		// loop (skill.go lives in summon for exactly this call site).
+		return summon.InstallSagaSkill(svc.SpacePath(op.SagaID))
+	case OpSagaAdd:
+		return svc.SagaAdd(ctx, op.SagaID, op.SpaceID, op.After, false)
+	case OpSagaStatus:
+		status, err := svc.SagaStatus(ctx, op.SagaID)
+		if err != nil {
+			return err
+		}
+		writeSagaStatus(out, status)
+		return nil
 	case OpSummon:
 		summoner := summon.ResolveName(e.Config, op.Summoner)
 		svc := summon.NewService(e.Config, e.SummonLauncher, out)
@@ -184,12 +250,27 @@ func (e Executor) executeOperation(ctx context.Context, op Operation) error {
 		svc := portal.NewService(e.Config, e.PortalRunner, nil)
 		_, err := svc.Detach(portal.DetachOptions{SpaceID: op.SpaceID, PortalID: op.PortalID})
 		return err
-	default:
-		if op.Type == OpPortalDestroyPreview {
-			return nil
+	case OpPortalLogs:
+		return e.executePortalPlan(ctx, out, func(svc portal.Service) (portal.Plan, error) {
+			return svc.PlanLogs(ctx, portal.LogsOptions{SpaceID: op.SpaceID, PortalID: op.PortalID, Agent: op.Agent, Tail: op.Tail, Follow: op.Follow})
+		})
+	case OpPortalList, OpPortalStatus, OpPortalDoctor, OpPortalInspect, OpPortalAuthStatus, OpPortalDestroyPreview:
+		// Read-only portal operations execute against the executor's runner so
+		// their answers reflect live runtime state.
+		svc := portal.NewService(e.Config, e.PortalRunner, nil)
+		payload, _, err := portalReadPayload(ctx, svc, op)
+		if err != nil {
+			return err
 		}
+		data, err := json.MarshalIndent(payload, "", "  ")
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "%s\n", data)
+		return nil
+	default:
 		if isPortalOperation(op) {
-			return fmt.Errorf("portal operation %q is read-only or unsupported for execution", op.Type)
+			return fmt.Errorf("portal operation %q is unsupported for execution", op.Type)
 		}
 		return fmt.Errorf("unsupported operation %q", op.Type)
 	}
@@ -235,6 +316,25 @@ func repoRefsToSpecs(refs []RepoRef) []space.RepoSpec {
 		specs = append(specs, space.RepoSpec{Name: ref.Name, Ref: ref.Ref})
 	}
 	return specs
+}
+
+func writeSagaStatus(out io.Writer, status space.SagaStatus) {
+	var b bytes.Buffer
+	fmt.Fprintf(&b, "saga %s (%d members)\n", status.SagaID, len(status.Members))
+	for _, member := range status.Members {
+		fmt.Fprintf(&b, "%s [%s]", member.ID, member.State)
+		if len(member.After) > 0 {
+			fmt.Fprintf(&b, " after: %s", strings.Join(member.After, ", "))
+		}
+		fmt.Fprintln(&b)
+		for _, repo := range member.Repos {
+			fmt.Fprintf(&b, "  %s branch %s base %s (%s)\n", repo.Name, repo.Branch, repo.Base, repo.BaseHealth)
+		}
+	}
+	for _, note := range status.Notes {
+		fmt.Fprintf(&b, "note [%s] %s\n", note.Kind, note.Text)
+	}
+	_, _ = out.Write(b.Bytes())
 }
 
 func writeStatus(out io.Writer, spacePath string, status space.Status) {

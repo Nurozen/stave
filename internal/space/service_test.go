@@ -10,23 +10,34 @@ import (
 	"time"
 
 	"github.com/Nurozen/stave/internal/config"
+	"github.com/Nurozen/stave/internal/memory"
 )
 
 type fakeGit struct {
 	calls        []string
 	branchExists bool
-	dirty        map[string]bool
-	ahead        int
-	behind       int
-	fetchErr     error
-	branchErr    error
-	dirtyErr     error
-	driftErr     error
-	addErr       error
-	detachErr    error
-	removeErr    error
-	pruneErr     error
-	checkoutErr  error
+	ancestor     bool
+	refExists    bool
+	// ancestorFn / refExistsFn / removeFn, when set, take precedence over the
+	// flat ancestor / refExists / removeErr fields (verdict-matrix and
+	// fault-injection tests need per-ref/per-path answers).
+	ancestorFn  func(bare, ancestor, descendant string) (bool, error)
+	refExistsFn func(bare, fullRef string) (bool, error)
+	removeFn    func(bare, path string) error
+	dirty       map[string]bool
+	ahead       int
+	behind      int
+	fetchErr    error
+	branchErr   error
+	ancestorErr error
+	refErr      error
+	dirtyErr    error
+	driftErr    error
+	addErr      error
+	detachErr   error
+	removeErr   error
+	pruneErr    error
+	checkoutErr error
 }
 
 func (f *fakeGit) record(parts ...string) {
@@ -64,6 +75,9 @@ func (f *fakeGit) WorktreeAddDetached(ctx context.Context, bare, path, ref strin
 
 func (f *fakeGit) WorktreeRemove(ctx context.Context, bare, path string, force bool) error {
 	f.record("remove", bare, path)
+	if f.removeFn != nil {
+		return f.removeFn(bare, path)
+	}
 	return f.removeErr
 }
 
@@ -83,6 +97,28 @@ func (f *fakeGit) BranchExists(ctx context.Context, bare, branch string) (bool, 
 		return false, f.branchErr
 	}
 	return f.branchExists, nil
+}
+
+func (f *fakeGit) IsAncestor(ctx context.Context, bare, ancestor, descendant string) (bool, error) {
+	f.record("is-ancestor", bare, ancestor, descendant)
+	if f.ancestorErr != nil {
+		return false, f.ancestorErr
+	}
+	if f.ancestorFn != nil {
+		return f.ancestorFn(bare, ancestor, descendant)
+	}
+	return f.ancestor, nil
+}
+
+func (f *fakeGit) RefExists(ctx context.Context, bare, fullRef string) (bool, error) {
+	f.record("ref-exists", bare, fullRef)
+	if f.refErr != nil {
+		return false, f.refErr
+	}
+	if f.refExistsFn != nil {
+		return f.refExistsFn(bare, fullRef)
+	}
+	return f.refExists, nil
 }
 
 func (f *fakeGit) IsDirty(ctx context.Context, path string) (bool, string, error) {
@@ -145,6 +181,33 @@ func TestParseRepoSpec(t *testing.T) {
 	}
 	if _, err := ParseRepoSpec("../repo"); err == nil {
 		t.Fatal("unsafe repo name accepted")
+	}
+}
+
+func TestVerbsRejectTraversalSpaceIDs(t *testing.T) {
+	svc, fg, _ := testService(t)
+	ctx := context.Background()
+	const bad = "../escape"
+	verbs := map[string]func() error{
+		"sync":           func() error { return svc.Sync(ctx, SyncOptions{SpaceID: bad}) },
+		"status":         func() error { _, err := svc.Status(ctx, bad); return err },
+		"archive":        func() error { return svc.Archive(ctx, ArchiveOptions{SpaceID: bad}) },
+		"destroy":        func() error { return svc.Destroy(ctx, DestroyOptions{SpaceID: bad}) },
+		"detach-memory":  func() error { return svc.DetachMemory(ctx, bad, "", memory.FateKeep, false, false) },
+		"propose-memory": func() error { return svc.ProposeMemory(ctx, bad, "", false) },
+		"sync-memory":    func() error { return svc.SyncMemory(ctx, bad, "", false) },
+		"memory-status":  func() error { return svc.MemoryStatus(ctx, bad, "") },
+		"list-memories":  func() error { return svc.ListMemories(bad) },
+		"retarget":       func() error { return svc.Retarget(ctx, bad, "repo-a", "main", false) },
+	}
+	for name, call := range verbs {
+		err := call()
+		if err == nil || !strings.Contains(err.Error(), "space id") {
+			t.Fatalf("%s accepted traversal space id: %v", name, err)
+		}
+		if len(fg.calls) != 0 {
+			t.Fatalf("%s touched git before validation: %#v", name, fg.calls)
+		}
 	}
 }
 
@@ -589,6 +652,10 @@ func TestAddRepoDryRunAndValidationBranches(t *testing.T) {
 func TestAddRepoUsesExistingBranchAndRejectsDuplicatePath(t *testing.T) {
 	svc, fg, _ := testService(t)
 	fg.branchExists = true
+	fg.ahead = 2
+	fg.behind = 1
+	var out strings.Builder
+	svc.Out = &out
 	if err := svc.InitSpace(context.Background(), InitOptions{ID: "branchy"}); err != nil {
 		t.Fatal(err)
 	}
@@ -598,8 +665,135 @@ func TestAddRepoUsesExistingBranchAndRejectsDuplicatePath(t *testing.T) {
 	if !containsCallPrefix(fg.calls, "add-existing|") {
 		t.Fatalf("existing branch was not reused: %#v", fg.calls)
 	}
+	got := out.String()
+	if !strings.Contains(got, `warning: branch "topic" already exists`) || !strings.Contains(got, "requested base/start-point was ignored") || !strings.Contains(got, "aspirational") {
+		t.Fatalf("missing stale-adoption warning:\n%s", got)
+	}
+	if !strings.Contains(got, "ahead 2, behind 1 versus origin/main") {
+		t.Fatalf("missing adoption drift snapshot:\n%s", got)
+	}
 	if err := svc.AddRepo(context.Background(), AddOptions{SpaceID: "branchy", RepoName: "repo-a", Mode: ModeEdit}); err == nil {
 		t.Fatal("duplicate edit repo path accepted")
+	}
+}
+
+func TestResolveBaseRef(t *testing.T) {
+	tests := []struct {
+		name     string
+		base     string
+		resolved string
+		changed  bool
+		wantErr  bool
+	}{
+		{name: "empty passes through", base: "", resolved: ""},
+		{name: "plain branch passes through", base: "main", resolved: "main"},
+		{name: "origin ref passes through", base: "origin/main", resolved: "origin/main"},
+		{name: "canonical stave ref passes through", base: "refs/heads/stave/feat-1/repo-a", resolved: "refs/heads/stave/feat-1/repo-a"},
+		{name: "tag ref passes through", base: "refs/tags/v1", resolved: "refs/tags/v1"},
+		{name: "space sugar resolves", base: "space:feat-1", resolved: "refs/heads/stave/feat-1/repo-a"},
+		{name: "space sugar invalid id", base: "space:../x", wantErr: true},
+		{name: "space sugar empty id", base: "space:", wantErr: true},
+		{name: "bare stave rewrites", base: "stave/feat-1/repo-a", resolved: "refs/heads/stave/feat-1/repo-a", changed: true},
+		{name: "origin stave rewrites", base: "origin/stave/feat-1/repo-a", resolved: "refs/heads/stave/feat-1/repo-a", changed: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resolved, changed, err := ResolveBaseRef(tt.base, "repo-a")
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("ResolveBaseRef(%q) accepted invalid base", tt.base)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ResolveBaseRef(%q) error = %v", tt.base, err)
+			}
+			if resolved != tt.resolved || changed != tt.changed {
+				t.Fatalf("ResolveBaseRef(%q) = %q, %v; want %q, %v", tt.base, resolved, changed, tt.resolved, tt.changed)
+			}
+		})
+	}
+}
+
+func TestAddRepoSpaceSugarRequiresTargetBranch(t *testing.T) {
+	svc, fg, _ := testService(t)
+	var out strings.Builder
+	svc.Out = &out
+	if err := svc.InitSpace(context.Background(), InitOptions{ID: "stack-1"}); err != nil {
+		t.Fatal(err)
+	}
+	err := svc.AddRepo(context.Background(), AddOptions{SpaceID: "stack-1", RepoName: "repo-a", Mode: ModeEdit, Base: "space:ghost", NoFetch: true})
+	if err == nil || !strings.Contains(err.Error(), `space "ghost" has no branch "stave/ghost/repo-a"`) {
+		t.Fatalf("missing-target error = %v", err)
+	}
+	if containsCallPrefix(fg.calls, "add-branch|") || containsCallPrefix(fg.calls, "add-existing|") {
+		t.Fatalf("worktree created despite missing sugar target: %#v", fg.calls)
+	}
+
+	// Canonicalization warning + no BranchExists preflight for stave-spelled bases.
+	fg.calls = nil
+	out.Reset()
+	fg.branchExists = false
+	if err := svc.AddRepo(context.Background(), AddOptions{SpaceID: "stack-1", RepoName: "repo-a", Mode: ModeEdit, Base: "origin/stave/other/repo-a", NoFetch: true}); err != nil {
+		t.Fatalf("AddRepo(canonicalized base) error = %v", err)
+	}
+	if !strings.Contains(out.String(), `notice: base "origin/stave/other/repo-a" canonicalized to "refs/heads/stave/other/repo-a"`) {
+		t.Fatalf("missing canonicalization notice:\n%s", out.String())
+	}
+	if !containsCallPrefix(fg.calls, "add-branch|") {
+		t.Fatalf("worktree not created: %#v", fg.calls)
+	}
+	manifest, err := LoadManifest(svc.SpacePath("stack-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Repos[0].Base != "refs/heads/stave/other/repo-a" {
+		t.Fatalf("manifest Base = %q", manifest.Repos[0].Base)
+	}
+}
+
+func TestAddRepoDryRunResolvesSugarWithoutGit(t *testing.T) {
+	svc, fg, _ := testService(t)
+	var out strings.Builder
+	svc.Out = &out
+	if err := svc.InitSpace(context.Background(), InitOptions{ID: "dry-stack"}); err != nil {
+		t.Fatal(err)
+	}
+	fg.calls = nil
+	if err := svc.AddRepo(context.Background(), AddOptions{SpaceID: "dry-stack", RepoName: "repo-a", Mode: ModeEdit, Base: "space:feat-1", NoFetch: true, DryRun: true}); err != nil {
+		t.Fatalf("AddRepo(sugar dry-run) error = %v", err)
+	}
+	if !strings.Contains(out.String(), "from refs/heads/stave/feat-1/repo-a") {
+		t.Fatalf("dry-run did not print resolved sugar ref:\n%s", out.String())
+	}
+	if len(fg.calls) != 0 {
+		t.Fatalf("dry-run touched git: %#v", fg.calls)
+	}
+}
+
+func TestCreateDryRunResolvesSugarInEditLoop(t *testing.T) {
+	svc, fg, _ := testService(t)
+	var out strings.Builder
+	svc.Out = &out
+	if err := svc.Create(context.Background(), CreateOptions{
+		ID:     "dry-sugar",
+		Edits:  []RepoSpec{{Name: "repo-a", Ref: "space:feat-1"}},
+		DryRun: true,
+	}); err != nil {
+		t.Fatalf("Create(sugar dry-run) error = %v", err)
+	}
+	if !strings.Contains(out.String(), "from refs/heads/stave/feat-1/repo-a") {
+		t.Fatalf("dry-run did not print resolved sugar ref:\n%s", out.String())
+	}
+	if len(fg.calls) != 0 {
+		t.Fatalf("dry-run touched git: %#v", fg.calls)
+	}
+	if err := svc.Create(context.Background(), CreateOptions{
+		ID:     "dry-sugar",
+		Edits:  []RepoSpec{{Name: "repo-a", Ref: "space:../x"}},
+		DryRun: true,
+	}); err == nil {
+		t.Fatal("dry-run accepted invalid sugar id")
 	}
 }
 
@@ -1019,6 +1213,341 @@ func TestCopyFileErrorPaths(t *testing.T) {
 func TestCopySpecMissingSourceFails(t *testing.T) {
 	if err := copySpec(filepath.Join(t.TempDir(), "missing"), filepath.Join(t.TempDir(), "dest")); err == nil {
 		t.Fatal("copySpec accepted a missing source")
+	}
+}
+
+func TestRetargetUpdatesBaseWithoutWorktreeCalls(t *testing.T) {
+	svc, fg, _ := testService(t)
+	if err := svc.Create(context.Background(), CreateOptions{ID: "ret-1", Edits: []RepoSpec{{Name: "repo-a"}}, References: []RepoSpec{{Name: "repo-b"}}}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := LoadManifest(svc.SpacePath("ret-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fg.calls = nil
+
+	if err := svc.Retarget(context.Background(), "ret-1", "repo-a", "release", false); err != nil {
+		t.Fatalf("Retarget() error = %v", err)
+	}
+	if len(fg.calls) != 0 {
+		t.Fatalf("Retarget(plain ref) called git: %#v", fg.calls)
+	}
+	after, err := LoadManifest(svc.SpacePath("ret-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, idx, ok := after.FindRepo("repo-a")
+	if !ok || repo.Base != "origin/release" {
+		t.Fatalf("retargeted Base = %q (ok=%v)", repo.Base, ok)
+	}
+	// Only Base changed.
+	beforeRepo := before.Repos[idx]
+	beforeRepo.Base = repo.Base
+	if !reflect.DeepEqual(beforeRepo, repo) {
+		t.Fatalf("Retarget changed more than Base:\nbefore %#v\nafter  %#v", before.Repos[idx], repo)
+	}
+	refBefore, _, _ := before.FindRepo("repo-b")
+	refAfter, _, _ := after.FindRepo("repo-b")
+	if !reflect.DeepEqual(refBefore, refAfter) {
+		t.Fatalf("Retarget touched the reference repo: %#v -> %#v", refBefore, refAfter)
+	}
+
+	// Reference repos are refused.
+	err = svc.Retarget(context.Background(), "ret-1", "repo-b", "main", false)
+	if err == nil || !strings.Contains(err.Error(), "reference-only") {
+		t.Fatalf("Retarget(reference) error = %v", err)
+	}
+
+	// Unknown repo, empty base.
+	if err := svc.Retarget(context.Background(), "ret-1", "ghost", "main", false); err == nil {
+		t.Fatal("Retarget accepted unknown repo")
+	}
+	if err := svc.Retarget(context.Background(), "ret-1", "repo-a", " ", false); err == nil {
+		t.Fatal("Retarget accepted empty base")
+	}
+}
+
+func TestRetargetSugarRequiresExistingBranch(t *testing.T) {
+	svc, fg, _ := testService(t)
+	if err := svc.Create(context.Background(), CreateOptions{ID: "ret-2", Edits: []RepoSpec{{Name: "repo-a"}}}); err != nil {
+		t.Fatal(err)
+	}
+	fg.calls = nil
+
+	err := svc.Retarget(context.Background(), "ret-2", "repo-a", "space:ghost", false)
+	if err == nil || !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("Retarget(missing sugar target) error = %v", err)
+	}
+	if !containsCallPrefix(fg.calls, "branch-exists|") {
+		t.Fatalf("sugar retarget skipped BranchExists: %#v", fg.calls)
+	}
+	manifest, err := LoadManifest(svc.SpacePath("ret-2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Repos[0].Base != "origin/main" {
+		t.Fatalf("failed retarget mutated Base: %q", manifest.Repos[0].Base)
+	}
+
+	fg.branchExists = true
+	if err := svc.Retarget(context.Background(), "ret-2", "repo-a", "space:other", false); err != nil {
+		t.Fatalf("Retarget(sugar) error = %v", err)
+	}
+	manifest, err = LoadManifest(svc.SpacePath("ret-2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Repos[0].Base != "refs/heads/stave/other/repo-a" {
+		t.Fatalf("sugar retarget Base = %q", manifest.Repos[0].Base)
+	}
+}
+
+// writeSiblingSpace writes a minimal sibling manifest whose repo Base is the
+// given spelling, mimicking a space stacked on another space's branch.
+func writeSiblingSpace(t *testing.T, svc Service, id, base string) {
+	t.Helper()
+	path := svc.SpacePath(id)
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := Manifest{ID: id, CreatedAt: svc.now(), Repos: []RepoManifest{
+		{Name: "repo-a", Mode: ModeEdit, Path: "repo-a", Base: base, Branch: DefaultBranch(id, "repo-a"), BareRepoPath: svc.Config.Repos["repo-a"].BareRepoPath},
+	}}
+	if err := SaveManifest(path, manifest); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestArchiveDestroyRefuseDependentSpaces(t *testing.T) {
+	branch := DefaultBranch("owner", "repo-a")
+	for name, base := range map[string]string{
+		"refs-heads": "refs/heads/" + branch,
+		"origin":     "origin/" + branch,
+		"bare":       branch,
+	} {
+		t.Run(name, func(t *testing.T) {
+			svc, _, _ := testService(t)
+			if err := svc.Create(context.Background(), CreateOptions{ID: "owner", Edits: []RepoSpec{{Name: "repo-a"}}}); err != nil {
+				t.Fatal(err)
+			}
+			writeSiblingSpace(t, svc, "stacked", base)
+
+			err := svc.Archive(context.Background(), ArchiveOptions{SpaceID: "owner"})
+			if err == nil || !strings.Contains(err.Error(), `space "stacked" repo "repo-a" stacks on branch`) {
+				t.Fatalf("Archive(dependent) error = %v", err)
+			}
+			err = svc.Destroy(context.Background(), DestroyOptions{SpaceID: "owner"})
+			if err == nil || !strings.Contains(err.Error(), "stacks on branch") {
+				t.Fatalf("Destroy(dependent) error = %v", err)
+			}
+
+			// --force overrides.
+			if err := svc.Archive(context.Background(), ArchiveOptions{SpaceID: "owner", Force: true}); err != nil {
+				t.Fatalf("Archive(force) error = %v", err)
+			}
+		})
+	}
+}
+
+func TestArchiveDestroyDependentGuardEdgeCases(t *testing.T) {
+	// A refs/tags spelling of the branch is NOT a dependency.
+	svc, _, _ := testService(t)
+	if err := svc.Create(context.Background(), CreateOptions{ID: "owner", Edits: []RepoSpec{{Name: "repo-a"}}}); err != nil {
+		t.Fatal(err)
+	}
+	writeSiblingSpace(t, svc, "tagged", "refs/tags/"+DefaultBranch("owner", "repo-a"))
+	if err := svc.Archive(context.Background(), ArchiveOptions{SpaceID: "owner"}); err != nil {
+		t.Fatalf("Archive refused a refs/tags base: %v", err)
+	}
+
+	// Custom --branch owner: the guard matches the recorded Branch, not the default.
+	topicSvc, topicGit, _ := testService(t)
+	topicGit.branchExists = true
+	if err := topicSvc.InitSpace(context.Background(), InitOptions{ID: "topical"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := topicSvc.AddRepo(context.Background(), AddOptions{SpaceID: "topical", RepoName: "repo-a", Mode: ModeEdit, Branch: "topic"}); err != nil {
+		t.Fatal(err)
+	}
+	writeSiblingSpace(t, topicSvc, "on-topic", "origin/topic")
+	err := topicSvc.Destroy(context.Background(), DestroyOptions{SpaceID: "topical"})
+	if err == nil || !strings.Contains(err.Error(), `stacks on branch "topic"`) {
+		t.Fatalf("Destroy(custom branch dependent) error = %v", err)
+	}
+
+	// A sibling with an unreadable manifest fails closed.
+	corruptSvc, _, cfg := testService(t)
+	if err := corruptSvc.Create(context.Background(), CreateOptions{ID: "owner", Edits: []RepoSpec{{Name: "repo-a"}}}); err != nil {
+		t.Fatal(err)
+	}
+	badPath := filepath.Join(cfg.AgentWorkDir, "corrupt")
+	if err := os.MkdirAll(badPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(badPath, ManifestName), []byte("id: [unterminated\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err = corruptSvc.Archive(context.Background(), ArchiveOptions{SpaceID: "owner"})
+	if err == nil || !strings.Contains(err.Error(), `space "corrupt" has an unreadable manifest`) {
+		t.Fatalf("Archive(corrupt sibling) error = %v", err)
+	}
+	err = corruptSvc.Destroy(context.Background(), DestroyOptions{SpaceID: "owner"})
+	if err == nil || !strings.Contains(err.Error(), "unreadable manifest") {
+		t.Fatalf("Destroy(corrupt sibling) error = %v", err)
+	}
+	if err := corruptSvc.Destroy(context.Background(), DestroyOptions{SpaceID: "owner", Force: true}); err != nil {
+		t.Fatalf("Destroy(force past corrupt sibling) error = %v", err)
+	}
+
+	// A sibling directory without .stave.yaml is not a space and never blocks.
+	plainSvc, _, plainCfg := testService(t)
+	if err := plainSvc.Create(context.Background(), CreateOptions{ID: "owner", Edits: []RepoSpec{{Name: "repo-a"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(plainCfg.AgentWorkDir, "not-a-space"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := plainSvc.Destroy(context.Background(), DestroyOptions{SpaceID: "owner"}); err != nil {
+		t.Fatalf("Destroy blocked by a non-space directory: %v", err)
+	}
+}
+
+// TestDependentGuardScopedToRepo: a same-named base branch recorded against a
+// DIFFERENT repo's bare path must not block archive/destroy; a same-repo match
+// still refuses (mirrors resolveBaseOwner's canonical BareRepoPath scoping).
+func TestDependentGuardScopedToRepo(t *testing.T) {
+	svc, fg, cfg := testService(t)
+	ctx := context.Background()
+	fg.branchExists = true
+	if err := svc.InitSpace(ctx, InitOptions{ID: "owner"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.AddRepo(ctx, AddOptions{SpaceID: "owner", RepoName: "repo-a", Mode: ModeEdit, Branch: "feature"}); err != nil {
+		t.Fatal(err)
+	}
+	writeSibling := func(t *testing.T, id, repoName string) {
+		t.Helper()
+		path := svc.SpacePath(id)
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		manifest := Manifest{ID: id, CreatedAt: svc.now(), Repos: []RepoManifest{{
+			Name: repoName, Mode: ModeEdit, Path: repoName, Base: "origin/feature",
+			Branch: DefaultBranch(id, repoName), BareRepoPath: cfg.Repos[repoName].BareRepoPath,
+		}}}
+		if err := SaveManifest(path, manifest); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Same repo: still refuses.
+	writeSibling(t, "same-repo", "repo-a")
+	err := svc.Archive(ctx, ArchiveOptions{SpaceID: "owner"})
+	if err == nil || !strings.Contains(err.Error(), `stacks on branch "feature"`) {
+		t.Fatalf("Archive(same-repo dependent) error = %v", err)
+	}
+	if err := os.RemoveAll(svc.SpacePath("same-repo")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Same-named base on repo B: no dependency on owner's repo-A branch.
+	writeSibling(t, "other-repo", "repo-b")
+	if err := svc.Archive(ctx, ArchiveOptions{SpaceID: "owner"}); err != nil {
+		t.Fatalf("Archive blocked by a same-named branch in a different repo: %v", err)
+	}
+}
+
+// TestArchiveDestroyDryRunPrintsWouldRefuse: under dry-run the dirty and
+// dependent guards print would-refuse diagnostics and the preview continues
+// instead of erroring; real runs still refuse.
+func TestArchiveDestroyDryRunPrintsWouldRefuse(t *testing.T) {
+	svc, fg, _ := testService(t)
+	ctx := context.Background()
+	if err := svc.Create(ctx, CreateOptions{ID: "owner", Edits: []RepoSpec{{Name: "repo-a"}}}); err != nil {
+		t.Fatal(err)
+	}
+	writeSiblingSpace(t, svc, "stacked", "refs/heads/"+DefaultBranch("owner", "repo-a"))
+	fg.dirty = map[string]bool{filepath.Join(svc.SpacePath("owner"), "repo-a"): true}
+
+	var out strings.Builder
+	svc.Out = &out
+	if err := svc.Archive(ctx, ArchiveOptions{SpaceID: "owner", DryRun: true}); err != nil {
+		t.Fatalf("Archive(dry-run, would-refuse) error = %v", err)
+	}
+	for _, want := range []string{"dry-run: would refuse:", "dirty editable worktrees", "stacks on branch", "dry-run: archive "} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("archive dry-run missing %q:\n%s", want, out.String())
+		}
+	}
+	if !dirExists(t, svc.SpacePath("owner")) {
+		t.Fatal("dry-run archived the space")
+	}
+
+	out.Reset()
+	if err := svc.Destroy(ctx, DestroyOptions{SpaceID: "owner", DryRun: true}); err != nil {
+		t.Fatalf("Destroy(dry-run, would-refuse) error = %v", err)
+	}
+	for _, want := range []string{"dry-run: would refuse:", "stacks on branch", "dry-run: remove directory"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("destroy dry-run missing %q:\n%s", want, out.String())
+		}
+	}
+	if !dirExists(t, svc.SpacePath("owner")) {
+		t.Fatal("dry-run destroyed the space")
+	}
+
+	// Real runs keep the hard refusal.
+	if err := svc.Archive(ctx, ArchiveOptions{SpaceID: "owner"}); err == nil {
+		t.Fatal("non-dry-run archive must still refuse")
+	}
+}
+
+func TestListSpacesEnumeratesAndReportsErrors(t *testing.T) {
+	svc, _, cfg := testService(t)
+	if err := svc.InitSpace(context.Background(), InitOptions{ID: "alpha"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.InitSpace(context.Background(), InitOptions{ID: "beta"}); err != nil {
+		t.Fatal(err)
+	}
+	// Not a space: directory without a manifest. Archived spaces are skipped.
+	for _, dir := range []string{"plain-dir", ".archive"} {
+		if err := os.MkdirAll(filepath.Join(cfg.AgentWorkDir, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	badPath := filepath.Join(cfg.AgentWorkDir, "corrupt")
+	if err := os.MkdirAll(badPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(badPath, ManifestName), []byte("id: [unterminated\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	spaces, err := svc.ListSpaces()
+	if err != nil {
+		t.Fatalf("ListSpaces() error = %v", err)
+	}
+	got := map[string]bool{}
+	for _, entry := range spaces {
+		got[entry.ID] = entry.Err != nil
+		if entry.Path != filepath.Join(cfg.AgentWorkDir, entry.ID) {
+			t.Fatalf("entry path = %q", entry.Path)
+		}
+		if entry.Err == nil && entry.Manifest == nil {
+			t.Fatalf("entry %q has neither manifest nor error", entry.ID)
+		}
+	}
+	want := map[string]bool{"alpha": false, "beta": false, "corrupt": true}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ListSpaces entries = %#v, want %#v", got, want)
+	}
+
+	// Missing AgentWorkDir returns the ReadDir error verbatim.
+	missing := NewService(config.Config{AgentWorkDir: filepath.Join(t.TempDir(), "missing")}, &fakeGit{}, nil)
+	if _, err := missing.ListSpaces(); !os.IsNotExist(err) {
+		t.Fatalf("ListSpaces(missing dir) error = %v", err)
 	}
 }
 

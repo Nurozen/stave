@@ -8,6 +8,7 @@ import (
 	"io"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/Nurozen/stave/internal/config"
 	"github.com/Nurozen/stave/internal/git"
@@ -23,6 +24,9 @@ const (
 	ToolSpaceCreate          = "stave_space_create"
 	ToolSpaceAdd             = "stave_space_add"
 	ToolSummon               = "stave_summon"
+	ToolSagaCreate           = "stave_saga_create"
+	ToolSagaStatus           = "stave_saga_status"
+	ToolSagaAdd              = "stave_saga_add"
 	ToolAsk                  = "stave_ask"
 	ToolPortalList           = "stave_portal_list"
 	ToolPortalStatus         = "stave_portal_status"
@@ -226,6 +230,7 @@ func ToolDefinitions() []ToolDefinition {
 			}, []string{"message", "questions"}),
 		},
 	}
+	defs = append(defs, sagaToolDefinitions()...)
 	defs = append(defs, portalToolDefinitions()...)
 	defs = append(defs,
 		ToolDefinition{
@@ -250,6 +255,44 @@ func ToolDefinitions() []ToolDefinition {
 		},
 	)
 	return defs
+}
+
+func sagaToolDefinitions() []ToolDefinition {
+	return []ToolDefinition{
+		{
+			Name:        ToolSagaCreate,
+			Category:    ToolCategoryMutate,
+			Description: "Propose creating a new Stave saga: a coordination space for sequenced multi-ticket work whose members are ordinary spaces. Sagas hold no editable worktrees; reference repos become read-only context under references/. Create member workspaces with stave_space_create and register them with stave_saga_add.",
+			Parameters: objectSchema(map[string]any{
+				"saga_id":    stringSchema("New Stave saga id."),
+				"spec_path":  stringSchema("Optional path to a spec file or directory supplied by the user."),
+				"references": repoRefArraySchema("Registered repos to create as detached reference worktrees under references/."),
+				"memories": map[string]any{
+					"type":        "array",
+					"description": "Optional memory attachments as [provider:]<spec> strings; use \".\" for a fresh durable saga den shared with members.",
+					"items":       map[string]any{"type": "string"},
+				},
+			}, []string{"saga_id"}),
+		},
+		{
+			Name:        ToolSagaStatus,
+			Category:    ToolCategoryRead,
+			Description: "Inspect an existing saga: members in dependency order with lifecycle state, drift, and base health. This is read-only and should run before proposing changes to a saga. Merge detection here is ancestry-scoped (no PR lookup); squash merges are only detected by the stave saga status --json CLI.",
+			Parameters: objectSchema(map[string]any{
+				"saga_id": stringSchema("Existing Stave saga id."),
+			}, []string{"saga_id"}),
+		},
+		{
+			Name:        ToolSagaAdd,
+			Category:    ToolCategoryMutate,
+			Description: "Propose registering a space as a saga member, optionally sequenced after other members. Re-adding an existing member with new after edges updates its edges; that edge update is a permitted mutation. Sagas cannot be members of other sagas.",
+			Parameters: objectSchema(map[string]any{
+				"saga_id":  stringSchema("Existing Stave saga id, or a saga id created earlier in this same plan."),
+				"space_id": stringSchema("Existing Stave space id, or a space id created earlier in this same plan."),
+				"after":    stringArraySchema("Optional member ids this space lands behind."),
+			}, []string{"saga_id", "space_id"}),
+		},
+	}
 }
 
 func portalToolDefinitions() []ToolDefinition {
@@ -500,14 +543,22 @@ func (d *ToolDispatcher) dispatch(ctx context.Context, call ToolCall) ToolResult
 		if err := decodeToolArgs(call.Arguments, &args); err != nil {
 			return toolError(call, err)
 		}
-		op := Operation{Type: OpSpaceCreate, SpaceID: args.SpaceID, Kind: args.Kind, SpecPath: args.SpecPath, Edits: args.Edits, References: args.References, Memories: args.Memories}
+		edits, err := d.resolveEditRefs(ctx, args.Edits)
+		if err != nil {
+			return toolError(call, err)
+		}
+		op := Operation{Type: OpSpaceCreate, SpaceID: args.SpaceID, Kind: args.Kind, SpecPath: args.SpecPath, Edits: edits, References: args.References, Memories: args.Memories}
 		return d.queueOperation(call, op)
 	case ToolSpaceAdd:
 		var args spaceAddArgs
 		if err := decodeToolArgs(call.Arguments, &args); err != nil {
 			return toolError(call, err)
 		}
-		op := Operation{Type: OpSpaceAdd, SpaceID: args.SpaceID, Repo: args.Repo, Mode: args.Mode, Base: args.Base, Ref: args.Ref, Branch: args.Branch, NoFetch: args.NoFetch}
+		base, err := d.resolveQueuedEditBase(ctx, args.Base, args.Repo)
+		if err != nil {
+			return toolError(call, err)
+		}
+		op := Operation{Type: OpSpaceAdd, SpaceID: args.SpaceID, Repo: args.Repo, Mode: args.Mode, Base: base, Ref: args.Ref, Branch: args.Branch, NoFetch: args.NoFetch}
 		return d.queueOperation(call, op)
 	case ToolSummon:
 		var args summonArgs
@@ -515,6 +566,26 @@ func (d *ToolDispatcher) dispatch(ctx context.Context, call ToolCall) ToolResult
 			return toolError(call, err)
 		}
 		op := Operation{Type: OpSummon, SpaceID: args.SpaceID, Summoner: args.Summoner}
+		return d.queueOperation(call, op)
+	case ToolSagaCreate:
+		var args sagaCreateArgs
+		if err := decodeToolArgs(call.Arguments, &args); err != nil {
+			return toolError(call, err)
+		}
+		op := Operation{Type: OpSagaCreate, SagaID: args.SagaID, SpecPath: args.SpecPath, References: args.References, Memories: args.Memories}
+		return d.queueOperation(call, op)
+	case ToolSagaStatus:
+		var args sagaStatusArgs
+		if err := decodeToolArgs(call.Arguments, &args); err != nil {
+			return toolError(call, err)
+		}
+		return d.sagaStatus(ctx, call, args.SagaID)
+	case ToolSagaAdd:
+		var args sagaAddArgs
+		if err := decodeToolArgs(call.Arguments, &args); err != nil {
+			return toolError(call, err)
+		}
+		op := Operation{Type: OpSagaAdd, SagaID: args.SagaID, SpaceID: args.SpaceID, After: args.After}
 		return d.queueOperation(call, op)
 	case ToolAsk:
 		var args askArgs
@@ -528,35 +599,35 @@ func (d *ToolDispatcher) dispatch(ctx context.Context, call ToolCall) ToolResult
 			return toolError(call, err)
 		}
 		op := Operation{Type: OpPortalList, SpaceID: args.SpaceID, PortalID: args.PortalID}
-		return d.portalRead(call, op)
+		return d.portalRead(ctx, call, op)
 	case ToolPortalStatus:
 		var args portalTargetArgs
 		if err := decodeToolArgs(call.Arguments, &args); err != nil {
 			return toolError(call, err)
 		}
 		op := Operation{Type: OpPortalStatus, SpaceID: args.SpaceID, PortalID: args.PortalID}
-		return d.portalRead(call, op)
+		return d.portalRead(ctx, call, op)
 	case ToolPortalDoctor:
 		var args portalTargetArgs
 		if err := decodeToolArgs(call.Arguments, &args); err != nil {
 			return toolError(call, err)
 		}
 		op := Operation{Type: OpPortalDoctor, SpaceID: args.SpaceID, PortalID: args.PortalID}
-		return d.portalRead(call, op)
+		return d.portalRead(ctx, call, op)
 	case ToolPortalInspect:
 		var args portalTargetArgs
 		if err := decodeToolArgs(call.Arguments, &args); err != nil {
 			return toolError(call, err)
 		}
 		op := Operation{Type: OpPortalInspect, SpaceID: args.SpaceID, PortalID: args.PortalID}
-		return d.portalRead(call, op)
+		return d.portalRead(ctx, call, op)
 	case ToolPortalAuthStatus:
 		var args portalAuthStatusArgs
 		if err := decodeToolArgs(call.Arguments, &args); err != nil {
 			return toolError(call, err)
 		}
 		op := Operation{Type: OpPortalAuthStatus, SpaceID: args.SpaceID, PortalID: args.PortalID, Provider: args.Provider}
-		return d.portalRead(call, op)
+		return d.portalRead(ctx, call, op)
 	case ToolPortalLogs:
 		var args portalLogsArgs
 		if err := decodeToolArgs(call.Arguments, &args); err != nil {
@@ -566,7 +637,7 @@ func (d *ToolDispatcher) dispatch(ctx context.Context, call ToolCall) ToolResult
 		if args.Follow {
 			return toolError(call, fmt.Errorf("portal logs must be bounded; follow mode is unsupported for agent planning"))
 		}
-		return d.portalRead(call, op)
+		return d.portalRead(ctx, call, op)
 	case ToolPortalInit:
 		var args portalInitArgs
 		if err := decodeToolArgs(call.Arguments, &args); err != nil {
@@ -638,7 +709,7 @@ func (d *ToolDispatcher) dispatch(ctx context.Context, call ToolCall) ToolResult
 		if err := decodeToolArgs(call.Arguments, &args); err != nil {
 			return toolError(call, err)
 		}
-		return d.portalRead(call, Operation{Type: OpPortalDestroyPreview, SpaceID: args.SpaceID, PortalID: args.PortalID})
+		return d.portalRead(ctx, call, Operation{Type: OpPortalDestroyPreview, SpaceID: args.SpaceID, PortalID: args.PortalID})
 	case ToolExplainUnsupported:
 		var args explainUnsupportedArgs
 		if err := decodeToolArgs(call.Arguments, &args); err != nil {
@@ -692,11 +763,11 @@ func (d *ToolDispatcher) ask(call ToolCall, args askArgs) ToolResult {
 	return toolOK(call, map[string]any{"status": RunStatusNeedsInput, "message": args.Message, "questions": args.Questions}, "needs user input")
 }
 
-func (d *ToolDispatcher) portalRead(call ToolCall, op Operation) ToolResult {
+func (d *ToolDispatcher) portalRead(ctx context.Context, call ToolCall, op Operation) ToolResult {
 	if err := ValidatePlan(d.Config, Plan{Operations: []Operation{op}}); err != nil {
 		return toolError(call, err)
 	}
-	payload, summary, err := d.portalReadPayload(op)
+	payload, summary, err := portalReadPayload(ctx, portal.NewService(d.Config, nil, nil), op)
 	if err != nil {
 		return toolError(call, err)
 	}
@@ -705,20 +776,23 @@ func (d *ToolDispatcher) portalRead(call ToolCall, op Operation) ToolResult {
 	return result
 }
 
-func (d *ToolDispatcher) portalReadPayload(op Operation) (any, string, error) {
-	svc := portal.NewService(d.Config, nil, nil)
+// portalReadPayload resolves one read-only portal operation against svc. It is
+// shared by the planning dispatcher and the plan executor (which passes its
+// configured runner), so every operation ValidatePlan accepts stays
+// executable.
+func portalReadPayload(ctx context.Context, svc portal.Service, op Operation) (any, string, error) {
 	switch op.Type {
 	case OpPortalList:
 		entries, err := svc.List(op.SpaceID)
 		return map[string]any{"portals": entries, "command": EquivalentCommand(op)}, "listed portals", err
 	case OpPortalStatus:
-		status, err := svc.Status(context.Background(), portal.SelectOptions{SpaceID: op.SpaceID, PortalID: op.PortalID})
+		status, err := svc.Status(ctx, portal.SelectOptions{SpaceID: op.SpaceID, PortalID: op.PortalID})
 		return map[string]any{"status": status, "command": EquivalentCommand(op)}, "read portal status", err
 	case OpPortalDoctor:
-		report, err := svc.Doctor(context.Background(), portal.SelectOptions{SpaceID: op.SpaceID, PortalID: op.PortalID})
+		report, err := svc.Doctor(ctx, portal.SelectOptions{SpaceID: op.SpaceID, PortalID: op.PortalID})
 		return map[string]any{"doctor": report, "command": EquivalentCommand(op)}, "ran portal doctor", err
 	case OpPortalInspect:
-		report, err := svc.Inspect(context.Background(), portal.SelectOptions{SpaceID: op.SpaceID, PortalID: op.PortalID})
+		report, err := svc.Inspect(ctx, portal.SelectOptions{SpaceID: op.SpaceID, PortalID: op.PortalID})
 		return map[string]any{"inspect": report, "command": EquivalentCommand(op)}, "inspected portal", err
 	case OpPortalAuthStatus:
 		item, _, err := svc.LoadPortal(portal.SelectOptions{SpaceID: op.SpaceID, PortalID: op.PortalID})
@@ -737,10 +811,10 @@ func (d *ToolDispatcher) portalReadPayload(op Operation) (any, string, error) {
 		}
 		return map[string]any{"auth": auth, "command": EquivalentCommand(op)}, "read portal auth status", nil
 	case OpPortalLogs:
-		plan, err := svc.PlanLogs(context.Background(), portal.LogsOptions{SpaceID: op.SpaceID, PortalID: op.PortalID, Agent: op.Agent, Tail: op.Tail, Follow: op.Follow})
+		plan, err := svc.PlanLogs(ctx, portal.LogsOptions{SpaceID: op.SpaceID, PortalID: op.PortalID, Agent: op.Agent, Tail: op.Tail, Follow: op.Follow})
 		return map[string]any{"plan": plan, "commands": plan.EquivalentCommands()}, "planned bounded portal logs", err
 	case OpPortalDestroyPreview:
-		report, err := svc.Inspect(context.Background(), portal.SelectOptions{SpaceID: op.SpaceID, PortalID: op.PortalID})
+		report, err := svc.Inspect(ctx, portal.SelectOptions{SpaceID: op.SpaceID, PortalID: op.PortalID})
 		return map[string]any{"destroyPreview": report.DestroyDryRunNotes, "ownedResources": report.OwnedResources, "command": EquivalentCommand(op)}, "previewed portal destroy", err
 	default:
 		return nil, "", fmt.Errorf("unsupported portal read operation %q", op.Type)
@@ -764,6 +838,9 @@ func (d *ToolDispatcher) reposList(call ToolCall) ToolResult {
 }
 
 func (d *ToolDispatcher) spaceStatus(ctx context.Context, call ToolCall, spaceID string) ToolResult {
+	if err := config.ValidateSpaceID(spaceID); err != nil {
+		return toolError(call, err)
+	}
 	svc := space.NewService(d.Config, d.Git, io.Discard)
 	status, err := svc.Status(ctx, spaceID)
 	if err != nil {
@@ -773,6 +850,98 @@ func (d *ToolDispatcher) spaceStatus(ctx context.Context, call ToolCall, spaceID
 	result := toolOK(call, payload, fmt.Sprintf("inspected space %s", spaceID))
 	d.Session.ReadResults = append(d.Session.ReadResults, result)
 	return result
+}
+
+func (d *ToolDispatcher) sagaStatus(ctx context.Context, call ToolCall, sagaID string) ToolResult {
+	payload, err := d.sagaStatusPayload(ctx, sagaID)
+	if err != nil {
+		return toolError(call, err)
+	}
+	result := toolOK(call, payload, fmt.Sprintf("inspected saga %s", sagaID))
+	d.Session.ReadResults = append(d.Session.ReadResults, result)
+	return result
+}
+
+// sagaStatusPayload resolves the frozen SagaStatus contract for the planner.
+// The dispatcher's space.Service deliberately leaves PRLookup nil, so merge
+// detection here is ANCESTRY-ONLY; detection degradation surfaces as notes in
+// the status, never as an error. The payload note points at the CLI for
+// PR-aware (squash-merge) detection.
+func (d *ToolDispatcher) sagaStatusPayload(ctx context.Context, sagaID string) (map[string]any, error) {
+	if err := config.ValidateSpaceID(sagaID); err != nil {
+		return nil, err
+	}
+	svc := space.NewService(d.Config, d.Git, io.Discard)
+	status, err := svc.SagaStatus(ctx, sagaID)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"status":  status,
+		"command": EquivalentCommand(Operation{Type: OpSagaStatus, SagaID: sagaID}),
+		"note":    "merge detection is ancestry-scoped in agent planning (no PR lookup); squash merges are only detected by 'stave saga status --json'",
+	}, nil
+}
+
+// resolveEditRefs applies resolveQueuedEditBase to every edit spec of a
+// space_create call.
+func (d *ToolDispatcher) resolveEditRefs(ctx context.Context, refs []RepoRef) ([]RepoRef, error) {
+	if len(refs) == 0 {
+		return refs, nil
+	}
+	out := make([]RepoRef, len(refs))
+	for i, ref := range refs {
+		resolved, err := d.resolveQueuedEditBase(ctx, ref.Ref, ref.Name)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = RepoRef{Name: ref.Name, Ref: resolved}
+	}
+	return out, nil
+}
+
+// resolveQueuedEditBase expands space:<id> base sugar EAGERLY at queue time so
+// EquivalentCommand renders the resolved ref and validateRefish never sees the
+// sugar spelling. Sugar targets are existence-checked here: a target created
+// earlier in this same plan soft-passes when the plan gives it an edit branch
+// for the repo (the branch cannot exist yet); an on-disk target is
+// hard-checked against the bare repo with BranchExists. Non-sugar bases pass
+// through (canonicalized) without any check.
+func (d *ToolDispatcher) resolveQueuedEditBase(ctx context.Context, base, repoName string) (string, error) {
+	resolved, _, err := space.ResolveBaseRef(base, repoName)
+	if err != nil {
+		return "", err
+	}
+	id, isSugar := strings.CutPrefix(strings.TrimSpace(base), "space:")
+	if !isSugar {
+		return resolved, nil
+	}
+	branch := strings.TrimPrefix(resolved, "refs/heads/")
+	if record := plannedSpacesFromOps(d.Session.Plan.Operations)[id]; record != nil {
+		switch {
+		case record.branches[branch]:
+			return resolved, nil // planned earlier in this plan: soft-pass
+		case record.isSaga:
+			return "", fmt.Errorf("base %q targets %q, which this plan creates as a saga; sagas own no edit branches", base, id)
+		case record.created:
+			return "", fmt.Errorf("base %q: space %q is created earlier in this plan but has no planned edit branch %q", base, id, branch)
+		}
+	}
+	if !spaceExists(d.Config, id) {
+		return "", fmt.Errorf("base %q: space %q does not exist", base, id)
+	}
+	repoCfg, ok := d.Config.Repos[repoName]
+	if !ok {
+		return "", fmt.Errorf("repo %q is not registered", repoName)
+	}
+	exists, err := d.Git.BranchExists(ctx, repoCfg.BareRepoPath, branch)
+	if err != nil {
+		return "", fmt.Errorf("base %q: branch existence check failed: %w", base, err)
+	}
+	if !exists {
+		return "", fmt.Errorf("base %q: space %q has no branch %q for repo %q", base, id, branch, repoName)
+	}
+	return resolved, nil
 }
 
 func (d *ToolDispatcher) queueOperation(call ToolCall, op Operation) ToolResult {
@@ -885,6 +1054,23 @@ type spaceAddArgs struct {
 type summonArgs struct {
 	SpaceID  string `json:"space_id"`
 	Summoner string `json:"summoner"`
+}
+
+type sagaCreateArgs struct {
+	SagaID     string    `json:"saga_id"`
+	SpecPath   string    `json:"spec_path"`
+	References []RepoRef `json:"references"`
+	Memories   []string  `json:"memories"`
+}
+
+type sagaStatusArgs struct {
+	SagaID string `json:"saga_id"`
+}
+
+type sagaAddArgs struct {
+	SagaID  string   `json:"saga_id"`
+	SpaceID string   `json:"space_id"`
+	After   []string `json:"after"`
 }
 
 type askArgs struct {

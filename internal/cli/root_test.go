@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -30,6 +31,7 @@ func TestCLIHelpCommands(t *testing.T) {
 		{"repos", "--help"},
 		{"space", "--help"},
 		{"space", "create", "--help"},
+		{"space", "retarget", "--help"},
 		{"memory", "--help"},
 		{"memory", "attach", "--help"},
 		{"memory", "providers", "--help"},
@@ -62,6 +64,15 @@ func TestCLIHelpCommands(t *testing.T) {
 		{"portal", "destroy", "--help"},
 		{"agent", "--help"},
 		{"summon", "--help"},
+		{"saga", "--help"},
+		{"saga", "create", "--help"},
+		{"saga", "list", "--help"},
+		{"saga", "status", "--help"},
+		{"saga", "sync", "--help"},
+		{"saga", "add", "--help"},
+		{"saga", "remove", "--help"},
+		{"saga", "archive", "--help"},
+		{"saga", "destroy", "--help"},
 		{"space", "create", "example", "--help"},
 	} {
 		cmd := NewRootCommand()
@@ -117,6 +128,39 @@ func TestCLISetupReposAddAndCreate(t *testing.T) {
 	status := runCLI(t, "space", "status", "ex-1234")
 	if !strings.Contains(status, "spec:") || !strings.Contains(status, "repo-a [edit]") || !strings.Contains(status, "repo-b [reference]") {
 		t.Fatalf("status output missing repos:\n%s", status)
+	}
+}
+
+func TestCLISpaceStatusRejectsTraversalID(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	out, err := runCLIError(t, nil, "space", "status", "../x")
+	if err == nil || !strings.Contains(err.Error(), "space id") {
+		t.Fatalf("space status ../x error = %v\n%s", err, out)
+	}
+}
+
+func TestCLIRetargetFlow(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	src := createGitRepo(t, "repo-a")
+	runGit(t, src, "branch", "dev")
+	if err := os.WriteFile(filepath.Join(src, "next.md"), []byte("next\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, src, "add", "next.md")
+	runGit(t, src, "commit", "-m", "second")
+
+	runCLI(t, "setup")
+	runCLI(t, "repos", "add", "repo-a", src)
+	runCLI(t, "space", "create", "rt-1", "-e", "repo-a:dev")
+
+	out := runCLI(t, "space", "retarget", "rt-1", "--repo", "repo-a", "--base", "origin/main")
+	if !strings.Contains(out, "retargeted rt-1 repo repo-a to base origin/main") {
+		t.Fatalf("retarget output = %s", out)
+	}
+	status := runCLI(t, "space", "status", "rt-1")
+	if !strings.Contains(status, "base: origin/main") || !strings.Contains(status, "drift: ahead 0, behind 1") {
+		t.Fatalf("status after retarget:\n%s", status)
 	}
 }
 
@@ -358,6 +402,86 @@ func TestCLIPortalReadCommandsTextAndJSON(t *testing.T) {
 	missingDoctor := runCLIWithApp(t, &app{portalRunner: missingRunner}, "portal", "doctor", "ex-1234")
 	if !strings.Contains(missingDoctor, "driver.binary_missing") {
 		t.Fatalf("missing binary doctor output = %s", missingDoctor)
+	}
+}
+
+// TestCLISagaStatusJSONRedactionContract pins the CLI-side --json pipeline
+// for the frozen space.SagaStatus. writeJSON re-encodes through generic maps
+// (agent.RedactForJSON), so a whole-payload byte-compare against a typed
+// MarshalIndent proves nothing; instead this asserts snake_case keys,
+// absence of Go-name keys, and that every realistic ref/URL/PR scalar
+// survives the redaction pass value-identically — the emitted payload
+// unmarshals back equal to the input struct.
+func TestCLISagaStatusJSONRedactionContract(t *testing.T) {
+	status := space.SagaStatus{
+		SagaID: "pay-1",
+		Members: []space.SagaMemberStatus{
+			{
+				ID:    "pay-1-api",
+				After: []string{"pay-1-schema"},
+				State: space.MemberLive,
+				Dirty: true,
+				Repos: []space.SagaRepoStatus{{
+					Name:       "api",
+					Branch:     "stave/pay-1/api",
+					Base:       "refs/heads/stave/pay-1-schema/api",
+					Ahead:      3,
+					Behind:     1,
+					BaseHealth: space.BaseHealthMerged,
+					MergedVia:  space.MergedViaPR,
+					Note:       `stacks on base refs/heads/stave/pay-1-schema/api owned by "pay-1-schema"`,
+				}, {
+					Name:       "web",
+					Branch:     "stave/pay-1/web",
+					Base:       "origin/main",
+					BaseHealth: space.BaseHealthOK,
+				}},
+				PRs: []space.SagaPRStatus{{
+					Repo:        "api",
+					Number:      41,
+					State:       "MERGED",
+					MergedAt:    "2026-07-01T12:00:00Z",
+					BaseRefName: "main",
+				}},
+			},
+			{ID: "pay-1-schema", State: space.MemberArchived, Error: "/archive/2026/pay-1-schema"},
+		},
+		Notes: []space.SagaNote{{
+			Kind:   space.NoteKindSuggestion,
+			Member: "pay-1-api",
+			Text:   "repo api: the PR for branch stave/pay-1/api merged but the branch is not an ancestor of refs/remotes/origin/main; see https://github.com/acme/api/pull/41",
+		}},
+	}
+	var buf bytes.Buffer
+	if err := writeJSON(&buf, status); err != nil {
+		t.Fatalf("writeJSON error = %v", err)
+	}
+	payload := buf.String()
+	for _, key := range []string{`"saga_id"`, `"members"`, `"after"`, `"state"`, `"dirty"`, `"repos"`, `"prs"`, `"base_health"`, `"merged_via"`, `"merged_at"`, `"base_ref_name"`, `"notes"`, `"kind"`} {
+		if !strings.Contains(payload, key) {
+			t.Fatalf("saga status json missing %s:\n%s", key, payload)
+		}
+	}
+	for _, key := range []string{`"SagaID"`, `"Members"`, `"BaseHealth"`, `"MergedVia"`, `"MergedAt"`, `"BaseRefName"`, `"Notes"`} {
+		if strings.Contains(payload, key) {
+			t.Fatalf("saga status json leaks Go-name key %s:\n%s", key, payload)
+		}
+	}
+	var restored space.SagaStatus
+	if err := json.Unmarshal([]byte(payload), &restored); err != nil {
+		t.Fatalf("saga status json does not unmarshal into space.SagaStatus: %v\n%s", err, payload)
+	}
+	if !reflect.DeepEqual(status, restored) {
+		t.Fatalf("saga status json round-trip mismatch (redaction mangled a value):\nhave %#v\nwant %#v", restored, status)
+	}
+	// Spot-check the scalars a redaction pass is most tempted to touch.
+	repo := restored.Members[0].Repos[0]
+	pr := restored.Members[0].PRs[0]
+	if repo.Base != "refs/heads/stave/pay-1-schema/api" || repo.Branch != "stave/pay-1/api" || pr.Number != 41 || pr.BaseRefName != "main" || pr.MergedAt != "2026-07-01T12:00:00Z" {
+		t.Fatalf("ref/PR scalars altered: repo=%#v pr=%#v", repo, pr)
+	}
+	if !strings.Contains(restored.Notes[0].Text, "https://github.com/acme/api/pull/41") {
+		t.Fatalf("note URL altered: %q", restored.Notes[0].Text)
 	}
 }
 
@@ -1267,7 +1391,7 @@ func TestCLIAgentRunAndValidationErrors(t *testing.T) {
 	cmd.SetOut(&out)
 	cmd.SetErr(&out)
 	err = cmd.Execute()
-	if err == nil || !strings.Contains(err.Error(), "space \"\" does not exist") {
+	if err == nil || !strings.Contains(err.Error(), "space id \"\"") {
 		t.Fatalf("expected validation error, err=%v out=%s", err, out.String())
 	}
 }
@@ -1414,6 +1538,14 @@ func TestCLICommandsSurfaceConfigLoadErrors(t *testing.T) {
 		{"space", "sync", "ex-1"},
 		{"space", "archive", "ex-1"},
 		{"space", "destroy", "ex-1"},
+		{"saga", "create", "epic-1"},
+		{"saga", "list"},
+		{"saga", "status", "epic-1"},
+		{"saga", "sync", "epic-1"},
+		{"saga", "add", "epic-1", "ex-1"},
+		{"saga", "remove", "epic-1", "ex-1"},
+		{"saga", "archive", "epic-1"},
+		{"saga", "destroy", "epic-1"},
 		{"summon", "ex-1"},
 		{"portal", "drivers"},
 		{"portal", "doctor", "ex-1"},

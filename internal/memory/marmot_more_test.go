@@ -1144,78 +1144,13 @@ func TestPrintfNil(t *testing.T) {
 
 func TestRemoveSpaceMCPConfigPreservesOtherServers(t *testing.T) {
 	dir := t.TempDir()
-	// Seed multi-server configs
-	mcp := map[string]any{
-		"mcpServers": map[string]any{
-			"context-marmot": map[string]any{"command": "marmot", "args": []string{"serve", "--den", "gone"}},
-			"other":          map[string]any{"command": "other"},
-		},
-	}
-	raw, _ := json.MarshalIndent(mcp, "", "  ")
-	if err := os.WriteFile(filepath.Join(dir, ".mcp.json"), append(raw, '\n'), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Join(dir, ".cursor"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, ".cursor", "mcp.json"), append(raw, '\n'), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	vs := map[string]any{
-		"servers": map[string]any{
-			"context-marmot": map[string]any{"command": "marmot"},
-			"keep-me":        map[string]any{"command": "x"},
-		},
-	}
-	vsRaw, _ := json.MarshalIndent(vs, "", "  ")
-	if err := os.MkdirAll(filepath.Join(dir, ".vscode"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, ".vscode", "mcp.json"), append(vsRaw, '\n'), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	codex := "model = \"gpt\"\n\n[mcp_servers.context-marmot]\nenabled = true\ncommand = \"marmot\"\n\n[mcp_servers.context-marmot.env]\nMARMOT_HOME = \"/tmp\"\n\n[mcp_servers.other]\ncommand = \"y\"\n"
-	if err := os.MkdirAll(filepath.Join(dir, ".codex"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, ".codex", "config.toml"), []byte(codex), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	seedMultiServerMCPConfigs(t, dir)
 
 	if err := RemoveSpaceMCPConfig(dir); err != nil {
 		t.Fatal(err)
 	}
 
-	// .mcp.json keeps other
-	got, err := os.ReadFile(filepath.Join(dir, ".mcp.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(got), "context-marmot") {
-		t.Fatalf("context-marmot still present: %s", got)
-	}
-	if !strings.Contains(string(got), "other") {
-		t.Fatalf("other server removed: %s", got)
-	}
-	// vscode
-	got, err = os.ReadFile(filepath.Join(dir, ".vscode", "mcp.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(got), "context-marmot") || !strings.Contains(string(got), "keep-me") {
-		t.Fatalf("vscode cleanup wrong: %s", got)
-	}
-	// codex
-	got, err = os.ReadFile(filepath.Join(dir, ".codex", "config.toml"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(got), "context-marmot") {
-		t.Fatalf("codex still has context-marmot: %s", got)
-	}
-	if !strings.Contains(string(got), "[mcp_servers.other]") || !strings.Contains(string(got), "model") {
-		t.Fatalf("codex lost unrelated config: %s", got)
-	}
+	assertMarmotEntriesStripped(t, dir)
 }
 
 func TestDetachKeepSpaceWiringRepointsRouteAndMCP(t *testing.T) {

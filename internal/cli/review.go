@@ -6,12 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 
 	"github.com/Nurozen/stave/internal/config"
+	"github.com/Nurozen/stave/internal/gh"
 	"github.com/Nurozen/stave/internal/git"
 	"github.com/Nurozen/stave/internal/space"
 	"github.com/Nurozen/stave/internal/summon"
@@ -197,7 +197,7 @@ func (a *app) setUpReviewSpace(cmd *cobra.Command, cfg *config.Config, cfgPath s
 		return reviewResult{}, fmt.Errorf("fetch PR #%d head: %w", ref.Number, err)
 	}
 
-	meta, metaErr := fetchPRMetadata(ctx, ref)
+	meta, metaErr := fetchPRMetadata(ctx, &gh.Client{Runner: a.ghRunner}, ref)
 	if metaErr != nil {
 		fmt.Fprintf(cmd.ErrOrStderr(), "note: PR metadata unavailable (%v); the review spec will be minimal\n", metaErr)
 	}
@@ -327,27 +327,17 @@ func sameCloneURL(a, b string) bool {
 }
 
 // fetchPRMetadata reads PR details via the gh CLI when it is available and
-// authenticated; the review flow degrades gracefully without it.
-func fetchPRMetadata(ctx context.Context, ref prRef) (prMetadata, error) {
+// authenticated; the review flow degrades gracefully without it (a missing
+// binary surfaces as gh.ErrGHUnavailable through the client's runner).
+func fetchPRMetadata(ctx context.Context, client *gh.Client, ref prRef) (prMetadata, error) {
 	var meta prMetadata
 	if ref.Owner == "" {
 		return meta, fmt.Errorf("PR referenced by registered repo name; owner unknown")
 	}
-	ghPath, err := exec.LookPath("gh")
+	output, err := client.ViewPRJSON(ctx, ref.webURL(),
+		"title,body,state,isDraft,baseRefName,headRefName,additions,deletions,changedFiles,url,author,statusCheckRollup")
 	if err != nil {
-		return meta, fmt.Errorf("gh CLI not found in PATH")
-	}
-	cmd := exec.CommandContext(ctx, ghPath, "pr", "view", ref.webURL(),
-		"--json", "title,body,state,isDraft,baseRefName,headRefName,additions,deletions,changedFiles,url,author,statusCheckRollup")
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
-	output, err := cmd.Output()
-	if err != nil {
-		detail := strings.TrimSpace(stderr.String())
-		if detail == "" {
-			detail = err.Error()
-		}
-		return meta, fmt.Errorf("gh pr view: %s", detail)
+		return meta, err
 	}
 	if err := json.Unmarshal(output, &meta); err != nil {
 		return meta, fmt.Errorf("parse gh pr view output: %w", err)

@@ -184,6 +184,131 @@ func TestBranchExistsTrimsFullRefAndFindsBranch(t *testing.T) {
 	}
 }
 
+func TestIsAncestorHandlesNonAncestor(t *testing.T) {
+	runner := &fakeRunner{errs: []error{&GitError{ExitCode: 1}}}
+	client := New(WithRunner(runner))
+	ok, err := client.IsAncestor(context.Background(), "/tmp/repo.git", "child", "parent")
+	if err != nil {
+		t.Fatalf("IsAncestor() error = %v", err)
+	}
+	if ok {
+		t.Fatal("non-ancestor reported as ancestor")
+	}
+}
+
+func TestIsAncestorReturnsUnexpectedErrors(t *testing.T) {
+	wantErr := errors.New("boom")
+	runner := &fakeRunner{errs: []error{wantErr}}
+	client := New(WithRunner(runner))
+	_, err := client.IsAncestor(context.Background(), "/tmp/repo.git", "parent", "child")
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("error = %v, want %v", err, wantErr)
+	}
+}
+
+func TestIsAncestorReportsAncestorWithExactArgs(t *testing.T) {
+	runner := &fakeRunner{}
+	client := New(WithRunner(runner))
+	ok, err := client.IsAncestor(context.Background(), "/tmp/repo.git", "origin/main", "refs/heads/stave/x/repo")
+	if err != nil {
+		t.Fatalf("IsAncestor() error = %v", err)
+	}
+	if !ok {
+		t.Fatal("ancestor reported as non-ancestor")
+	}
+	want := []string{"--git-dir", "/tmp/repo.git", "merge-base", "--is-ancestor", "origin/main", "refs/heads/stave/x/repo"}
+	if !reflect.DeepEqual(runner.calls[0].args, want) {
+		t.Fatalf("args = %#v, want %#v", runner.calls[0].args, want)
+	}
+}
+
+func TestRefExistsHandlesMissingRef(t *testing.T) {
+	runner := &fakeRunner{errs: []error{&GitError{ExitCode: 1}}}
+	client := New(WithRunner(runner))
+	exists, err := client.RefExists(context.Background(), "/tmp/repo.git", "refs/remotes/origin/missing")
+	if err != nil {
+		t.Fatalf("RefExists() error = %v", err)
+	}
+	if exists {
+		t.Fatal("missing ref reported as existing")
+	}
+}
+
+func TestRefExistsReturnsUnexpectedErrors(t *testing.T) {
+	wantErr := errors.New("boom")
+	runner := &fakeRunner{errs: []error{wantErr}}
+	client := New(WithRunner(runner))
+	_, err := client.RefExists(context.Background(), "/tmp/repo.git", "refs/heads/main")
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("error = %v, want %v", err, wantErr)
+	}
+}
+
+func TestRefExistsPassesFullRefVerbatim(t *testing.T) {
+	runner := &fakeRunner{}
+	client := New(WithRunner(runner))
+	exists, err := client.RefExists(context.Background(), "/tmp/repo.git", "refs/remotes/origin/pr/7")
+	if err != nil {
+		t.Fatalf("RefExists() error = %v", err)
+	}
+	if !exists {
+		t.Fatal("existing ref reported missing")
+	}
+	want := []string{"--git-dir", "/tmp/repo.git", "show-ref", "--verify", "--quiet", "refs/remotes/origin/pr/7"}
+	if !reflect.DeepEqual(runner.calls[0].args, want) {
+		t.Fatalf("args = %#v, want %#v", runner.calls[0].args, want)
+	}
+}
+
+func TestIsAncestorAndRefExistsAgainstRealRepo(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	source := filepath.Join(tmp, "source")
+	bare := filepath.Join(tmp, "repo.git")
+
+	runGitTestCommand(t, "", "init", "--initial-branch=main", source)
+	runGitTestCommand(t, source, "config", "user.email", "test@example.invalid")
+	runGitTestCommand(t, source, "config", "user.name", "Stave Test")
+	if err := os.WriteFile(filepath.Join(source, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitTestCommand(t, source, "add", "README.md")
+	runGitTestCommand(t, source, "commit", "-m", "parent")
+	client := New()
+	parent, err := client.OutputIn(ctx, source, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse parent error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "README.md"), []byte("hello again\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitTestCommand(t, source, "add", "README.md")
+	runGitTestCommand(t, source, "commit", "-m", "child")
+	child, err := client.OutputIn(ctx, source, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse child error = %v", err)
+	}
+
+	if err := client.CloneBare(ctx, source, bare); err != nil {
+		t.Fatalf("CloneBare() error = %v", err)
+	}
+
+	parent = strings.TrimSpace(parent)
+	child = strings.TrimSpace(child)
+	if ok, err := client.IsAncestor(ctx, bare, parent, child); err != nil || !ok {
+		t.Fatalf("IsAncestor(parent, child) = %v %v, want true", ok, err)
+	}
+	if ok, err := client.IsAncestor(ctx, bare, child, parent); err != nil || ok {
+		t.Fatalf("IsAncestor(child, parent) = %v %v, want false", ok, err)
+	}
+	if exists, err := client.RefExists(ctx, bare, "refs/heads/main"); err != nil || !exists {
+		t.Fatalf("RefExists(refs/heads/main) = %v %v, want true", exists, err)
+	}
+	if exists, err := client.RefExists(ctx, bare, "refs/heads/absent"); err != nil || exists {
+		t.Fatalf("RefExists(refs/heads/absent) = %v %v, want false", exists, err)
+	}
+}
+
 func TestRemoteDefaultBranchParsesSymbolicRefAndRemoteShowFallback(t *testing.T) {
 	runner := &fakeRunner{results: []Result{{Stdout: "origin/trunk\n"}}}
 	client := New(WithRunner(runner))

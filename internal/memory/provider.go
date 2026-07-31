@@ -130,6 +130,19 @@ type LinkReferenceResult struct {
 	DryRunCommands []string
 }
 
+// MCPWirer is an OPTIONAL Provider extension: providers implementing it can
+// (re)write or strip a space's local MCP config for an existing attachment
+// without a full attach/detach cycle (saga member wiring). Callers
+// type-assert; providers without it simply skip MCP wiring.
+type MCPWirer interface {
+	// WriteMCPConfig writes the space-local harness MCP configs pointing at
+	// the store identified by storeID.
+	WriteMCPConfig(ctx context.Context, spacePath, storeID string) error
+	// RemoveMCPConfig strips ONLY this provider's MCP entries from the
+	// space-local configs, preserving other servers/settings.
+	RemoveMCPConfig(ctx context.Context, spacePath string) error
+}
+
 type AttachResult struct {
 	Provider       string
 	StoreID        string

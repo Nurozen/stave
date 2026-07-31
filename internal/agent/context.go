@@ -66,6 +66,20 @@ func BuildContext(cfg config.Config) (Context, error) {
 				Owned:    mem.Owned,
 			})
 		}
+		if manifest.Saga != nil {
+			saga := &SagaContext{}
+			for _, member := range manifest.Saga.Members {
+				memberCtx := SagaMemberContext{
+					ID:    member.ID,
+					After: append([]string(nil), member.After...),
+				}
+				for _, pr := range member.PRs {
+					memberCtx.PRs = append(memberCtx.PRs, SagaPRContext{Repo: pr.Repo, Number: pr.Number})
+				}
+				saga.Members = append(saga.Members, memberCtx)
+			}
+			spaceCtx.Saga = saga
+		}
 		spaceCtx.Portals = portalSummaries(spacePath)
 		ctx.Spaces = append(ctx.Spaces, spaceCtx)
 	}

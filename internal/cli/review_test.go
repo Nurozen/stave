@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -147,6 +148,79 @@ func TestCLIReviewEndToEnd(t *testing.T) {
 	diff := gitOutput(t, worktree, "diff", "origin/main...HEAD")
 	if !strings.Contains(diff, "feature.txt") || !strings.Contains(diff, "pr change") {
 		t.Fatalf("PR diff missing change:\n%s", diff)
+	}
+}
+
+// TestCLIReviewRendersFetchedMetadata is the gh success path: the PR is
+// referenced with an owner so metadata is fetched, but through an injected
+// fake runner returning canned gh JSON, and the rendered spec carries it.
+// The repo resolves by registered name first, so no GitHub clone happens.
+func TestCLIReviewRendersFetchedMetadata(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	src := createGitRepo(t, "repo-a")
+	prSHA := gitOutput(t, src, "rev-parse", "main")
+	runGit(t, src, "update-ref", "refs/pull/42/head", prSHA)
+
+	runCLI(t, "setup")
+	runCLI(t, "repos", "add", "repo-a", src)
+
+	var gotArgs []string
+	application := &app{ghRunner: func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		gotArgs = append([]string{name}, args...)
+		return []byte(`{
+			"title": "Add widget",
+			"body": "This adds a widget.",
+			"state": "OPEN",
+			"isDraft": false,
+			"baseRefName": "main",
+			"headRefName": "feature",
+			"additions": 10,
+			"deletions": 2,
+			"changedFiles": 3,
+			"author": {"login": "octocat"},
+			"statusCheckRollup": [{"name": "build", "status": "COMPLETED", "conclusion": "SUCCESS"}]
+		}`), nil
+	}}
+	out := runCLIWithApp(t, application, "review", "octocat/repo-a#42")
+	if !strings.Contains(out, "review space review-repo-a-42 is ready") {
+		t.Fatalf("review output missing ready line:\n%s", out)
+	}
+	if strings.Contains(out, "PR metadata unavailable") {
+		t.Fatalf("success path must not degrade:\n%s", out)
+	}
+	wantArgs := []string{"gh", "pr", "view", "https://github.com/octocat/repo-a/pull/42",
+		"--json", "title,body,state,isDraft,baseRefName,headRefName,additions,deletions,changedFiles,url,author,statusCheckRollup"}
+	if len(gotArgs) != len(wantArgs) {
+		t.Fatalf("gh invocation = %#v, want %#v", gotArgs, wantArgs)
+	}
+	for i, want := range wantArgs {
+		if gotArgs[i] != want {
+			t.Fatalf("gh invocation = %#v, want %#v", gotArgs, wantArgs)
+		}
+	}
+
+	spec, err := os.ReadFile(filepath.Join(home, "stave", "agent-work", "review-repo-a-42", "spec", "pr-42.md"))
+	if err != nil {
+		t.Fatalf("review spec missing: %v", err)
+	}
+	got := string(spec)
+	for _, want := range []string{
+		"# Review: PR #42 — Add widget",
+		"- Author: octocat",
+		"- State: open",
+		"- Branches: feature -> main",
+		"- Size: 3 files changed, +10/-2",
+		"  - build: success",
+		"This adds a widget.",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("review spec missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "could not be fetched") {
+		t.Fatalf("review spec unexpectedly carries the degrade note:\n%s", got)
 	}
 }
 

@@ -149,6 +149,8 @@ func TestValidatePlanAdditionalBranches(t *testing.T) {
 		{Operations: []Operation{{Type: OpSpaceAdd, SpaceID: "ex-1", Repo: "missing", Mode: "edit"}}},
 		{Operations: []Operation{{Type: OpSpaceAdd, SpaceID: "ex-1", Repo: "api", Mode: "bad"}}},
 		{Operations: []Operation{{Type: OpSpaceAdd, SpaceID: "ex-1", Repo: "api", Mode: "edit", Branch: "bad branch"}}},
+		{Operations: []Operation{{Type: OpSpaceSync, SpaceID: "../x"}}},
+		{Operations: []Operation{{Type: OpSpaceStatus, SpaceID: "../x"}}},
 		{Operations: []Operation{{Type: OpReposSync, Repo: "missing"}}},
 		{Operations: []Operation{{Type: OpPortalList, SpaceID: "missing"}}},
 		{Operations: []Operation{{Type: OpPortalLogs, SpaceID: "ex-1", PortalID: "local-dev", Tail: 0}}},
@@ -180,6 +182,98 @@ func TestValidateRefishRejectsSpecificInvalidForms(t *testing.T) {
 	}
 	if err := validateSafePortalPath("workdir", "/workspace/ex-1"); err != nil {
 		t.Fatalf("absolute workdir should be accepted: %v", err)
+	}
+}
+
+func TestValidatePlanSagaOperations(t *testing.T) {
+	cfg := testConfig(t)
+	saveTestSaga(t, cfg, "story-1", space.SagaMember{ID: "member-0"})
+
+	okPlans := []Plan{
+		{Operations: []Operation{{Type: OpSagaCreate, SagaID: "story-2"}}},
+		// Create-then-add in the same plan: the add consults the planned record.
+		{Operations: []Operation{
+			{Type: OpSpaceCreate, SpaceID: "ex-2"},
+			{Type: OpSpaceAdd, SpaceID: "ex-2", Repo: "api", Mode: "edit"},
+		}},
+		// Full same-plan saga chain with after edges between planned members.
+		{Operations: []Operation{
+			{Type: OpSagaCreate, SagaID: "story-2"},
+			{Type: OpSpaceCreate, SpaceID: "m-1", Edits: []RepoRef{{Name: "api"}}},
+			{Type: OpSagaAdd, SagaID: "story-2", SpaceID: "m-1"},
+			{Type: OpSpaceCreate, SpaceID: "m-2"},
+			{Type: OpSagaAdd, SagaID: "story-2", SpaceID: "m-2", After: []string{"m-1"}},
+		}},
+		{Operations: []Operation{{Type: OpSagaAdd, SagaID: "story-1", SpaceID: "ex-1"}}},
+		{Operations: []Operation{{Type: OpSagaStatus, SagaID: "story-1"}}},
+		{Operations: []Operation{
+			{Type: OpSagaCreate, SagaID: "story-2"},
+			{Type: OpSagaStatus, SagaID: "story-2"},
+		}},
+		// Reference context may be added to a planned saga; edits may not.
+		{Operations: []Operation{
+			{Type: OpSagaCreate, SagaID: "story-2"},
+			{Type: OpSpaceAdd, SpaceID: "story-2", Repo: "api", Mode: "reference"},
+		}},
+	}
+	for _, plan := range okPlans {
+		if err := ValidatePlan(cfg, plan); err != nil {
+			t.Fatalf("ValidatePlan(%#v) error = %v", plan, err)
+		}
+	}
+
+	badPlans := []Plan{
+		// space_create must never mint a saga; that is stave_saga_create's job.
+		{Operations: []Operation{{Type: OpSpaceCreate, SpaceID: "ex-2", Kind: "saga"}}},
+		// Bogus destructive saga op types are rejected outright.
+		{Operations: []Operation{{Type: "saga_destroy", SagaID: "story-1"}}},
+		{Operations: []Operation{{Type: OpSagaCreate, SagaID: "story-1"}}},
+		{Operations: []Operation{{Type: OpSagaCreate, SagaID: "../x"}}},
+		{Operations: []Operation{{Type: OpSagaCreate, SagaID: "story-2", Edits: []RepoRef{{Name: "api"}}}}},
+		{Operations: []Operation{{Type: OpSagaAdd, SagaID: "story-1", SpaceID: "missing"}}},
+		{Operations: []Operation{{Type: OpSagaAdd, SagaID: "ex-1", SpaceID: "story-1"}}},
+		{Operations: []Operation{{Type: OpSagaAdd, SagaID: "story-1", SpaceID: "story-1"}}},
+		{Operations: []Operation{{Type: OpSagaAdd, SagaID: "story-1", SpaceID: "ex-1", After: []string{"../x"}}}},
+		{Operations: []Operation{
+			{Type: OpSagaCreate, SagaID: "story-2"},
+			{Type: OpSagaCreate, SagaID: "story-3"},
+			{Type: OpSagaAdd, SagaID: "story-2", SpaceID: "story-3"},
+		}},
+		{Operations: []Operation{{Type: OpSagaStatus, SagaID: "missing"}}},
+		{Operations: []Operation{
+			{Type: OpSpaceCreate, SpaceID: "ex-2"},
+			{Type: OpSagaStatus, SagaID: "ex-2"},
+		}},
+		{Operations: []Operation{
+			{Type: OpSagaCreate, SagaID: "story-2"},
+			{Type: OpSpaceAdd, SpaceID: "story-2", Repo: "api", Mode: "edit"},
+		}},
+		// Same-plan path conflict: the create already occupies the repo path.
+		{Operations: []Operation{
+			{Type: OpSpaceCreate, SpaceID: "ex-2", Edits: []RepoRef{{Name: "api"}}},
+			{Type: OpSpaceAdd, SpaceID: "ex-2", Repo: "api", Mode: "edit"},
+		}},
+	}
+	for _, plan := range badPlans {
+		if err := ValidatePlan(cfg, plan); err == nil {
+			t.Fatalf("ValidatePlan(%#v) succeeded unexpectedly", plan)
+		}
+	}
+}
+
+func saveTestSaga(t *testing.T, cfg config.Config, sagaID string, members ...space.SagaMember) {
+	t.Helper()
+	spacePath := filepath.Join(cfg.AgentWorkDir, sagaID)
+	if err := os.MkdirAll(spacePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := space.SaveManifest(spacePath, space.Manifest{
+		ID:        sagaID,
+		Kind:      space.KindSaga,
+		CreatedAt: time.Now().UTC(),
+		Saga:      &space.SagaManifest{Members: members},
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 

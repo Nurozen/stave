@@ -215,6 +215,141 @@ func TestWriteFileAtomicRenameFailureCleansTempAndLeavesTargetIntact(t *testing.
 	assertNoTempFiles(t, dir, "state.yaml")
 }
 
+// TestWriteFileExclusiveOneWinner races many creators of the same path;
+// exactly one must succeed, every loser must report os.ErrExist, and the
+// surviving content must be the winner's full payload with no temp residue.
+func TestWriteFileExclusiveOneWinner(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "manifest.yaml")
+
+	const writers = 8
+	var wg sync.WaitGroup
+	var wins atomic.Int32
+	var badErr atomic.Value // error
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			err := WriteFileExclusive(path, []byte(fmt.Sprintf("writer: %d\n", idx)), 0o644)
+			switch {
+			case err == nil:
+				wins.Add(1)
+			case !os.IsExist(err):
+				badErr.Store(fmt.Errorf("writer %d: unexpected error %w", idx, err))
+			}
+		}(w)
+	}
+	wg.Wait()
+	if err, ok := badErr.Load().(error); ok && err != nil {
+		t.Fatal(err)
+	}
+	if wins.Load() != 1 {
+		t.Fatalf("winners = %d, want exactly 1", wins.Load())
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(data), "writer: ") || !strings.HasSuffix(string(data), "\n") {
+		t.Fatalf("content = %q, want one full payload", data)
+	}
+	assertNoTempFiles(t, dir, "manifest.yaml")
+}
+
+func TestWriteFileExclusiveRefusesExistingAndAppliesPerm(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.yaml")
+	if err := WriteFileExclusive(path, []byte("first\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("perm = %v, want 0600", info.Mode().Perm())
+	}
+	err = WriteFileExclusive(path, []byte("second\n"), 0o600)
+	if !os.IsExist(err) {
+		t.Fatalf("second write error = %v, want ErrExist", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "first\n" {
+		t.Fatalf("content clobbered: %q", data)
+	}
+	assertNoTempFiles(t, dir, "state.yaml")
+}
+
+// TestWriteFileExclFallbackOneWinner races many creators of the same path
+// through the O_EXCL degrade path used when the filesystem rejects hard links
+// (exFAT, SMB, some container mounts); the one-winner and ErrExist contracts
+// must hold there too.
+func TestWriteFileExclFallbackOneWinner(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "manifest.yaml")
+
+	const writers = 8
+	var wg sync.WaitGroup
+	var wins atomic.Int32
+	var badErr atomic.Value // error
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			err := writeFileExcl(path, []byte(fmt.Sprintf("writer: %d\n", idx)), 0o644)
+			switch {
+			case err == nil:
+				wins.Add(1)
+			case !os.IsExist(err):
+				badErr.Store(fmt.Errorf("writer %d: unexpected error %w", idx, err))
+			}
+		}(w)
+	}
+	wg.Wait()
+	if err, ok := badErr.Load().(error); ok && err != nil {
+		t.Fatal(err)
+	}
+	if wins.Load() != 1 {
+		t.Fatalf("winners = %d, want exactly 1", wins.Load())
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(data), "writer: ") || !strings.HasSuffix(string(data), "\n") {
+		t.Fatalf("content = %q, want one full payload", data)
+	}
+}
+
+func TestWriteFileExclFallbackRefusesExistingAndAppliesPerm(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.yaml")
+	if err := writeFileExcl(path, []byte("first\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("perm = %v, want 0600", info.Mode().Perm())
+	}
+	err = writeFileExcl(path, []byte("second\n"), 0o600)
+	if !os.IsExist(err) {
+		t.Fatalf("second write error = %v, want ErrExist", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "first\n" {
+		t.Fatalf("content clobbered: %q", data)
+	}
+}
+
 // TestWithLockSerializesLoadModifySave runs concurrent read-increment-write
 // cycles on a counter file under WithLock; the exclusive advisory lock must
 // prevent lost updates so the final value equals the total number of

@@ -25,6 +25,9 @@ func TestToolDefinitions(t *testing.T) {
 		ToolSpaceAdd,
 		ToolSummon,
 		ToolAsk,
+		ToolSagaCreate,
+		ToolSagaStatus,
+		ToolSagaAdd,
 		ToolPortalList,
 		ToolPortalStatus,
 		ToolPortalDoctor,
@@ -75,6 +78,12 @@ func TestToolDefinitions(t *testing.T) {
 	}
 	if seen[ToolAsk].Category != ToolCategoryControl {
 		t.Fatalf("ask category = %s", seen[ToolAsk].Category)
+	}
+	if seen[ToolSagaCreate].Category != ToolCategoryMutate || seen[ToolSagaAdd].Category != ToolCategoryMutate {
+		t.Fatalf("saga mutate categories = %s/%s", seen[ToolSagaCreate].Category, seen[ToolSagaAdd].Category)
+	}
+	if seen[ToolSagaStatus].Category != ToolCategoryRead {
+		t.Fatalf("saga status category = %s", seen[ToolSagaStatus].Category)
 	}
 	if seen[ToolPortalDestroyPreview].Category != ToolCategoryRead {
 		t.Fatalf("destroy preview category = %s", seen[ToolPortalDestroyPreview].Category)
@@ -313,7 +322,7 @@ func TestToolDispatcherPortalReadPayloads(t *testing.T) {
 	if !strings.Contains(string(authData), "codex") || strings.Contains(string(authData), "claude") {
 		t.Fatalf("filtered auth = %s", authData)
 	}
-	if _, _, err := dispatcher.portalReadPayload(Operation{Type: OpPortalConfigure, SpaceID: "ex-1", PortalID: "dev"}); err == nil {
+	if _, _, err := portalReadPayload(context.Background(), portal.NewService(dispatcher.Config, nil, nil), Operation{Type: OpPortalConfigure, SpaceID: "ex-1", PortalID: "dev"}); err == nil {
 		t.Fatal("unsupported portal read payload succeeded")
 	}
 }
@@ -405,6 +414,19 @@ func TestToolDispatcherSpaceStatusPayload(t *testing.T) {
 	}
 }
 
+func TestToolDispatcherSpaceStatusRejectsInvalidSpaceID(t *testing.T) {
+	cfg := testConfig(t)
+	dispatcher := NewToolDispatcher(cfg, nil, nil)
+
+	result := dispatcher.Dispatch(context.Background(), toolCall(ToolSpaceStatus, map[string]any{"space_id": "../x"}))
+	if !result.Error || !strings.Contains(result.Summary, "space id") {
+		t.Fatalf("space status result = %#v", result)
+	}
+	if len(dispatcher.Session.ReadResults) != 0 {
+		t.Fatalf("read results = %#v", dispatcher.Session.ReadResults)
+	}
+}
+
 func TestToolDispatcherValidationAndEncodingBranches(t *testing.T) {
 	cfg := testConfig(t)
 	dispatcher := NewToolDispatcher(cfg, nil, nil)
@@ -441,6 +463,190 @@ func TestToolDispatcherValidationAndEncodingBranches(t *testing.T) {
 	if !strings.Contains(bad, "unsupported value") {
 		t.Fatalf("bad output string = %s", bad)
 	}
+}
+
+func TestToolDispatcherQueuesSagaOperations(t *testing.T) {
+	cfg := testConfig(t)
+	dispatcher := NewToolDispatcher(cfg, nil, nil)
+
+	calls := []struct {
+		name string
+		args map[string]any
+	}{
+		{ToolSagaCreate, map[string]any{"saga_id": "story"}},
+		{ToolSpaceCreate, map[string]any{"space_id": "m-1", "edits": []map[string]any{{"name": "api"}}}},
+		{ToolSagaAdd, map[string]any{"saga_id": "story", "space_id": "m-1"}},
+		{ToolSpaceCreate, map[string]any{"space_id": "m-2"}},
+		{ToolSagaAdd, map[string]any{"saga_id": "story", "space_id": "m-2", "after": []string{"m-1"}}},
+	}
+	for _, tc := range calls {
+		result := dispatcher.Dispatch(context.Background(), toolCall(tc.name, tc.args))
+		if result.Error {
+			t.Fatalf("%s result = %#v", tc.name, result)
+		}
+	}
+	run := dispatcher.Session.RunResult()
+	want := []string{
+		"stave saga create story",
+		"stave space create m-1 -e api",
+		"stave saga add story m-1",
+		"stave space create m-2",
+		"stave saga add story m-2 --after m-1",
+	}
+	if len(run.Commands) != len(want) {
+		t.Fatalf("commands = %#v", run.Commands)
+	}
+	for i, command := range want {
+		if run.Commands[i] != command {
+			t.Fatalf("command %d = %q, want %q", i, run.Commands[i], command)
+		}
+	}
+}
+
+func TestToolDispatcherRejectsSagaKindSpaceCreate(t *testing.T) {
+	cfg := testConfig(t)
+	dispatcher := NewToolDispatcher(cfg, nil, nil)
+
+	result := dispatcher.Dispatch(context.Background(), toolCall(ToolSpaceCreate, map[string]any{
+		"space_id": "ex-2",
+		"kind":     "saga",
+	}))
+	if !result.Error || !strings.Contains(result.Summary, "stave_saga_create") {
+		t.Fatalf("saga kind result = %#v", result)
+	}
+}
+
+func TestToolDispatcherSagaStatusPayload(t *testing.T) {
+	cfg := testConfig(t)
+	saveTestSaga(t, cfg, "story-1", space.SagaMember{ID: "ex-1"})
+	dispatcher := NewToolDispatcher(cfg, nil, nil)
+
+	result := dispatcher.Dispatch(context.Background(), toolCall(ToolSagaStatus, map[string]any{"saga_id": "story-1"}))
+	if result.Error {
+		t.Fatalf("saga status result = %#v", result)
+	}
+	payload := result.Payload.(map[string]any)
+	if payload["command"] != "stave saga status story-1" {
+		t.Fatalf("payload command = %#v", payload["command"])
+	}
+	note, _ := payload["note"].(string)
+	if !strings.Contains(note, "ancestry") || !strings.Contains(note, "stave saga status --json") {
+		t.Fatalf("payload note = %q", note)
+	}
+	statusData, err := json.Marshal(payload["status"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	statusText := string(statusData)
+	if !strings.Contains(statusText, `"saga_id":"story-1"`) || !strings.Contains(statusText, `"id":"ex-1"`) || !strings.Contains(statusText, `"state":"live"`) {
+		t.Fatalf("status payload = %s", statusText)
+	}
+	if len(dispatcher.Session.ReadResults) != 1 || len(dispatcher.Session.Plan.Operations) != 0 {
+		t.Fatalf("session = %#v", dispatcher.Session)
+	}
+
+	result = dispatcher.Dispatch(context.Background(), toolCall(ToolSagaStatus, map[string]any{"saga_id": "../x"}))
+	if !result.Error {
+		t.Fatalf("invalid saga id was accepted: %#v", result)
+	}
+	result = dispatcher.Dispatch(context.Background(), toolCall(ToolSagaStatus, map[string]any{"saga_id": "ex-1"}))
+	if !result.Error || !strings.Contains(result.Summary, "not a saga") {
+		t.Fatalf("non-saga status result = %#v", result)
+	}
+}
+
+func TestToolDispatcherResolvesBaseSugarForPlanCreatedTarget(t *testing.T) {
+	cfg := testConfig(t)
+	dispatcher := NewToolDispatcher(cfg, nil, nil)
+
+	result := dispatcher.Dispatch(context.Background(), toolCall(ToolSpaceCreate, map[string]any{
+		"space_id": "base-1",
+		"edits":    []map[string]any{{"name": "api"}},
+	}))
+	if result.Error {
+		t.Fatalf("base space create result = %#v", result)
+	}
+	// Soft-pass: the sugar target is created earlier in this same plan, so no
+	// on-disk branch check runs and the ref resolves eagerly.
+	result = dispatcher.Dispatch(context.Background(), toolCall(ToolSpaceCreate, map[string]any{
+		"space_id": "ex-2",
+		"edits":    []map[string]any{{"name": "api", "ref": "space:base-1"}},
+	}))
+	if result.Error {
+		t.Fatalf("stacked space create result = %#v", result)
+	}
+	ops := dispatcher.Session.Plan.Operations
+	if len(ops) != 2 || ops[1].Edits[0].Ref != "refs/heads/stave/base-1/api" {
+		t.Fatalf("operations = %#v", ops)
+	}
+	if command := EquivalentCommand(ops[1]); command != "stave space create ex-2 -e api:refs/heads/stave/base-1/api" {
+		t.Fatalf("command = %q", command)
+	}
+}
+
+func TestToolDispatcherBaseSugarHardChecks(t *testing.T) {
+	cfg := testConfig(t)
+	// ex-1 exists on disk but the executor git runner reports show-ref exit 1,
+	// so its stave branch does not exist: sugar must hard-fail.
+	dispatcher := NewToolDispatcher(cfg, git.New(git.WithRunner(&executorGitRunner{})), nil)
+	result := dispatcher.Dispatch(context.Background(), toolCall(ToolSpaceCreate, map[string]any{
+		"space_id": "ex-2",
+		"edits":    []map[string]any{{"name": "api", "ref": "space:ex-1"}},
+	}))
+	if !result.Error || !strings.Contains(result.Summary, "no branch") {
+		t.Fatalf("missing-branch sugar result = %#v", result)
+	}
+	if len(dispatcher.Session.Plan.Operations) != 0 {
+		t.Fatalf("operations = %#v", dispatcher.Session.Plan.Operations)
+	}
+
+	// With the branch present in the bare repo the same sugar hard-passes.
+	dispatcher = NewToolDispatcher(cfg, git.New(git.WithRunner(&branchExistsGitRunner{})), nil)
+	result = dispatcher.Dispatch(context.Background(), toolCall(ToolSpaceAdd, map[string]any{
+		"space_id": "ex-1",
+		"repo":     "api",
+		"mode":     "edit",
+		"base":     "space:ex-1",
+	}))
+	if result.Error {
+		t.Fatalf("existing-branch sugar result = %#v", result)
+	}
+	last := dispatcher.Session.Plan.Operations[0]
+	if last.Base != "refs/heads/stave/ex-1/api" {
+		t.Fatalf("resolved base = %q", last.Base)
+	}
+
+	// A sugar target that neither exists on disk nor in the plan is an error.
+	result = dispatcher.Dispatch(context.Background(), toolCall(ToolSpaceCreate, map[string]any{
+		"space_id": "ex-3",
+		"edits":    []map[string]any{{"name": "api", "ref": "space:nope"}},
+	}))
+	if !result.Error || !strings.Contains(result.Summary, "does not exist") {
+		t.Fatalf("unknown sugar target result = %#v", result)
+	}
+}
+
+func TestToolDispatcherBaseSugarRejectsPlannedSagaTarget(t *testing.T) {
+	cfg := testConfig(t)
+	dispatcher := NewToolDispatcher(cfg, nil, nil)
+
+	result := dispatcher.Dispatch(context.Background(), toolCall(ToolSagaCreate, map[string]any{"saga_id": "story"}))
+	if result.Error {
+		t.Fatalf("saga create result = %#v", result)
+	}
+	result = dispatcher.Dispatch(context.Background(), toolCall(ToolSpaceCreate, map[string]any{
+		"space_id": "m-1",
+		"edits":    []map[string]any{{"name": "api", "ref": "space:story"}},
+	}))
+	if !result.Error || !strings.Contains(result.Summary, "saga") {
+		t.Fatalf("planned saga sugar result = %#v", result)
+	}
+}
+
+type branchExistsGitRunner struct{}
+
+func (r *branchExistsGitRunner) Run(ctx context.Context, bin string, args []string, opts git.RunOptions) (git.Result, error) {
+	return git.Result{}, nil
 }
 
 func toolCall(name string, args map[string]any) ToolCall {

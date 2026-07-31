@@ -373,3 +373,161 @@ func TestReviewSkillPromptIncludesMemoryBullets(t *testing.T) {
 		t.Fatalf("prompt must still start with the skill invocation: %q", claude.Args[0])
 	}
 }
+
+func sagaManifest(id string) space.Manifest {
+	return space.Manifest{
+		ID:        id,
+		Kind:      space.KindSaga,
+		CreatedAt: time.Now().UTC(),
+		Saga:      &space.SagaManifest{Members: []space.SagaMember{{ID: "member-a"}}},
+	}
+}
+
+func TestSagaSpaceDefaultsToEmbeddedSkill(t *testing.T) {
+	cfg := testConfig(t)
+	spacePath := filepath.Join(cfg.AgentWorkDir, "saga-1")
+	if err := os.MkdirAll(spacePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := space.SaveManifest(spacePath, sagaManifest("saga-1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := InstallSagaSkill(spacePath); err != nil {
+		t.Fatal(err)
+	}
+	svc := NewService(cfg, &fakeLauncher{}, nil)
+
+	claude, err := svc.Invocation(Options{SpaceID: "saga-1", Summoner: Claude})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claude.Args) != 1 || claude.Args[0] != "/"+SagaSkillName {
+		t.Fatalf("claude saga args = %#v, want the skill invocation", claude.Args)
+	}
+
+	// Codex has no skill system: it gets the saga coordinator stance instead
+	// of the editable-repos prompt.
+	codex, err := svc.Invocation(Options{SpaceID: "saga-1", Summoner: Codex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(codex.Args, " ")
+	if !strings.Contains(joined, "saga space") || !strings.Contains(joined, "stave saga status saga-1 --json") {
+		t.Fatalf("codex saga args = %#v, want the saga-stance prompt", codex.Args)
+	}
+	if strings.Contains(joined, "editable repositories") {
+		t.Fatalf("codex saga args = %#v, must not carry the editable-repos bullets", codex.Args)
+	}
+
+	// An explicit --prompt override wins over the skill launch.
+	override, err := svc.Invocation(Options{SpaceID: "saga-1", Summoner: Claude, Prompt: "custom"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(override.Args) != 1 || override.Args[0] != "custom" {
+		t.Fatalf("override args = %#v, want the override prompt only", override.Args)
+	}
+
+	// Without the installed skill (e.g. a pre-existing saga space), claude
+	// falls back to the saga-stance prompt instead of a dangling /command.
+	if err := os.RemoveAll(filepath.Join(spacePath, ".claude", "skills", SagaSkillName)); err != nil {
+		t.Fatal(err)
+	}
+	claude, err = svc.Invocation(Options{SpaceID: "saga-1", Summoner: Claude})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined = strings.Join(claude.Args, " ")
+	if strings.Contains(joined, "/"+SagaSkillName) || !strings.Contains(joined, "saga space") {
+		t.Fatalf("claude args = %#v, want the saga-stance fallback when skill missing", claude.Args)
+	}
+}
+
+// The saga detection predicate is the manifest's saga block, not Kind alone:
+// a kind:saga space without a roster (pseudo-saga) gets the plain prompt.
+func TestPseudoSagaGetsPlainPrompt(t *testing.T) {
+	cfg := testConfig(t)
+	spacePath := filepath.Join(cfg.AgentWorkDir, "pseudo-saga")
+	if err := os.MkdirAll(spacePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := space.SaveManifest(spacePath, space.Manifest{ID: "pseudo-saga", Kind: space.KindSaga, CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := InstallSagaSkill(spacePath); err != nil {
+		t.Fatal(err)
+	}
+	svc := NewService(cfg, &fakeLauncher{}, nil)
+
+	claude, err := svc.Invocation(Options{SpaceID: "pseudo-saga", Summoner: Claude})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(claude.Args, " ")
+	if strings.Contains(joined, "/"+SagaSkillName) || strings.Contains(joined, "saga space") {
+		t.Fatalf("pseudo-saga args = %#v, want the plain default prompt", claude.Args)
+	}
+	if !strings.Contains(joined, "editable repositories") {
+		t.Fatalf("pseudo-saga args = %#v, want the editable-repos bullets", claude.Args)
+	}
+}
+
+// F13 for sagas: the Claude saga-skill launch prompt must carry the memory
+// bullets, and the non-Claude stance prompt must carry both the saga stance
+// and the bullets.
+func TestSagaSkillPromptIncludesMemoryBullets(t *testing.T) {
+	cfg := testConfig(t)
+	spacePath := filepath.Join(cfg.AgentWorkDir, "saga-mem")
+	if err := os.MkdirAll(spacePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := sagaManifest("saga-mem")
+	manifest.Memories = []space.MemoryManifest{
+		{Name: "default", Provider: "marmot", ID: "den-a", Owned: true},
+		{Name: "extra", Provider: "marmot", ID: "den-b", Owned: false},
+	}
+	if err := space.SaveManifest(spacePath, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := InstallSagaSkill(spacePath); err != nil {
+		t.Fatal(err)
+	}
+	svc := NewService(cfg, &fakeLauncher{}, nil)
+
+	claude, err := svc.Invocation(Options{SpaceID: "saga-mem", Summoner: Claude})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claude.Args) != 1 {
+		t.Fatalf("claude args = %#v", claude.Args)
+	}
+	want := "/" + SagaSkillName + "\n\n" +
+		"- Persistent memory is available via the context-marmot MCP tools (den: den-a).\n" +
+		"- Persistent memory is available via the context-marmot MCP tools (den: den-b)."
+	if claude.Args[0] != want {
+		t.Fatalf("prompt = %q, want %q", claude.Args[0], want)
+	}
+
+	codex, err := svc.Invocation(Options{SpaceID: "saga-mem", Summoner: Codex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(codex.Args, " ")
+	if !strings.Contains(joined, "context-marmot MCP tools (den: den-a)") || !strings.Contains(joined, "saga space") {
+		t.Fatalf("codex saga invocation missing memory bullet or stance: %#v", codex.Args)
+	}
+}
+
+func TestInstallSagaSkillWritesEmbeddedSkill(t *testing.T) {
+	spacePath := t.TempDir()
+	if err := InstallSagaSkill(spacePath); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(spacePath, ".claude", "skills", SagaSkillName, "SKILL.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "name: "+SagaSkillName) {
+		t.Fatalf("installed skill missing frontmatter name: %q", string(data)[:120])
+	}
+}

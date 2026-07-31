@@ -19,6 +19,9 @@ type Fake struct {
 	DetachFn        func(context.Context, DetachOptions) (DetachResult, error)
 	LinkReferenceFn func(context.Context, LinkReferenceOptions) (LinkReferenceResult, error)
 
+	WriteMCPConfigFn  func(ctx context.Context, spacePath, storeID string) error
+	RemoveMCPConfigFn func(ctx context.Context, spacePath string) error
+
 	Calls []string
 
 	// DefaultAttachOwned controls the Owned field of the default Attach result.
@@ -42,7 +45,7 @@ func (f *Fake) Probe(ctx context.Context) (ProbeResult, error) {
 }
 
 func (f *Fake) Attach(ctx context.Context, opts AttachOptions) (AttachResult, error) {
-	f.record("attach", opts.SpaceID, opts.UseID, fmt.Sprintf("dry=%v", opts.DryRun))
+	f.record("attach", opts.SpaceID, opts.UseID, "lifetime="+opts.Lifetime, fmt.Sprintf("dry=%v", opts.DryRun))
 	if f.AttachFn != nil {
 		return f.AttachFn(ctx, opts)
 	}
@@ -117,6 +120,24 @@ func (f *Fake) LinkReference(ctx context.Context, opts LinkReferenceOptions) (Li
 	}
 	printf(opts.Out, "reference %s → %s (warren-url)\n", firstNonEmpty(opts.Spec.Name, opts.Spec.URL), target)
 	return LinkReferenceResult{Linked: true, Link: AttachLink{Ref: target, Mode: "link", ResolvedVia: "warren-url"}}, nil
+}
+
+// WriteMCPConfig makes Fake an MCPWirer (saga member wiring tests).
+func (f *Fake) WriteMCPConfig(ctx context.Context, spacePath, storeID string) error {
+	f.record("write-mcp-config", spacePath, storeID)
+	if f.WriteMCPConfigFn != nil {
+		return f.WriteMCPConfigFn(ctx, spacePath, storeID)
+	}
+	return WriteSpaceMCPConfig(spacePath, "marmot", storeID)
+}
+
+// RemoveMCPConfig makes Fake an MCPWirer (saga member wiring tests).
+func (f *Fake) RemoveMCPConfig(ctx context.Context, spacePath string) error {
+	f.record("remove-mcp-config", spacePath)
+	if f.RemoveMCPConfigFn != nil {
+		return f.RemoveMCPConfigFn(ctx, spacePath)
+	}
+	return RemoveSpaceMCPConfig(spacePath)
 }
 
 func (f *Fake) Detach(ctx context.Context, opts DetachOptions) (DetachResult, error) {

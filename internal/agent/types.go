@@ -24,6 +24,10 @@ const (
 	OpReposSync   = "repos_sync"
 	OpSummon      = "summon"
 
+	OpSagaCreate = "saga_create"
+	OpSagaStatus = "saga_status"
+	OpSagaAdd    = "saga_add"
+
 	OpPortalInit           = "portal_init"
 	OpPortalAttach         = "portal_attach"
 	OpPortalConfigure      = "portal_configure"
@@ -73,64 +77,69 @@ type Plan struct {
 }
 
 type Operation struct {
-	Type             string    `json:"type"`
-	SpaceID          string    `json:"space_id,omitempty"`
-	PortalID         string    `json:"portal_id,omitempty"`
-	Kind             string    `json:"kind,omitempty"`
-	SpecPath         string    `json:"spec_path,omitempty"`
-	Edits            []RepoRef `json:"edits,omitempty"`
-	References       []RepoRef `json:"references,omitempty"`
+	Type     string `json:"type"`
+	SpaceID  string `json:"space_id,omitempty"`
+	PortalID string `json:"portal_id,omitempty"`
+	// SagaID names the saga a saga_* operation targets; for saga_add the
+	// member being registered is SpaceID.
+	SagaID string `json:"saga_id,omitempty"`
+	// After lists the member ids a saga_add member lands behind.
+	After      []string  `json:"after,omitempty"`
+	Kind       string    `json:"kind,omitempty"`
+	SpecPath   string    `json:"spec_path,omitempty"`
+	Edits      []RepoRef `json:"edits,omitempty"`
+	References []RepoRef `json:"references,omitempty"`
 	// Memories are raw `[provider:]<spec>` values (space create --memory sugar).
 	Memories []string `json:"memories,omitempty"`
 	// MemoryFate is keep|destroy|contribute for space destroy (default keep).
-	MemoryFate     string    `json:"memory_fate,omitempty"`
-	Repo           string    `json:"repo,omitempty"`
-	Mode           string    `json:"mode,omitempty"`
-	Base           string    `json:"base,omitempty"`
-	Ref            string    `json:"ref,omitempty"`
-	Branch         string    `json:"branch,omitempty"`
-	NoFetch        bool      `json:"no_fetch,omitempty"`
-	ReferencesOnly bool      `json:"references_only,omitempty"`
-	Summoner       string    `json:"summoner,omitempty"`
-	Driver           string    `json:"driver,omitempty"`
-	Preset           string    `json:"preset,omitempty"`
-	Engine           string    `json:"engine,omitempty"`
-	Image            string    `json:"image,omitempty"`
-	Host             string    `json:"host,omitempty"`
-	Port             int       `json:"port,omitempty"`
-	InstanceID       string    `json:"instance_id,omitempty"`
-	Region           string    `json:"region,omitempty"`
-	Profile          string    `json:"profile,omitempty"`
-	SSHUser          string    `json:"ssh_user,omitempty"`
-	IdentityPath     string    `json:"identity_path,omitempty"`
-	KnownHostsPath   string    `json:"known_hosts_path,omitempty"`
-	StrictHostKey    string    `json:"strict_host_key,omitempty"`
-	RemoteRoot       string    `json:"remote_root,omitempty"`
-	ContainerRoot    string    `json:"container_root,omitempty"`
-	DevcontainerPath string    `json:"devcontainer_path,omitempty"`
-	ComposeFiles     []string  `json:"compose_files,omitempty"`
-	Service          string    `json:"service,omitempty"`
-	SyncMode         string    `json:"sync_mode,omitempty"`
-	Direction        string    `json:"direction,omitempty"`
-	Include          []string  `json:"include,omitempty"`
-	Exclude          []string  `json:"exclude,omitempty"`
-	Delete           bool      `json:"delete,omitempty"`
-	MaxDelete        int       `json:"max_delete,omitempty"`
-	AllowDirty       bool      `json:"allow_dirty,omitempty"`
-	AttachMode       string    `json:"attach_mode,omitempty"`
-	Workdir          string    `json:"workdir,omitempty"`
-	TTY              string    `json:"tty,omitempty"`
-	Permission       string    `json:"permission,omitempty"`
-	HandoffPrompt    string    `json:"handoff_prompt,omitempty"`
-	Provider         string    `json:"provider,omitempty"`
-	Method           string    `json:"method,omitempty"`
-	Target           string    `json:"target,omitempty"`
-	Agent            string    `json:"agent,omitempty"`
-	Tail             int       `json:"tail,omitempty"`
-	Follow           bool      `json:"follow,omitempty"`
-	Timeout          int       `json:"timeout,omitempty"`
-	Force            bool      `json:"force,omitempty"`
-	Unsupported      string    `json:"unsupported,omitempty"`
+	MemoryFate       string   `json:"memory_fate,omitempty"`
+	Repo             string   `json:"repo,omitempty"`
+	Mode             string   `json:"mode,omitempty"`
+	Base             string   `json:"base,omitempty"`
+	Ref              string   `json:"ref,omitempty"`
+	Branch           string   `json:"branch,omitempty"`
+	NoFetch          bool     `json:"no_fetch,omitempty"`
+	ReferencesOnly   bool     `json:"references_only,omitempty"`
+	Summoner         string   `json:"summoner,omitempty"`
+	Driver           string   `json:"driver,omitempty"`
+	Preset           string   `json:"preset,omitempty"`
+	Engine           string   `json:"engine,omitempty"`
+	Image            string   `json:"image,omitempty"`
+	Host             string   `json:"host,omitempty"`
+	Port             int      `json:"port,omitempty"`
+	InstanceID       string   `json:"instance_id,omitempty"`
+	Region           string   `json:"region,omitempty"`
+	Profile          string   `json:"profile,omitempty"`
+	SSHUser          string   `json:"ssh_user,omitempty"`
+	IdentityPath     string   `json:"identity_path,omitempty"`
+	KnownHostsPath   string   `json:"known_hosts_path,omitempty"`
+	StrictHostKey    string   `json:"strict_host_key,omitempty"`
+	RemoteRoot       string   `json:"remote_root,omitempty"`
+	ContainerRoot    string   `json:"container_root,omitempty"`
+	DevcontainerPath string   `json:"devcontainer_path,omitempty"`
+	ComposeFiles     []string `json:"compose_files,omitempty"`
+	Service          string   `json:"service,omitempty"`
+	SyncMode         string   `json:"sync_mode,omitempty"`
+	Direction        string   `json:"direction,omitempty"`
+	Include          []string `json:"include,omitempty"`
+	Exclude          []string `json:"exclude,omitempty"`
+	Delete           bool     `json:"delete,omitempty"`
+	MaxDelete        int      `json:"max_delete,omitempty"`
+	AllowDirty       bool     `json:"allow_dirty,omitempty"`
+	AttachMode       string   `json:"attach_mode,omitempty"`
+	Workdir          string   `json:"workdir,omitempty"`
+	TTY              string   `json:"tty,omitempty"`
+	Permission       string   `json:"permission,omitempty"`
+	HandoffPrompt    string   `json:"handoff_prompt,omitempty"`
+	Provider         string   `json:"provider,omitempty"`
+	Method           string   `json:"method,omitempty"`
+	Target           string   `json:"target,omitempty"`
+	Agent            string   `json:"agent,omitempty"`
+	Tail             int      `json:"tail,omitempty"`
+	Follow           bool     `json:"follow,omitempty"`
+	Timeout          int      `json:"timeout,omitempty"`
+	Force            bool     `json:"force,omitempty"`
+	Unsupported      string   `json:"unsupported,omitempty"`
 }
 
 type RepoRef struct {
@@ -157,6 +166,27 @@ type SpaceContext struct {
 	Repos    []SpaceRepoContext   `json:"repos"`
 	Memories []SpaceMemoryContext `json:"memories,omitempty"`
 	Portals  []PortalContext      `json:"portals,omitempty"`
+	Saga     *SagaContext         `json:"saga,omitempty"`
+}
+
+// SagaContext surfaces a saga space's member roster to the planner: after
+// edges plus the cached PR identities recorded per member (identity only;
+// merge state is never cached).
+type SagaContext struct {
+	Members []SagaMemberContext `json:"members"`
+}
+
+// SagaMemberContext is one roster row of SagaContext.
+type SagaMemberContext struct {
+	ID    string          `json:"id"`
+	After []string        `json:"after,omitempty"`
+	PRs   []SagaPRContext `json:"prs,omitempty"`
+}
+
+// SagaPRContext is one cached pull-request identity for a member repo.
+type SagaPRContext struct {
+	Repo   string `json:"repo"`
+	Number int    `json:"number"`
 }
 
 // SpaceMemoryContext surfaces attachment records to the planner.
@@ -307,6 +337,26 @@ func EquivalentCommand(op Operation) string {
 			summoner = summon.Codex
 		}
 		return strings.Join([]string{"stave", "summon", shellQuote(op.SpaceID), "--with", shellQuote(summoner)}, " ")
+	case OpSagaCreate:
+		parts := []string{"stave", "saga", "create", shellQuote(op.SagaID)}
+		if op.SpecPath != "" {
+			parts = append(parts, "-s", shellQuote(op.SpecPath))
+		}
+		for _, ref := range op.References {
+			parts = append(parts, "-r", shellQuote(repoSpec(ref)))
+		}
+		for _, mem := range op.Memories {
+			parts = append(parts, "--memory", shellQuote(mem))
+		}
+		return strings.Join(parts, " ")
+	case OpSagaStatus:
+		return strings.Join([]string{"stave", "saga", "status", shellQuote(op.SagaID)}, " ")
+	case OpSagaAdd:
+		parts := []string{"stave", "saga", "add", shellQuote(op.SagaID), shellQuote(op.SpaceID)}
+		for _, id := range op.After {
+			parts = append(parts, "--after", shellQuote(id))
+		}
+		return strings.Join(parts, " ")
 	case OpPortalList:
 		parts := []string{"stave", "portal", "list"}
 		appendSpaceAndPortal(&parts, op)

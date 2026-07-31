@@ -239,6 +239,19 @@ func TestValidateNames(t *testing.T) {
 	}
 }
 
+func TestValidateSpaceID(t *testing.T) {
+	for _, id := range []string{"space-a_1.2", "s1", "a.b-c"} {
+		if err := ValidateSpaceID(id); err != nil {
+			t.Fatalf("valid space id %q rejected: %v", id, err)
+		}
+	}
+	for _, id := range []string{"", "../x", "x/y", "-bad", ".archive/foo"} {
+		if err := ValidateSpaceID(id); err == nil {
+			t.Fatalf("invalid space id %q accepted", id)
+		}
+	}
+}
+
 func TestValidateGitURLSchemes(t *testing.T) {
 	valid := []string{
 		"git@example.test:repo.git",

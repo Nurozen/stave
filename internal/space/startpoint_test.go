@@ -106,6 +106,104 @@ func TestAddRepoStartPointBranchesAtStartPointWhileBaseTracksBase(t *testing.T) 
 	}
 }
 
+// TestAddRepoSpaceSugarStacksOnSiblingBranch verifies the stacking contract
+// against real git: a second space whose base is "space:<id>" branches from the
+// first space's edit branch (refs/heads/stave/<id>/<repo>), and drift tracks
+// that branch as the first space commits. A missing target branch errors
+// cleanly instead of minting a dead ref.
+func TestAddRepoSpaceSugarStacksOnSiblingBranch(t *testing.T) {
+	root := t.TempDir()
+
+	src := filepath.Join(t.TempDir(), "src")
+	startGit(t, "", "init", "-b", "main", src)
+	startGit(t, src, "config", "user.name", "Test User")
+	startGit(t, src, "config", "user.email", "test@example.test")
+	if err := os.WriteFile(filepath.Join(src, "base.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	startGit(t, src, "add", "base.txt")
+	startGit(t, src, "commit", "-m", "base")
+
+	ctx := context.Background()
+	client := git.New()
+	bare := filepath.Join(root, "bare-repos", "repo-a.git")
+	if err := client.CloneBare(ctx, src, bare); err != nil {
+		t.Fatalf("CloneBare() error = %v", err)
+	}
+	if err := client.ConfigureBareRemoteTracking(ctx, bare); err != nil {
+		t.Fatalf("ConfigureBareRemoteTracking() error = %v", err)
+	}
+	if err := client.FetchAllPrune(ctx, bare); err != nil {
+		t.Fatalf("FetchAllPrune() error = %v", err)
+	}
+
+	cfg := config.Config{
+		Root:         root,
+		BareReposDir: filepath.Join(root, "bare-repos"),
+		AgentWorkDir: filepath.Join(root, "agent-work"),
+		DefaultBase:  "main",
+		Repos: map[string]config.Repository{
+			"repo-a": {Name: "repo-a", URL: src, BareRepoPath: bare, DefaultBranch: "main"},
+		},
+	}
+	if err := cfg.EnsureRootDirs(); err != nil {
+		t.Fatal(err)
+	}
+	svc := NewService(cfg, client, nil)
+
+	// Space A owns refs/heads/stave/space-a/repo-a and commits on it.
+	if err := svc.Create(ctx, CreateOptions{ID: "space-a", Edits: []RepoSpec{{Name: "repo-a"}}}); err != nil {
+		t.Fatalf("Create(space-a) error = %v", err)
+	}
+	worktreeA := filepath.Join(cfg.AgentWorkDir, "space-a", "repo-a")
+	startGit(t, worktreeA, "config", "user.name", "Test User")
+	startGit(t, worktreeA, "config", "user.email", "test@example.test")
+	if err := os.WriteFile(filepath.Join(worktreeA, "layer.txt"), []byte("layer\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	startGit(t, worktreeA, "add", "layer.txt")
+	startGit(t, worktreeA, "commit", "-m", "layer one")
+	headA := startGitOutput(t, worktreeA, "rev-parse", "HEAD")
+
+	// Space B stacks on space A.
+	if err := svc.Create(ctx, CreateOptions{ID: "space-b", Edits: []RepoSpec{{Name: "repo-a", Ref: "space:space-a"}}}); err != nil {
+		t.Fatalf("Create(space-b stacked) error = %v", err)
+	}
+	worktreeB := filepath.Join(cfg.AgentWorkDir, "space-b", "repo-a")
+	if head := startGitOutput(t, worktreeB, "rev-parse", "HEAD"); head != headA {
+		t.Fatalf("stacked worktree HEAD = %q, want space A head %q", head, headA)
+	}
+	if branch := startGitOutput(t, worktreeB, "rev-parse", "--abbrev-ref", "HEAD"); branch != DefaultBranch("space-b", "repo-a") {
+		t.Fatalf("stacked worktree branch = %q", branch)
+	}
+	manifest, err := LoadManifest(filepath.Join(cfg.AgentWorkDir, "space-b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Repos[0].Base != "refs/heads/"+DefaultBranch("space-a", "repo-a") {
+		t.Fatalf("stacked manifest Base = %q", manifest.Repos[0].Base)
+	}
+
+	// Drift tracks space A's branch: another commit in A puts B one behind.
+	if ahead, behind, err := client.AheadBehind(ctx, worktreeB, manifest.Repos[0].Base); err != nil || ahead != 0 || behind != 0 {
+		t.Fatalf("fresh stack drift = %d/%d, %v", ahead, behind, err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreeA, "layer2.txt"), []byte("layer two\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	startGit(t, worktreeA, "add", "layer2.txt")
+	startGit(t, worktreeA, "commit", "-m", "layer two")
+	if ahead, behind, err := client.AheadBehind(ctx, worktreeB, manifest.Repos[0].Base); err != nil || ahead != 0 || behind != 1 {
+		t.Fatalf("post-commit drift = %d/%d, %v; want 0 ahead, 1 behind", ahead, behind, err)
+	}
+
+	// Stacking on a space that has no branch for the repo fails cleanly.
+	err = svc.Create(ctx, CreateOptions{ID: "space-c", Edits: []RepoSpec{{Name: "repo-a", Ref: "space:ghost"}}})
+	if err == nil || !strings.Contains(err.Error(), `space "ghost" has no branch "stave/ghost/repo-a"`) {
+		t.Fatalf("Create(missing stack target) error = %v", err)
+	}
+}
+
 func startGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)

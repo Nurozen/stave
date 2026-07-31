@@ -367,6 +367,10 @@ func ValidateName(label, name string) error {
 	return nil
 }
 
+// ValidateSpaceID is the seam for any future multi-segment space addressing;
+// today it matches ValidateName exactly.
+func ValidateSpaceID(id string) error { return ValidateName("space id", id) }
+
 func ValidateGitURL(raw string) error {
 	if raw == "" {
 		return errors.New("git URL is required")
