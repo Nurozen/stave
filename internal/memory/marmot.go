@@ -460,6 +460,7 @@ func (m *Marmot) Attach(ctx context.Context, opts AttachOptions) (AttachResult, 
 			result.DryRunCommands = append(result.DryRunCommands, linkLine)
 			printf(opts.Out, "dry-run: %s\n", linkLine)
 		}
+		printf(opts.Out, "dry-run: set watch_sources: false in den vault config (under MARMOT_HOME; keeps the den agent-authored)\n")
 		printf(opts.Out, "dry-run: write space-local MCP config (den: %s)\n", storeID)
 		printf(opts.Out, "dry-run: write memory attachment (marmot: %s, owned) to .stave.yaml\n", storeID)
 		return result, nil
@@ -534,11 +535,88 @@ func (m *Marmot) Attach(ctx context.Context, opts AttachOptions) (AttachResult, 
 			}
 		}
 	}
+	// Owned dens are agent-authored: disable serve-driven source watching in
+	// the den vault config BEFORE the MCP config lands (marmot reads the
+	// vault config at each serve start, so no serve can race ahead of this
+	// write once .mcp.json exists).
+	if err := disableDenSourceWatch(result.StorePath); err != nil {
+		return result, fmt.Errorf("set watch_sources: false in den vault config: %w", err)
+	}
 	if err := WriteSpaceMCPConfig(opts.SpacePath, path, result.StoreID); err != nil {
 		return result, fmt.Errorf("write space-local MCP config: %w", err)
 	}
 	result.MCPConfigWritten = true
 	return result, nil
+}
+
+// disableDenSourceWatch writes `watch_sources: false` into the YAML
+// frontmatter of <denPath>/vault/_config.md so marmot serve never starts
+// source-tree watching for a stave-created den (stave-owned dens are
+// agent-authored; the space workdir is not a source tree to index). It is
+// unconditional for owned creates — there is no stave config knob — and is
+// NEVER passed via den-create argv (marmot rejects unknown flags, and the S2
+// argv must stay byte-stable).
+//
+// Tolerances:
+//   - vault/_config.md absent (--no-vault dens, old-binary stubs whose den
+//     path does not exist) → skip silently.
+//   - existing watch_sources key (any value) → left untouched.
+//   - present-but-unreadable/unparseable config → error, failing the attach
+//     pre-MCP (warn-and-continue would silently yield a source-watching den).
+//
+// Every existing frontmatter byte is preserved (vault_id is the den's
+// federation identity); the new line is inserted just before the closing
+// `---` delimiter and the file lands via atomic tmp+rename in the same dir.
+func disableDenSourceWatch(denPath string) error {
+	if denPath == "" {
+		return nil
+	}
+	configPath := filepath.Join(denPath, "vault", "_config.md")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	content := string(data)
+	// Opening delimiter: `---` alone on the first line, LF or CRLF (the closing
+	// scan below tolerates \r too — the two checks must stay symmetric).
+	headerLen := 0
+	switch {
+	case strings.HasPrefix(content, "---\n"):
+		headerLen = 4
+	case strings.HasPrefix(content, "---\r\n"):
+		headerLen = 5
+	default:
+		return fmt.Errorf("%s: no YAML frontmatter", configPath)
+	}
+	// Closing delimiter: the first LINE that is exactly `---` (a trailing \r
+	// tolerated for CRLF files). Scanning for the substring would mistake a
+	// frontmatter value that happens to start with dashes (`summary: --- draft`)
+	// for the delimiter and splice watch_sources into the middle of that value.
+	insertAt := -1
+	for offset := headerLen; offset < len(content); {
+		line, next := content[offset:], len(content)
+		if nl := strings.IndexByte(line, '\n'); nl >= 0 {
+			line, next = line[:nl], offset+nl+1
+		}
+		if strings.TrimRight(line, "\r") == "---" {
+			insertAt = offset
+			break
+		}
+		offset = next
+	}
+	if insertAt < 0 {
+		return fmt.Errorf("%s: unterminated YAML frontmatter", configPath)
+	}
+	for _, line := range strings.Split(content[4:insertAt], "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "watch_sources:") {
+			return nil // already set (any value) — never overwrite
+		}
+	}
+	updated := content[:insertAt] + "watch_sources: false\n" + content[insertAt:]
+	return writeFileAtomic(configPath, []byte(updated))
 }
 
 // denLinkCall is one planned `den link` pass-through invocation.
@@ -819,16 +897,33 @@ func (m *Marmot) Detach(ctx context.Context, opts DetachOptions) (DetachResult, 
 		result.DryRunCommands = append(result.DryRunCommands, pres.DryRunCommands...)
 		result.Warnings = append(result.Warnings, pres.Warnings...)
 		if perr != nil {
-			return result, perr
+			// den_not_found here is the destroy-retry crash window: the den is
+			// already gone and the service tolerates the refusal by splicing the
+			// attachment. The wiring strip below never runs on this path, so do
+			// it now — otherwise the space keeps an MCP config pointing at a den
+			// that no longer exists while the attachment record is removed.
+			// Best-effort: the attachment is going away either way, so a failed
+			// strip warns rather than masking the refusal the caller must see.
+			if IsDenNotFound(perr) && !opts.DryRun {
+				if _, werr := m.applyDetachSpaceWiring(opts); werr != nil {
+					warn := fmt.Sprintf("space MCP wiring still points at vanished den %s (cleanup failed: %v)", opts.StoreID, werr)
+					result.Warnings = append(result.Warnings, warn)
+					printf(opts.Out, "warning: %s\n", warn)
+				}
+			}
+			// Pre-destroy: nothing touched the den, so callers may safely
+			// restore any wiring they stripped ahead of this call.
+			return result, &DestroyNotIssuedError{Err: perr}
 		}
 		if !opts.DryRun {
 			PrintProposeOutcome(opts.Out, pres)
 		}
-		destroy := []string{"den", "destroy", opts.StoreID, "--json"}
-		if opts.Force {
-			destroy = []string{"den", "destroy", opts.StoreID, "--force", "--json"}
-		}
-		cmds = append(cmds, destroy)
+		// The destroy gets --force UNCONDITIONALLY (gated on the successful
+		// contribute+propose above): the fresh contribute commit would trip
+		// marmot's unpushed_edits refusal and wedge every retry. Safe by
+		// design — den destroy never deletes warren branches (edit branches
+		// always survive in the shared cache).
+		cmds = append(cmds, []string{"den", "destroy", opts.StoreID, "--force", "--json"})
 	case FateDestroy:
 		execDir = opts.SpacePath
 		destroy := []string{"den", "destroy", opts.StoreID, "--json"}
@@ -849,8 +944,32 @@ func (m *Marmot) Detach(ctx context.Context, opts DetachOptions) (DetachResult, 
 	// maps the space to exactly ONE den, so re-point it at a surviving den
 	// instead of leaving it dangling at the detached/destroyed one. route add
 	// upserts, so this is safe even when the route already targets a survivor.
+	// No route rm for destroying fates: marmot's destroy removes routes
+	// itself, so a stave route rm would double-remove.
 	if opts.RepointRouteStoreID != "" && opts.SpacePath != "" && opts.NewSpacePath == "" {
 		routeCmds = append(routeCmds, []string{"route", "add", "--project", opts.SpacePath, "--json", opts.RepointRouteStoreID})
+	}
+
+	// Destroying fates strip/re-point the space MCP wiring BEFORE issuing the
+	// destroy: a client started from the stale config could re-acquire the den
+	// mid-teardown. A failed strip/re-point is therefore a FATAL prerequisite,
+	// not a warning. (Keep fate updates wiring after its route commands, below,
+	// warn-tolerant as before — the den is untouched either way.)
+	destroying := fate == FateDestroy || fate == FateContribute
+	wiringChanged := false
+	if destroying {
+		if opts.DryRun {
+			renderDetachSpaceWiringPlan(opts, &result)
+		} else {
+			changed, err := m.applyDetachSpaceWiring(opts)
+			if err != nil {
+				// DestroyNotIssuedError, as the message says: the den is
+				// untouched, so callers that stripped their own wiring ahead of
+				// this call (saga member configs) must restore it.
+				return result, &DestroyNotIssuedError{Err: fmt.Errorf("space MCP wiring update failed; destroy of den %s not issued (a client could re-acquire it mid-teardown): %w", opts.StoreID, err)}
+			}
+			wiringChanged = changed
+		}
 	}
 
 	for _, args := range cmds {
@@ -862,10 +981,13 @@ func (m *Marmot) Detach(ctx context.Context, opts DetachOptions) (DetachResult, 
 		}
 		path, err := m.lookPath(bin)
 		if err != nil {
-			return result, &UnavailableError{Provider: "marmot", Err: err}
+			uerr := &UnavailableError{Provider: "marmot", Err: err}
+			m.restoreDetachSpaceWiring(opts, &result, wiringChanged, uerr)
+			return result, uerr
 		}
 		env, err := m.runJSON(ctx, path, args, execDir)
 		if err != nil {
+			m.restoreDetachSpaceWiring(opts, &result, wiringChanged, err)
 			return result, err
 		}
 		reportWarnings(opts.Out, &result.Warnings, env.Warnings)
@@ -888,40 +1010,21 @@ func (m *Marmot) Detach(ctx context.Context, opts DetachOptions) (DetachResult, 
 		}
 	}
 	if opts.DryRun {
-		// Archive path moves (NewSpacePath set) keep MCP configs with the
-		// space; only detaching the provider's LAST attachment strips them
-		// (KeepSpaceWiring means siblings remain and still need them).
-		if opts.SpacePath != "" && opts.NewSpacePath == "" {
-			switch {
-			case !opts.KeepSpaceWiring:
-				result.DryRunCommands = append(result.DryRunCommands, "remove space-local context-marmot MCP config")
-				printf(opts.Out, "dry-run: remove space-local context-marmot MCP config\n")
-			case opts.RepointRouteStoreID != "":
-				line := fmt.Sprintf("re-point space-local context-marmot MCP config at den %s", opts.RepointRouteStoreID)
-				result.DryRunCommands = append(result.DryRunCommands, line)
-				printf(opts.Out, "dry-run: %s\n", line)
-			}
+		// Keep fate renders the wiring plan after its route commands
+		// (destroying fates already rendered it before the destroy line).
+		if !destroying {
+			renderDetachSpaceWiringPlan(opts, &result)
 		}
 		return result, nil
 	}
-	// Strip generated MCP bindings when the PROVIDER is leaving the space
-	// (not when only rewriting reverse routes for archive, and not while
-	// sibling attachments still rely on them). When siblings remain, rewrite
-	// the config so `serve --den` targets a surviving den instead of the
-	// detached one.
-	if opts.SpacePath != "" && opts.NewSpacePath == "" {
-		switch {
-		case !opts.KeepSpaceWiring:
-			if err := RemoveSpaceMCPConfig(opts.SpacePath); err != nil {
-				result.Warnings = append(result.Warnings, fmt.Sprintf("mcp cleanup: %v", err))
-			}
-		case opts.RepointRouteStoreID != "":
-			if err := WriteSpaceMCPConfig(opts.SpacePath, bin, opts.RepointRouteStoreID); err != nil {
-				result.Warnings = append(result.Warnings, fmt.Sprintf("mcp re-point: %v", err))
-			}
+	// Keep fate updates the wiring post-loop, warn-tolerant (the den is
+	// untouched; destroying fates handled wiring before the destroy above).
+	if !destroying {
+		if _, err := m.applyDetachSpaceWiring(opts); err != nil {
+			result.Warnings = append(result.Warnings, err.Error())
 		}
 	}
-	if fate == FateDestroy || fate == FateContribute {
+	if destroying {
 		result.Destroyed = true
 		result.Kept = false
 		result.Summary = fmt.Sprintf("destroyed den %s", opts.StoreID)
@@ -930,6 +1033,74 @@ func (m *Marmot) Detach(ctx context.Context, opts DetachOptions) (DetachResult, 
 		printf(opts.Out, "%s\n", result.Summary)
 	}
 	return result, nil
+}
+
+// renderDetachSpaceWiringPlan is the dry-run mirror of
+// applyDetachSpaceWiring: it prints/records the wiring change without touching
+// anything. Archive path moves (NewSpacePath set) keep MCP configs with the
+// space; only detaching the provider's LAST attachment strips them
+// (KeepSpaceWiring means siblings remain and still need them).
+func renderDetachSpaceWiringPlan(opts DetachOptions, result *DetachResult) {
+	if opts.SpacePath == "" || opts.NewSpacePath != "" {
+		return
+	}
+	switch {
+	case !opts.KeepSpaceWiring:
+		result.DryRunCommands = append(result.DryRunCommands, "remove space-local context-marmot MCP config")
+		printf(opts.Out, "dry-run: remove space-local context-marmot MCP config\n")
+	case opts.RepointRouteStoreID != "":
+		line := fmt.Sprintf("re-point space-local context-marmot MCP config at den %s", opts.RepointRouteStoreID)
+		result.DryRunCommands = append(result.DryRunCommands, line)
+		printf(opts.Out, "dry-run: %s\n", line)
+	}
+}
+
+// applyDetachSpaceWiring strips the generated MCP bindings when the PROVIDER
+// is leaving the space (not when only rewriting reverse routes for archive,
+// and not while sibling attachments still rely on them). When siblings remain,
+// it rewrites the config so `serve --den` targets a surviving den instead of
+// the detached one. Reports whether anything was rewritten; callers decide
+// fatality (fatal before a destroy, warn-only on keep).
+//
+// The reported "changed" is the intent, not a diff: a strip of configs that
+// were already absent still reports true, so a later restore can recreate MCP
+// configs for a space that had none. Accepted — attach always writes them, so
+// their absence is abnormal and a restored config points at the surviving den
+// either way.
+func (m *Marmot) applyDetachSpaceWiring(opts DetachOptions) (bool, error) {
+	if opts.SpacePath == "" || opts.NewSpacePath != "" {
+		return false, nil
+	}
+	switch {
+	case !opts.KeepSpaceWiring:
+		if err := RemoveSpaceMCPConfig(opts.SpacePath); err != nil {
+			return false, fmt.Errorf("mcp cleanup: %w", err)
+		}
+		return true, nil
+	case opts.RepointRouteStoreID != "":
+		if err := WriteSpaceMCPConfig(opts.SpacePath, m.binary(), opts.RepointRouteStoreID); err != nil {
+			return false, fmt.Errorf("mcp re-point: %w", err)
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+// restoreDetachSpaceWiring re-points the space MCP configs back at the
+// still-alive den after a destroy failed WITHOUT destroying it. It is scoped
+// to structured refusals known to leave the den intact
+// (DenIntactAfterFailedDestroy): restoring after an ambiguous failure could
+// rewire clients at a destroyed den — marmot destroys BEFORE serializing
+// success, so a decode/schema error may mean the den is already gone.
+func (m *Marmot) restoreDetachSpaceWiring(opts DetachOptions, result *DetachResult, wiringChanged bool, cause error) {
+	if !wiringChanged || !DenIntactAfterFailedDestroy(cause) {
+		return
+	}
+	if err := WriteSpaceMCPConfig(opts.SpacePath, m.binary(), opts.StoreID); err != nil {
+		warn := fmt.Sprintf("memory wiring for this space was removed; re-run the destroy, or re-attach to restore it (restore failed: %v)", err)
+		result.Warnings = append(result.Warnings, warn)
+		printf(opts.Out, "warning: %s\n", warn)
+	}
 }
 
 // JSON envelope types (schema 1) — negotiate on Schema field.

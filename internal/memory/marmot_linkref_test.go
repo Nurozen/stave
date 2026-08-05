@@ -276,3 +276,21 @@ func TestDetachDestroyPrintsEnvelopeWarnings(t *testing.T) {
 		t.Fatalf("output missing warning line:\n%s", out.String())
 	}
 }
+
+// P1: a den-held-by-live-process destroy refusal surfaces as a RefusalError
+// with the source_in_use code (IsSourceInUse true) — never a raw exec error.
+func TestDetachDestroySourceInUseRefusal(t *testing.T) {
+	bin := writeFakeMarmot(t, map[string]fakeResp{
+		"den destroy": {Stdout: `{"schema":1,"error":{"code":"source_in_use","message":"cannot lock den \"sp\" lifecycle for destruction","hint":"retry after other den operations finish"}}`, Code: 1},
+	})
+	_, err := NewMarmot(bin).Detach(context.Background(), DetachOptions{
+		StoreID: "sp", Fate: FateDestroy, Owned: true,
+	})
+	var refusal *RefusalError
+	if !errors.As(err, &refusal) || refusal.Code != CodeSourceInUse {
+		t.Fatalf("err = %v", err)
+	}
+	if !IsSourceInUse(err) {
+		t.Fatalf("IsSourceInUse must classify: %v", err)
+	}
+}

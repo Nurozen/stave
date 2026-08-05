@@ -54,15 +54,19 @@ same den id twice) reject the batch with nothing attached.
 
 1. Capability probe (`marmot` version / den create help).
 2. `marmot den create <store-id> --lifetime task --project <abs-space-path> --no-pointer [--ref …]… --json`
-3. Register reverse route: space path → den id in `$MARMOT_HOME/routes.yml`.
-4. Write space-local MCP (never `.marmot-vault`):
+3. Set `watch_sources: false` in the new den's vault `_config.md` (owned
+   creates only, before any MCP config lands; see
+   [Source watching](#source-watching-stave-owned-dens)).
+4. Register reverse route: space path → den id in `$MARMOT_HOME/routes.yml`.
+5. Write space-local MCP (never `.marmot-vault`):
    - `.mcp.json` / `.cursor/mcp.json` — `mcpServers.context-marmot`
    - `.vscode/mcp.json` — `servers.context-marmot`
    - `.codex/config.toml` — `[mcp_servers.context-marmot]` (+ `.env` for `MARMOT_HOME`)
-5. Record attachment in `.stave.yaml` and refresh `AGENTS.md`.
+6. Record attachment in `.stave.yaml` and refresh `AGENTS.md`.
 
-Attach-existing (`--use <den-id>` / `--memory marmot:<den-id>`) skips step 2
-(no den create) but still verifies the den, registers the reverse route
+Attach-existing (`--use <den-id>` / `--memory marmot:<den-id>`) skips steps
+2–3 (no den create, and a reused den's vault config is never touched) but
+still verifies the den, registers the reverse route
 (`marmot route add --project <space-path> --json <den-id>`), and writes the
 MCP configs. The route table maps one path to one id, so with multiple
 attachments the space's reverse route follows the most recently attached den.
@@ -182,19 +186,93 @@ concurrency to manage, not Stave's, and it was already possible with
 `memory attach --use <den-id>` — but sagas make it the default topology rather
 than the exception.
 
+The flip side at teardown: a den-destroying `saga destroy` destroys the saga
+den *first*, so **every member's live serve blocks it** with `source_in_use`
+(not `--force`-bypassable) and the whole saga stays intact — see
+[saga.md](saga.md#saga-aware-lifecycle-saga-archive-and-saga-destroy).
+
+### Source watching (stave-owned dens)
+
+Owned creates write `watch_sources: false` into the den vault's `_config.md`
+frontmatter (all existing keys preserved — `vault_id` is federation identity)
+so `marmot serve` never auto-indexes the space workdir into the den:
+stave-created dens are agent-authored. Scope and limits:
+
+- The opt-out governs **serve-driven source indexing only**. It does NOT
+  avoid the `source_in_use` destroy refusal — the serve owner holds the
+  watch lock regardless of the key.
+- Dens created before this write keep any residual source nodes (harmless;
+  retroactive cleanup is out of scope).
+- A standalone `marmot watch` process ignores the key.
+- The write is best-effort only for **absent** vaults: no `vault/_config.md`
+  (`--no-vault` dens, old binaries) = silent skip, while a
+  present-but-unwritable/unparseable config fails the attach cleanly before
+  any MCP config is written.
+
 ## Detach and cleanup
 
 | Fate | Den | Reverse route | MCP configs |
 |------|-----|---------------|-------------|
 | `--keep` (default) | Retained | Removed | **Stripped** (`context-marmot` only) |
-| `--destroy` | Destroyed | Removed with den | **Stripped** |
+| `--destroy` | Destroyed | Removed with den | **Stripped before the destroy** |
+| `--contribute` | Contribute + propose, then destroyed (destroy runs with `--force` by design) | Removed with den | **Stripped before the destroy** |
 | Archive space | Kept (fate keep) | `route set-project --from old --to .archive/…` | **Preserved** with the moved space |
 
 MCP cleanup preserves unrelated servers in the same JSON/TOML files. Reattach
 rewrites the Codex section so a new den id is not left pointing at a stale table.
 
+Destroying fates strip (or re-point, when sibling attachments remain) the
+space MCP wiring **before** issuing `den destroy`, so no client started from a
+stale config can re-acquire the den mid-teardown; a failed strip aborts the
+destroy. Marmot refuses the destroy with `source_in_use` while any
+`serve --den` against the den is live — `--force` included — and the refusal
+leaves the space intact: stave restores the wiring so the space keeps working
+and the destroy can simply be re-run. The same restore applies to
+`unpushed_edits` / `unpushed_unknown` refusals; ambiguous failures (including
+`den_not_found`) never restore, since the den may already be gone.
+
+The contribute fate passes `--force` to its destroy step by design, and the
+waiver is wider than the fresh contribute commit: it waives the
+`unpushed_edits` refusal for **unpushed work in every one of the den's edit
+worktrees**, and the `unpushed_unknown` refusal too — the case where the git
+state is degraded enough that marmot cannot verify whether anything is
+unpushed. Without it the contribute commit alone would trip the refusal on
+every retry. This is safe because den destroy never deletes warren branches:
+every edit branch survives in the shared warren cache, so the waiver only
+skips a preflight check and never discards published history. `--destroy`'s
+`--force` stays user-controlled.
+
 Owned attachments only are destroyed; unowned (`--use` existing den) force
 `fate=keep` with a notice.
+
+### Destroy retries converge
+
+A destroying-fate teardown (`space destroy --memory destroy|contribute`, and
+`memory detach --destroy`) records each attachment's outcome durably as it
+goes: after every successful destroy the attachment is spliced out of
+`.stave.yaml` and `AGENTS.md` is rewritten in the same step, so the space
+never keeps advertising a den that no longer exists. If a later attachment
+refuses (e.g. `source_in_use`), the mid-retry state is well-defined:
+
+- the manifest lists **only the unprocessed attachments** — already-destroyed
+  dens are gone from both `.stave.yaml` and `AGENTS.md`;
+- the refusing attachment's space MCP wiring is **restored**, so the space
+  keeps working while you close the holder;
+- remediation is simply to **re-run the same command**: processed attachments
+  are never re-destroyed or re-contributed, so retries converge instead of
+  wedging.
+
+Because the manifest is spliced as teardown goes, `stave space status` reflects
+exactly what remains: after a partial or failed destroy its output is an
+accurate picture of the residue — which attachments are still attached and
+which dens are still present — so the operator can re-run the destroy and watch
+it converge.
+
+A `den_not_found` refusal from the provider is treated as part of the same
+convergence: for the destroy fate the den is already gone, so the record is
+spliced with a notice and teardown continues. For the contribute fate stave
+cannot know whether the vanished den's content was ever contributed — the
+notice says exactly that (the record is still spliced so retries converge).
 
 ## Propose output
 
@@ -233,6 +311,11 @@ archive plan without invoking anything.
 - Marmot missing from `PATH` → provider unavailable; attach exits non-zero; manifest unchanged.
 - Den id already exists → structured `den_create_failed`; attach aborts.
 - Project path already owned by another den → marmot refuses create (no silent route steal).
+- Den held by a live process on destroy/detach → structured `source_in_use`; the space
+  and manifest stay untouched. Remediation: close agent sessions using this space's
+  memory — or any space sharing its den (saga members do) — and other marmot processes
+  (`marmot serve --den`, watch/index), then retry. `--force` does **not** bypass this
+  (it covers only `unpushed_edits`/`unpushed_unknown`).
 
 ## Related
 

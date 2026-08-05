@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/Nurozen/stave/internal/config"
 )
 
@@ -182,10 +184,31 @@ func TestDenCreateArgsRefsAndLinks(t *testing.T) {
 	}
 }
 
+// denVaultFrontmatter is a realistic marmot-generated vault _config.md:
+// vault_id is the den's federation identity and must survive byte-for-byte.
+const denVaultFrontmatter = "---\nversion: \"1\"\nvault_id: demo-space-vault\nnamespace: default\nembedding_provider: mock\nembedding_model: test-model\n---\nBody notes stay put.\n"
+
+// writeDenVaultFixture creates <denPath>/vault/_config.md with the given
+// content and returns the config path.
+func writeDenVaultFixture(t *testing.T, denPath, content string) string {
+	t.Helper()
+	vaultDir := filepath.Join(denPath, "vault")
+	if err := os.MkdirAll(vaultDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(vaultDir, "_config.md")
+	if err := os.WriteFile(configPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return configPath
+}
+
 func TestAttachCreateSuccess(t *testing.T) {
 	env := okEnv("demo-space")
+	denPath := t.TempDir()
+	configPath := writeDenVaultFixture(t, denPath, denVaultFrontmatter)
 	// pointer_written true path also covered via second call if needed — use true once.
-	envPtr := `{"schema":1,"den_id":"demo-space","den_path":"/tmp/dens/demo-space","pointer_written":true,"warnings":["w1"]}`
+	envPtr := fmt.Sprintf(`{"schema":1,"den_id":"demo-space","den_path":%q,"pointer_written":true,"warnings":["w1"]}`, denPath)
 	bin := writeFakeMarmot(t, map[string]fakeResp{
 		"den create": {Stdout: envPtr, Code: 0},
 	})
@@ -222,7 +245,52 @@ func TestAttachCreateSuccess(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, ".marmot-vault")); !os.IsNotExist(err) {
 		t.Fatal(".marmot-vault must not exist")
 	}
+	// Owned create disables serve-driven source watching in the den vault
+	// config: key added, every original frontmatter byte preserved, still
+	// valid YAML.
+	got, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertWatchSourcesOff(t, string(got), denVaultFrontmatter)
 	_ = env
+}
+
+// assertWatchSourcesOff checks a rewritten vault _config.md: watch_sources
+// false was inserted inside the frontmatter, all original lines survive
+// byte-for-byte, and the frontmatter still parses as YAML.
+//
+// The closing delimiter is located independently of the production scan — as
+// the LAST `---\n` in the original, not the first — so fixtures whose values
+// contain `---` substrings are still checked against the real delimiter.
+func assertWatchSourcesOff(t *testing.T, got, original string) {
+	t.Helper()
+	const inserted = "watch_sources: false\n"
+	if !strings.Contains(got, "\n"+inserted) {
+		t.Fatalf("watch_sources: false missing:\n%s", got)
+	}
+	idx := strings.LastIndex(original, "---\n")
+	want := original[:idx] + inserted + original[idx:]
+	if got != want {
+		t.Fatalf("original bytes not preserved:\ngot:\n%s\nwant:\n%s", got, want)
+	}
+	closeAt := idx + len(inserted)
+	if !strings.HasPrefix(got, "---\n") || !strings.HasPrefix(got[closeAt:], "---\n") {
+		t.Fatalf("frontmatter delimiters lost:\n%s", got)
+	}
+	fm := got[len("---\n"):closeAt]
+	var parsed map[string]any
+	if err := yaml.Unmarshal([]byte(fm), &parsed); err != nil {
+		t.Fatalf("frontmatter no longer valid YAML: %v\n%s", err, fm)
+	}
+	if v, isBool := parsed["watch_sources"].(bool); !isBool || v {
+		t.Fatalf("watch_sources = %#v, want false", parsed["watch_sources"])
+	}
+	for _, key := range []string{"vault_id", "version", "namespace", "embedding_provider", "embedding_model"} {
+		if _, present := parsed[key]; !present {
+			t.Fatalf("original key %q lost: %#v", key, parsed)
+		}
+	}
 }
 
 func TestAttachUseIDExisting(t *testing.T) {
@@ -320,6 +388,11 @@ func TestAttachUseIDDryRun(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "route add") || !strings.Contains(buf.String(), "--project") {
 		t.Fatalf("dry-run must plan reverse-route registration: %s", buf.String())
+	}
+	// watch_sources is owned-create-only: attach-existing reuses a den whose
+	// vault config stave must not touch.
+	if strings.Contains(buf.String(), "watch_sources") {
+		t.Fatalf("attach-existing dry-run must not plan a watch_sources write: %s", buf.String())
 	}
 }
 
@@ -722,6 +795,21 @@ func TestDetachDestroyAndContribute(t *testing.T) {
 	last := res.DryRunCommands[2]
 	if !strings.Contains(last, "--force") {
 		t.Fatalf("destroy line = %q", last)
+	}
+
+	// contribute fate WITHOUT Force still carries --force on the destroy —
+	// unconditional by design: the fresh contribute commit would otherwise
+	// trip marmot's unpushed_edits refusal and wedge every retry (destroy
+	// never deletes warren branches).
+	res, err = m.Detach(context.Background(), DetachOptions{
+		StoreID: "d5", Fate: FateContribute, Owned: true, Force: false, DryRun: true,
+	})
+	if err != nil || len(res.DryRunCommands) != 3 {
+		t.Fatalf("%#v %v", res, err)
+	}
+	last = res.DryRunCommands[2]
+	if !strings.Contains(last, "den destroy") || !strings.Contains(last, "--force") {
+		t.Fatalf("contribute destroy must always carry --force: %q", last)
 	}
 }
 
@@ -1202,16 +1290,29 @@ func TestDetachKeepSpaceWiringRepointsRouteAndMCP(t *testing.T) {
 
 func TestDetachDestroyOneOfManyRepointsRoute(t *testing.T) {
 	// Destroying one-of-many must still re-point route + MCP at a survivor
-	// (the destroyed den would otherwise leave both dangling).
+	// (the destroyed den would otherwise leave both dangling) — and the MCP
+	// re-point happens BEFORE the destroy is issued, so no client can
+	// re-acquire the dying den from a stale config mid-teardown.
 	dir := t.TempDir()
 	if err := WriteSpaceMCPConfig(dir, "marmot", "den-a"); err != nil {
 		t.Fatal(err)
 	}
-	bin := writeFakeMarmot(t, map[string]fakeResp{
-		"den destroy": {Stdout: `{"schema":1,"destroyed":true}`, Code: 0},
-		"route add":   {Stdout: `{"schema":1}`, Code: 0},
-	})
-	m := NewMarmot(bin)
+	mcpAtDestroy := ""
+	m := &Marmot{
+		Binary:   "marmot",
+		LookPath: func(string) (string, error) { return "marmot", nil },
+		Command: func(ctx context.Context, name string, args ...string) *exec.Cmd {
+			if strings.Contains(strings.Join(args, " "), "den destroy") {
+				raw, rerr := os.ReadFile(filepath.Join(dir, ".mcp.json"))
+				if rerr != nil {
+					t.Errorf("read .mcp.json at destroy time: %v", rerr)
+				}
+				mcpAtDestroy = string(raw)
+				return exec.CommandContext(ctx, "sh", "-c", `printf '%s' '{"schema":1,"destroyed":true}'`)
+			}
+			return exec.CommandContext(ctx, "sh", "-c", `printf '%s' '{"schema":1}'`)
+		},
+	}
 	res, err := m.Detach(context.Background(), DetachOptions{
 		StoreID:             "den-a",
 		SpacePath:           dir,
@@ -1222,6 +1323,9 @@ func TestDetachDestroyOneOfManyRepointsRoute(t *testing.T) {
 	})
 	if err != nil || !res.Destroyed {
 		t.Fatalf("%#v %v", res, err)
+	}
+	if !strings.Contains(mcpAtDestroy, "den-b") || strings.Contains(mcpAtDestroy, "den-a") {
+		t.Fatalf(".mcp.json must already target den-b when destroy runs: %s", mcpAtDestroy)
 	}
 	raw, err := os.ReadFile(filepath.Join(dir, ".mcp.json"))
 	if err != nil {

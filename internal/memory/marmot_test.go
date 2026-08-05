@@ -65,6 +65,9 @@ func TestAttachDryRunDoesNotInvokeBinary(t *testing.T) {
 	if !strings.Contains(buf.String(), "dry-run:") {
 		t.Fatalf("stdout missing dry-run: %s", buf.String())
 	}
+	if !strings.Contains(buf.String(), "dry-run: set watch_sources: false in den vault config (under MARMOT_HOME; keeps the den agent-authored)") {
+		t.Fatalf("owned-create dry-run must plan the watch_sources write: %s", buf.String())
+	}
 	if res.Owned != true {
 		t.Fatal("fresh create should be owned")
 	}

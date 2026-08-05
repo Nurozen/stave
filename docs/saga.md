@@ -263,8 +263,28 @@ destroy refuses and names the sharer, because destroying the den would strand
 that attachment (`--force` overrides; unreadable sibling manifests fail
 closed).
 
-`--dry-run` prints the ordered plan — each member step with its skip/report
-disposition, then the saga space — without changing state.
+For a den-destroying fate the **saga den is destroyed first**, before any
+member teardown. Marmot refuses the destroy with `source_in_use` while any
+live agent session serves the den — and since every member's MCP config points
+at the saga den, *any member's* live serve blocks it (see
+[memory.md](memory.md#concurrent-serve)) — so the refusal fails the operation
+with the **whole saga intact**: no member torn down, the attachment record
+kept, and the members' saga-den MCP wiring (stripped just before the destroy
+so no stale client can re-acquire the den mid-teardown) restored. `--force`
+skips stave's own guards above — dirty worktrees, external dependents, the
+den-refcount guard — but **marmot's refusal is not force-bypassable**: a
+`--force` run still fails fast before any member teardown. Close the live
+sessions and re-run; a successful den destroy records itself in the saga
+manifest, so retries never re-destroy it. The same member-wiring strip/restore
+applies to `stave memory detach <saga-id> --destroy`, which destroys the same
+den outside the saga walk.
+
+`--dry-run` prints the ordered plan — for a den-destroying fate the den-destroy
+step first, then each member step with its skip/report disposition, then the
+saga space — without changing state, followed by the provider's real dry-run
+command lines for the den. One caveat: a destroying-fate dry-run **cannot
+predict a live-serve refusal** — marmot's dry-run returns before lock
+acquisition, while the real run fails fast before any member teardown.
 
 ## The agent planner and sagas
 

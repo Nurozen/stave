@@ -1227,6 +1227,46 @@ func TestApplyMemoryFateProviderError(t *testing.T) {
 	}
 }
 
+func TestApplyMemoryFateSourceInUse(t *testing.T) {
+	svc, _, _ := testService(t)
+	fake := &memory.Fake{
+		DetachFn: func(ctx context.Context, opts memory.DetachOptions) (memory.DetachResult, error) {
+			return memory.DetachResult{}, &memory.RefusalError{Provider: "fake", Code: memory.CodeSourceInUse, Message: "den busy", Hint: "stop serving processes"}
+		},
+	}
+	svc.Memory = fake
+	if err := svc.InitSpace(context.Background(), InitOptions{ID: "held"}); err != nil {
+		t.Fatal(err)
+	}
+	spacePath := svc.SpacePath("held")
+	manifest, _ := LoadManifest(spacePath)
+	manifest.Memories = []MemoryManifest{{Name: "default", Provider: "fake", ID: "held-den", Owned: true}}
+	if err := SaveManifest(spacePath, manifest); err != nil {
+		t.Fatal(err)
+	}
+	err := svc.Destroy(context.Background(), DestroyOptions{SpaceID: "held", MemoryFate: memory.FateDestroy, Force: true})
+	if err == nil {
+		t.Fatal("expected source_in_use error")
+	}
+	for _, want := range []string{`space "held"`, "close agent sessions", memory.CodeSourceInUse} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q missing %q", err.Error(), want)
+		}
+	}
+	var inUse *MemoryInUseError
+	if !errors.As(err, &inUse) || inUse.SpaceID != "held" {
+		t.Fatalf("expected MemoryInUseError: %v", err)
+	}
+	var refusal *memory.RefusalError
+	if !errors.As(err, &refusal) || refusal.Code != memory.CodeSourceInUse {
+		t.Fatalf("RefusalError must stay unwrappable: %v", err)
+	}
+	// Space untouched: the memory-fate step aborts before worktree removal.
+	if _, statErr := os.Stat(spacePath); statErr != nil {
+		t.Fatalf("space must remain: %v", statErr)
+	}
+}
+
 func TestArchiveDryRunWithMemory(t *testing.T) {
 	svc, _, _ := testService(t)
 	fake := &memory.Fake{}
@@ -1292,6 +1332,42 @@ func TestDetachMemoryProviderError(t *testing.T) {
 	}
 	if err := svc.DetachMemory(context.Background(), "derr", "default", memory.FateDestroy, true, false); err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+func TestDetachMemorySourceInUse(t *testing.T) {
+	svc, _, _ := testService(t)
+	svc.Memory = &memory.Fake{
+		DetachFn: func(ctx context.Context, opts memory.DetachOptions) (memory.DetachResult, error) {
+			return memory.DetachResult{}, &memory.RefusalError{Provider: "fake", Code: memory.CodeSourceInUse, Message: "den busy"}
+		},
+	}
+	if err := svc.InitSpace(context.Background(), InitOptions{ID: "diu"}); err != nil {
+		t.Fatal(err)
+	}
+	spacePath := svc.SpacePath("diu")
+	manifest, _ := LoadManifest(spacePath)
+	manifest.Memories = []MemoryManifest{{Name: "default", Provider: "fake", ID: "diu-den", Owned: true}}
+	if err := SaveManifest(spacePath, manifest); err != nil {
+		t.Fatal(err)
+	}
+	err := svc.DetachMemory(context.Background(), "diu", "default", memory.FateDestroy, true, false)
+	if err == nil {
+		t.Fatal("expected source_in_use error")
+	}
+	for _, want := range []string{`space "diu"`, "close agent sessions", memory.CodeSourceInUse} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q missing %q", err.Error(), want)
+		}
+	}
+	var refusal *memory.RefusalError
+	if !errors.As(err, &refusal) || refusal.Code != memory.CodeSourceInUse {
+		t.Fatalf("RefusalError must stay unwrappable: %v", err)
+	}
+	// Attachment survives: the manifest still lists the memory.
+	manifest, _ = LoadManifest(spacePath)
+	if len(manifest.Memories) != 1 {
+		t.Fatalf("manifest memories changed: %#v", manifest.Memories)
 	}
 }
 

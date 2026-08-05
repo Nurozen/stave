@@ -5,6 +5,7 @@ package memory
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -342,10 +343,14 @@ type DetachOptions struct {
 	// surviving attachment.
 	RepointRouteStoreID string
 	Fate                MemoryFate
-	Force               bool
-	Owned               bool // caller must pass attachment.Owned; false never destroys
-	DryRun              bool
-	Out                 io.Writer
+	// Force acknowledges destroy refusals about un-published work
+	// (marmot: unpushed_edits / unpushed_unknown). It does NOT bypass
+	// source_in_use — a den held by a live process refuses destruction
+	// regardless of --force; the holder must be closed first.
+	Force  bool
+	Owned  bool // caller must pass attachment.Owned; false never destroys
+	DryRun bool
+	Out    io.Writer
 }
 
 type DetachResult struct {
@@ -408,6 +413,91 @@ func (e *RefusalError) Error() string {
 		msg += " (" + e.Hint + ")"
 	}
 	return msg
+}
+
+// CodeSourceInUse is marmot's destroy refusal for a den held by a live
+// process (agent session over MCP, `marmot serve --den`, watch/index).
+// Unlike unpushed_edits / unpushed_unknown it is NOT force-bypassable:
+// the holder must go away before the den can be destroyed.
+const CodeSourceInUse = "source_in_use"
+
+// IsSourceInUse reports whether err carries a provider RefusalError with
+// the source_in_use code (den held by a live process; --force never helps).
+func IsSourceInUse(err error) bool {
+	var refusal *RefusalError
+	return errors.As(err, &refusal) && refusal.Code == CodeSourceInUse
+}
+
+// CodeDenNotFound is marmot's refusal code for a den that does not exist.
+// Both `den destroy` and `den contribute` return it, which is how the
+// destroy-retry crash window presents (den destroyed, manifest save lost):
+// destroying-fate teardowns treat it as already-done so retries converge.
+const CodeDenNotFound = "den_not_found"
+
+// IsDenNotFound reports whether err carries a provider RefusalError with the
+// den_not_found code (the den named by the caller does not exist).
+func IsDenNotFound(err error) bool {
+	var refusal *RefusalError
+	return errors.As(err, &refusal) && refusal.Code == CodeDenNotFound
+}
+
+// CodeUnpushedEdits / CodeUnpushedUnknown are marmot's destroy refusals for
+// un-published work (unpushed edit-branch commits / a git state it cannot
+// verify). Unlike source_in_use, both are waived by --force — safe because
+// den destroy never deletes warren branches.
+const (
+	CodeUnpushedEdits   = "unpushed_edits"
+	CodeUnpushedUnknown = "unpushed_unknown"
+)
+
+// DestroyNotIssuedError wraps a destroying-fate failure raised BEFORE the
+// `den destroy` command was issued — the contribute/propose stage refused, or
+// the pre-destroy space-wiring strip failed. No destroy ran, so the den is
+// intact by construction rather than by inference from a refusal code, which
+// is what DenIntactAfterFailedDestroy needs to authorize a wiring restore.
+// Error and Unwrap are transparent: the wrapped message is unchanged and
+// errors.Is/As on the cause keep matching through the wrapper.
+type DestroyNotIssuedError struct{ Err error }
+
+func (e *DestroyNotIssuedError) Error() string { return e.Err.Error() }
+
+func (e *DestroyNotIssuedError) Unwrap() error { return e.Err }
+
+// DenIntactAfterFailedDestroy reports whether a failed destroying-fate detach
+// is KNOWN to have left the den intact: failures raised before the destroy was
+// ever issued (DestroyNotIssuedError), marmot's structured refusals that are
+// pre-destroy preflights or lease holds (source_in_use, unpushed_edits,
+// unpushed_unknown) plus a missing provider binary (UnavailableError —
+// nothing ran). den_not_found, envelope decode/schema errors and ambiguous
+// process failures never qualify — marmot destroys the den BEFORE serializing
+// success, so those may follow a completed destroy. Callers use it to scope
+// wiring restores (space MCP configs, saga member re-wires) to failures where
+// pointing clients back at the den is safe.
+func DenIntactAfterFailedDestroy(err error) bool {
+	// den_not_found is decided first and negatively: the den is already gone,
+	// so it disqualifies even when it surfaced from a pre-destroy stage (a
+	// contribute that refused because the den had vanished is wrapped in
+	// DestroyNotIssuedError like any other pre-destroy failure).
+	if IsDenNotFound(err) {
+		return false
+	}
+	var notIssued *DestroyNotIssuedError
+	if errors.As(err, &notIssued) {
+		return true
+	}
+	var unavailable *UnavailableError
+	if errors.As(err, &unavailable) {
+		return true
+	}
+	var refusal *RefusalError
+	if !errors.As(err, &refusal) {
+		return false
+	}
+	switch refusal.Code {
+	case CodeSourceInUse, CodeUnpushedEdits, CodeUnpushedUnknown:
+		return true
+	}
+	return false
 }
 
 func printf(w io.Writer, format string, args ...any) {

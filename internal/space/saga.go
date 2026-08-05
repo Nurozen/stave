@@ -612,6 +612,16 @@ func (s Service) sagaTeardownLocked(ctx context.Context, sagaID, sagaPath string
 	// down LAST) would otherwise only refuse mid-walk, after later members are
 	// already gone. The in-walk check inside Archive/Destroy stays as defense
 	// in depth.
+	//
+	// The SAGA SPACE's own two guards are deliberately not hoisted; they run
+	// only when Archive/Destroy reaches it at the final step, and that is safe
+	// for both. Dirty edits: a saga space is a coordination shell holding no
+	// edit worktrees of its own (members own the branches), so the scan has
+	// nothing to find and cannot produce a late refusal. Dependents: every
+	// space that stacks on the saga is a member, and members are on the exempt
+	// list, so the only refusal the late scan can raise comes from an EXTERNAL
+	// dependent — which the member pass above has no visibility into anyway
+	// and which legitimately blocks the saga space alone.
 	if !spec.force {
 		for _, p := range plan {
 			if p.state != MemberLive {
@@ -634,9 +644,18 @@ func (s Service) sagaTeardownLocked(ctx context.Context, sagaID, sagaPath string
 			}
 		}
 	}
+	// Den-first predicate: a destroying fate on a saga that owns a den. Same
+	// fate predicate as the den-refcount guard above, which stays a preflight —
+	// it must still fire before the den is touched.
+	den, hasDen := findOwnedMemory(manifest)
+	denFirst := spec.destroy && hasDen && spec.fate != "" && spec.fate != memory.FateKeep
 	if spec.dryRun {
 		s.printf("dry-run: saga %s plan for %s (members in reverse topological order, saga space last):\n", spec.verb, sagaID)
 		step := 1
+		if denFirst {
+			s.printf("dry-run: %d. destroy the saga den %s first (fate %s; a live agent serve refuses here with nothing destroyed)\n", step, den.ID, spec.fate)
+			step++
+		}
 		for _, p := range plan {
 			switch p.state {
 			case MemberArchived:
@@ -654,9 +673,30 @@ func (s Service) sagaTeardownLocked(ctx context.Context, sagaID, sagaPath string
 		}
 		s.printf("dry-run: %d. %s saga space %s\n", step, spec.verb, sagaID)
 	}
-	teardown := func(id string, fate memory.MemoryFate) error {
+	// Den-first: destroy the saga den BEFORE any member teardown, so marmot's
+	// source_in_use refusal (a live agent serve on the den — any member's,
+	// since they all point at it) fails the whole operation while every member
+	// and the saga space are still intact. Deliberately OUTSIDE the !force
+	// guard: stave's own guards above are force-skippable, marmot's refusal is
+	// not. detachMemoryLocked (both locks held here) strips the members' saga-
+	// den MCP wiring first and restores it on refusal, and its splice-save
+	// removes the owned attachment so the final saga-space teardown finds it
+	// already handled. In dry-run it previews the provider's real destroy argv
+	// right after the numbered plan — though a dry-run cannot predict a live-
+	// serve refusal (marmot's dry-run returns before lock acquisition).
+	if denFirst {
+		if err := s.detachMemoryLocked(ctx, sagaPath, sagaID, den.Name, spec.fate, spec.force, spec.dryRun); err != nil {
+			s.reportSagaTeardownFailure(sagaID, spec, "the saga den", nil)
+			return fmt.Errorf("saga %s: %w", spec.verb, err)
+		}
+	}
+	teardown := func(id string, fate memory.MemoryFate, skipStoreID string) error {
 		if spec.destroy {
-			return s.Destroy(ctx, DestroyOptions{SpaceID: id, Force: spec.force, DryRun: spec.dryRun, MemoryFate: fate, exemptDependentSpaces: exempt})
+			// sagaLockHeld: this walk holds sagaID's per-saga lock; only the
+			// saga space itself (id == sagaID) has a Saga manifest, so only its
+			// destroying-fate splice-saves would otherwise re-acquire — and
+			// deadlock on — that lock (fsio flock is non-reentrant).
+			return s.Destroy(ctx, DestroyOptions{SpaceID: id, Force: spec.force, DryRun: spec.dryRun, MemoryFate: fate, exemptDependentSpaces: exempt, sagaLockHeld: id == sagaID, skipMemoryStoreID: skipStoreID})
 		}
 		return s.Archive(ctx, ArchiveOptions{SpaceID: id, Force: spec.force, DryRun: spec.dryRun, MemoryFate: fate, exemptDependentSpaces: exempt})
 	}
@@ -676,7 +716,7 @@ func (s Service) sagaTeardownLocked(ctx context.Context, sagaID, sagaPath string
 			s.printf("skipping member %s: missing\n", p.member.ID)
 			continue
 		}
-		if err := teardown(p.member.ID, ""); err != nil {
+		if err := teardown(p.member.ID, "", ""); err != nil {
 			s.reportSagaTeardownFailure(sagaID, spec, "member "+p.member.ID, completed)
 			return fmt.Errorf("saga %s: member %s: %w", spec.verb, p.member.ID, err)
 		}
@@ -684,7 +724,15 @@ func (s Service) sagaTeardownLocked(ctx context.Context, sagaID, sagaPath string
 	}
 	// The saga space itself, last: references only, memory fate applies to
 	// the saga den (the window-guard is CLI-layer, so no interference here).
-	if err := teardown(sagaID, spec.fate); err != nil {
+	// A den handled den-first is skipped by store id — ONLY that one, so the
+	// fate loop still keep-detaches any additional unowned attachments (their
+	// routes and MCP wiring must not dangle), and a dry-run does not preview
+	// the den's destroy lines twice.
+	denSkip := ""
+	if denFirst {
+		denSkip = den.ID
+	}
+	if err := teardown(sagaID, spec.fate, denSkip); err != nil {
 		s.reportSagaTeardownFailure(sagaID, spec, "the saga space", completed)
 		return fmt.Errorf("saga %s: %w", spec.verb, err)
 	}
@@ -706,8 +754,9 @@ func (s Service) reportSagaTeardownFailure(sagaID string, spec sagaTeardownSpec,
 // SagaDestroy: any NON-member space holding an unowned attachment of the saga
 // den would be stranded by its destruction, so the destroy refuses naming the
 // sharer (--force overrides). Members are excluded — they are torn down in
-// the same operation (their unowned attachments detach with keep fate) before
-// the den is destroyed. Fails closed on unreadable siblings.
+// the same operation, and their unowned attachments detach with keep fate,
+// which never touches the den (the den itself is destroyed FIRST, before any
+// member teardown). Fails closed on unreadable siblings.
 func (s Service) ensureSagaDenUnshared(sagaID string, manifest Manifest) error {
 	den, ok := findOwnedMemory(manifest)
 	if !ok {
@@ -1015,6 +1064,43 @@ func (s Service) wireSagaDenMCP(ctx context.Context, den MemoryManifest, memberP
 		return
 	}
 	s.printf("wired saga den %s MCP config into %s\n", den.ID, memberID)
+}
+
+// stripSagaDenMemberWiring strips the saga den's MCP bindings from every
+// member that has no memory attachment of its own — exactly the set
+// sagaAddMemberEffects wired; a member's own den always owns its configs —
+// before a den-destroying detach, so no member client started from a stale
+// config can re-acquire the den mid-destroy (the provider closes the same
+// window for the saga space's own wiring). It returns a restore closure the
+// caller runs when the destroy fails: only failures KNOWN to leave the den
+// intact re-wire (memory.DenIntactAfterFailedDestroy — the same scoping the
+// provider uses for the saga space's own wiring restore); after an ambiguous
+// failure the members stay unwired rather than be rewired at a possibly
+// destroyed den. Both directions are member-side best-effort, like all den
+// wiring (unwire/wire print notices, never fail the verb).
+func (s Service) stripSagaDenMemberWiring(ctx context.Context, manifest Manifest, den MemoryManifest) func(cause error) {
+	type strippedMember struct {
+		id   string
+		path string
+	}
+	var stripped []strippedMember
+	for _, member := range manifest.Saga.Members {
+		memberPath := s.SpacePath(member.ID)
+		memberManifest, err := LoadManifest(memberPath)
+		if err != nil || len(memberManifest.Memories) > 0 {
+			continue // missing/unreadable members have nothing to strip
+		}
+		s.unwireSagaDenMCP(ctx, den, memberPath, member.ID)
+		stripped = append(stripped, strippedMember{id: member.ID, path: memberPath})
+	}
+	return func(cause error) {
+		if !memory.DenIntactAfterFailedDestroy(cause) {
+			return
+		}
+		for _, member := range stripped {
+			s.wireSagaDenMCP(ctx, den, member.path, member.id)
+		}
+	}
 }
 
 // unwireSagaDenMCP strips the saga den's MCP entries from a member (other

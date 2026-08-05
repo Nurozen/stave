@@ -11,18 +11,25 @@ package cli
 //	S4 corporate: warren add (shared cache) -> --ref resolution via
 //	source_url -> --edit pass-through -> contribute into the CACHE edit
 //	worktree -> real warren sync -> skew suffixes in memory/space status
+//	destroy hardening: live `serve --den` -> destroying fates refuse with
+//	source_in_use (wiring restored) -> serve stops -> destroy converges;
+//	watch_sources: false written on owned create, watch disabled on serve
 //
 // Guarded: skips cleanly when no marmot binary can be resolved (see
 // resolveE2EMarmot). Run via test_rig/memory-e2e/run.sh for a fresh
 // HEAD-vs-HEAD build.
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // marmotRepoPath is where the context-marmot checkout lives on dev machines;
@@ -99,6 +106,103 @@ func runMarmot(t *testing.T, bin, dir string, args ...string) (stdout string, co
 		t.Logf("marmot %v stderr: %s", args, errBuf.String())
 	}
 	return out.String(), code
+}
+
+// serveProc is a live `marmot serve --den <id>` child, run standalone via
+// MARMOT_NO_DAEMON=1. Stderr accumulates in a buffer that is only safe to
+// read AFTER stop() returns (the child writes it concurrently); stdin stays
+// open until stop() closes it to end the stdio session.
+type serveProc struct {
+	cmd    *exec.Cmd
+	stdin  io.WriteCloser
+	stdout *bufio.Reader
+	stderr bytes.Buffer
+	waited bool
+}
+
+// spawnServe starts `marmot serve --den <denID>` and registers a kill+wait
+// backstop immediately after Start, before any readiness I/O can fail.
+func spawnServe(t *testing.T, bin, denID string) *serveProc {
+	t.Helper()
+	p := &serveProc{cmd: exec.Command(bin, "serve", "--den", denID)}
+	p.cmd.Env = append(os.Environ(), "MARMOT_NO_DAEMON=1")
+	stdin, err := p.cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.stdin = stdin
+	stdout, err := p.cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.stdout = bufio.NewReader(stdout)
+	p.cmd.Stderr = &p.stderr
+	if err := p.cmd.Start(); err != nil {
+		t.Fatalf("start serve --den %s: %v", denID, err)
+	}
+	t.Cleanup(func() {
+		if p.waited {
+			return
+		}
+		_ = p.cmd.Process.Kill()
+		_ = p.cmd.Wait()
+	})
+	return p
+}
+
+// initialize performs one newline-delimited JSON-RPC initialize round-trip
+// over the child's stdio. Standalone serve acquires its shared den leases
+// inside buildEngineMode BEFORE ListenStdio, so ANY response proves a
+// subsequent `den destroy` will refuse with source_in_use. (A `den destroy
+// --dry-run` probe would prove nothing: it returns before lock acquisition.)
+func (p *serveProc) initialize(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	req := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"stave-e2e","version":"0"}}}` + "\n"
+	if _, err := io.WriteString(p.stdin, req); err != nil {
+		t.Fatalf("write initialize: %v", err)
+	}
+	type readResult struct {
+		line string
+		err  error
+	}
+	ch := make(chan readResult, 1)
+	go func() {
+		line, err := p.stdout.ReadString('\n')
+		ch <- readResult{line: line, err: err}
+	}()
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			t.Fatalf("serve initialize response: %v (line %q)", r.err, r.line)
+		}
+		if !strings.Contains(r.line, `"jsonrpc"`) {
+			t.Fatalf("unexpected initialize response line: %q", r.line)
+		}
+	case <-time.After(timeout):
+		t.Fatalf("serve did not answer initialize within %s", timeout)
+	}
+}
+
+// stop closes stdin (standalone serve exits when ListenStdio returns on
+// client EOF), waits with a timeout, and kills as a backstop. Only after it
+// returns is p.stderr safe to read.
+func (p *serveProc) stop(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	_ = p.stdin.Close()
+	done := make(chan error, 1)
+	go func() { done <- p.cmd.Wait() }()
+	select {
+	case err := <-done:
+		p.waited = true
+		if err != nil {
+			t.Fatalf("serve exit after stdin EOF: %v\nstderr:\n%s", err, p.stderr.String())
+		}
+	case <-time.After(timeout):
+		_ = p.cmd.Process.Kill()
+		<-done
+		p.waited = true
+		t.Fatalf("serve did not exit within %s of stdin EOF (killed)", timeout)
+	}
 }
 
 // writeWarrenCheckout builds a minimal warren git checkout: _warren.md
@@ -630,6 +734,120 @@ func TestMarmotMemoryE2E(t *testing.T) {
 			if _, err := os.Stat(filepath.Join(marmotHome, "dens", den, "_den.md")); err != nil {
 				t.Fatalf("archive must keep den %s: %v", den, err)
 			}
+		}
+	})
+
+	// Destroy-with-live-serve (destroy hardening P6): a live `serve --den`
+	// holds the den's shared leases, so destroying fates refuse with
+	// source_in_use (never --force-bypassable), the space survives with its
+	// MCP wiring restored, and after the serve exits the same destroy
+	// succeeds. Also covers the watch_sources opt-out end to end: the owned
+	// create writes the key, serve reports the watch disabled on stderr, and
+	// a source file seeded in the space is never indexed into a vault node.
+	step("destroy with live serve refuses then converges", func(t *testing.T) {
+		if err := os.Chdir(home); err != nil {
+			t.Fatal(err)
+		}
+		const watchProbe = "stave-e2e-watch-probe-8f3d1c.md"
+		t7Space := filepath.Join(home, "stave", "agent-work", "t7")
+		runCLI(t, "space", "create", "t7", "-e", "repo-a", "--memory", ".")
+
+		// Owned creates write the watch opt-out into the den vault config.
+		cfg, err := os.ReadFile(filepath.Join(marmotHome, "dens", "t7", "vault", "_config.md"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(cfg), "watch_sources: false") {
+			t.Fatalf("den vault _config.md missing watch_sources: false:\n%s", cfg)
+		}
+		// Uniquely-named source file in the space BEFORE serve starts: with
+		// the watch disabled it must never become a vault node. Space root,
+		// not the worktree — an untracked worktree file would trip the
+		// dirty-edit guard before the memory fate even runs.
+		if err := os.WriteFile(filepath.Join(t7Space, watchProbe), []byte("# watch probe\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		serve := spawnServe(t, marmotBin, "t7")
+		serve.initialize(t, 30*time.Second)
+
+		// Destroying fates refuse stave-shaped while the serve lives. The
+		// root command silences cobra's error printing, so the refusal lives
+		// on the returned error value, not in the command output buffer.
+		out, err := runCLIError(t, nil, "space", "destroy", "t7", "--memory", "destroy")
+		if err == nil {
+			t.Fatalf("space destroy with a live serve must refuse:\n%s", out)
+		}
+		for _, need := range []string{"source_in_use", "close agent sessions"} {
+			if !strings.Contains(err.Error(), need) {
+				t.Fatalf("space destroy refusal missing %q: %v", need, err)
+			}
+		}
+		// Space and den intact; the MCP wiring stripped before the destroy
+		// was restored after the refusal, so the space keeps working.
+		if _, err := os.Stat(filepath.Join(t7Space, ".stave.yaml")); err != nil {
+			t.Fatalf("space t7 must survive the refusal: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(marmotHome, "dens", "t7", "_den.md")); err != nil {
+			t.Fatalf("den t7 must survive the refusal: %v", err)
+		}
+		mcp, err := os.ReadFile(filepath.Join(t7Space, ".mcp.json"))
+		if err != nil {
+			t.Fatalf("space MCP config must be restored after the refusal: %v", err)
+		}
+		for _, need := range []string{"serve", "--den", "t7"} {
+			if !strings.Contains(string(mcp), need) {
+				t.Fatalf("restored .mcp.json missing %q:\n%s", need, mcp)
+			}
+		}
+
+		// memory detach --destroy hits the same refusal via detachMemoryLocked.
+		out, err = runCLIError(t, nil, "memory", "detach", "t7", "--destroy")
+		if err == nil {
+			t.Fatalf("memory detach --destroy with a live serve must refuse:\n%s", out)
+		}
+		for _, need := range []string{"source_in_use", "close agent sessions"} {
+			if !strings.Contains(err.Error(), need) {
+				t.Fatalf("detach refusal missing %q: %v", need, err)
+			}
+		}
+		if _, err := os.Stat(filepath.Join(marmotHome, "dens", "t7", "_den.md")); err != nil {
+			t.Fatalf("den t7 must survive the detach refusal: %v", err)
+		}
+
+		// Stop the serve; stderr is only safe to read after Wait returned.
+		serve.stop(t, 30*time.Second)
+		if !strings.Contains(serve.stderr.String(), "daemon: source watch disabled (watch_sources: false)") {
+			t.Fatalf("serve stderr missing the watch-disabled line:\n%s", serve.stderr.String())
+		}
+		// Concrete node check: no vault node ever referenced the probe file.
+		vault := filepath.Join(marmotHome, "dens", "t7", "vault")
+		if err := filepath.WalkDir(vault, func(path string, d os.DirEntry, walkErr error) error {
+			if walkErr != nil || d.IsDir() || !strings.HasSuffix(path, ".md") {
+				return walkErr
+			}
+			data, readErr := os.ReadFile(path)
+			if readErr != nil {
+				return readErr
+			}
+			if strings.Contains(string(data), watchProbe) {
+				t.Fatalf("vault node %s references source probe %s", path, watchProbe)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		// With the holder gone the exact same command converges.
+		destroyOut := runCLI(t, "space", "destroy", "t7", "--memory", "destroy")
+		if !strings.Contains(destroyOut, "destroyed t7") {
+			t.Fatalf("destroy output:\n%s", destroyOut)
+		}
+		if _, err := os.Stat(t7Space); !os.IsNotExist(err) {
+			t.Fatalf("space dir must be gone after destroy: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(marmotHome, "dens", "t7")); !os.IsNotExist(err) {
+			t.Fatalf("den dir must be gone after destroy: %v", err)
 		}
 	})
 }

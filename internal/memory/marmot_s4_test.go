@@ -5,6 +5,7 @@ package memory
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -117,7 +118,9 @@ func TestSupportsWarrenSyncProbe(t *testing.T) {
 }
 
 func TestAttachPassthroughRefsAndLinks(t *testing.T) {
-	createEnv := `{"schema":1,"den_id":"t1","den_path":"/tmp/dens/t1","pointer_written":false,` +
+	denPath := t.TempDir()
+	configPath := writeDenVaultFixture(t, denPath, denVaultFrontmatter)
+	createEnv := fmt.Sprintf(`{"schema":1,"den_id":"t1","den_path":%q,"pointer_written":false,`, denPath) +
 		`"links":[{"ref":"w/proj","mode":"link","resolved_via":"warren-url"},{"ref":"lost","mode":null,"resolved_via":"none"}],` +
 		`"warnings":["ref lost: no warren source_url or checkout vault_id match; skipped"]}`
 	linkEnv := `{"schema":1,"den_id":"t1","link":{"target":"w/docs","mode":"edit"},"warnings":[]}`
@@ -188,6 +191,13 @@ func TestAttachPassthroughRefsAndLinks(t *testing.T) {
 		res.Links[2].Mode != "edit" || res.Links[2].ResolvedVia != "explicit" {
 		t.Fatalf("links = %#v", res.Links)
 	}
+	// The passthrough path too must land watch_sources: false in the den
+	// vault config, with the original frontmatter intact.
+	got, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertWatchSourcesOff(t, string(got), denVaultFrontmatter)
 }
 
 func TestAttachOldMarmotDropsFlagsWithNotice(t *testing.T) {

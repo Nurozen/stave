@@ -163,6 +163,18 @@ type DestroyOptions struct {
 	MemoryFate memory.MemoryFate // empty → keep
 	// exemptDependentSpaces: see ArchiveOptions.exemptDependentSpaces.
 	exemptDependentSpaces []string
+	// sagaLockHeld: the caller (sagaTeardownLocked) already holds this space's
+	// per-saga lock, so destroying-fate splice-saves in applyMemoryFate must
+	// save directly rather than re-acquire it (fsio.WithLock's flock is
+	// non-reentrant; see CreateOptions.sagaLockHeld).
+	sagaLockHeld bool
+	// skipMemoryStoreID names ONE attachment (by store id) the memory-fate
+	// loop must skip: the saga den a den-first sagaTeardownLocked has already
+	// destroyed (or, in dry-run, already previewed). Only that attachment is
+	// skipped — the fate loop still runs over every other attachment, so
+	// keep-fate cleanup of additional unowned attachments (route + MCP strip)
+	// is never suppressed. Deliberately unexported: never set by the CLI.
+	skipMemoryStoreID string
 }
 
 // AttachMemoryOptions is the service-level entry for stave memory attach
@@ -210,6 +222,33 @@ type DirtyWorktreeError struct {
 
 func (e *DirtyWorktreeError) Error() string {
 	return fmt.Sprintf("space %q has dirty editable worktrees: %s", e.SpaceID, strings.Join(e.Repos, ", "))
+}
+
+// MemoryInUseError classifies a provider source_in_use destroy refusal: the
+// space's memory den is held by a live process, so destroy/detach cannot
+// proceed and --force never helps (marmot's --force covers only
+// unpushed_edits / unpushed_unknown). Unlike DirtyWorktreeError, Error()
+// APPENDS the wrapped refusal so the literal source_in_use code and marmot's
+// hint survive in rendered CLI output (cobra prints err.Error() only).
+type MemoryInUseError struct {
+	SpaceID string
+	Err     error
+}
+
+func (e *MemoryInUseError) Error() string {
+	return fmt.Sprintf("space %q: memory den is held by a live agent session or another marmot process (marmot serve --den): close agent sessions using this space's memory — or any space sharing its den (saga members do) — and retry (--force does not bypass): %v", e.SpaceID, e.Err)
+}
+
+func (e *MemoryInUseError) Unwrap() error { return e.Err }
+
+// wrapSourceInUse classifies ONLY source_in_use provider refusals into
+// MemoryInUseError; every other error (including other refusal codes such as
+// edit_link_required) flows through verbatim.
+func wrapSourceInUse(spaceID string, err error) error {
+	if err == nil || !memory.IsSourceInUse(err) {
+		return err
+	}
+	return &MemoryInUseError{SpaceID: spaceID, Err: err}
 }
 
 func ParseRepoSpec(raw string) (RepoSpec, error) {
@@ -1167,7 +1206,7 @@ func (s Service) Destroy(ctx context.Context, opts DestroyOptions) error {
 		fate = memory.FateKeep
 	}
 	// Memory fate BEFORE RemoveAll — manifest is gone after.
-	if err := s.applyMemoryFate(ctx, spacePath, manifest, fate, opts.Force, opts.DryRun); err != nil {
+	if err := s.applyMemoryFate(ctx, spacePath, opts.SpaceID, &manifest, fate, opts.Force, opts.DryRun, opts.sagaLockHeld, opts.skipMemoryStoreID); err != nil {
 		return err
 	}
 	for _, repo := range manifest.Repos {
@@ -1198,8 +1237,26 @@ func (s Service) Destroy(ctx context.Context, opts DestroyOptions) error {
 // owned:false never destroyed. The reverse-route removal is a SPACE-level
 // operation (one route per space path), so RemoveRoute is issued at most once
 // per provider rather than once per attachment — a second `route rm --project`
-// would fail on the already-removed route (G1).
-func (s Service) applyMemoryFate(ctx context.Context, spacePath string, manifest Manifest, fate memory.MemoryFate, force, dryRun bool) error {
+// would fail on the already-removed route (G1). The once-per-provider map is
+// per-RUN state: a retry after a partial failure re-issues route rm for a
+// keep-fate attachment whose route the previous run already removed, which
+// marmot tolerates with a warning rather than a failure (route commands are
+// warn-tolerant), so cross-retry double-removal still converges.
+//
+// Destroying fates record durably as they go: each successful (or
+// den_not_found-tolerated) destroy splices its attachment from the manifest,
+// saves it and rewrites AGENTS.md before the next attachment is touched, so a
+// mid-loop failure leaves the manifest listing exactly the unprocessed
+// attachments — a retry never re-destroys (or re-contributes) a den that is
+// already gone. Keep-fate attachments are never spliced: the whole manifest
+// disappears with the space, and a retry's redundant keep-detach is harmless.
+// Dry-run never saves.
+//
+// skipStoreID names one already-handled attachment (the saga den destroyed
+// den-first by sagaTeardownLocked) to skip in BOTH real and dry-run paths; in
+// real runs its splice-save usually removed the record already, so the skip
+// mainly keeps a dry-run from previewing the den's destroy lines twice.
+func (s Service) applyMemoryFate(ctx context.Context, spacePath, spaceID string, manifest *Manifest, fate memory.MemoryFate, force, dryRun, sagaLockHeld bool, skipStoreID string) error {
 	if len(manifest.Memories) == 0 {
 		return nil
 	}
@@ -1210,7 +1267,13 @@ func (s Service) applyMemoryFate(ctx context.Context, spacePath string, manifest
 		s.printf("memory fate=keep (default): dens retained as durable residue of this task\n")
 	}
 	routeRemoved := map[string]bool{}
-	for _, mem := range manifest.Memories {
+	// Iterate a snapshot: destroying-fate successes splice manifest.Memories
+	// in place (head-consume of the durable attachment list).
+	memories := append([]MemoryManifest(nil), manifest.Memories...)
+	for _, mem := range memories {
+		if skipStoreID != "" && mem.ID == skipStoreID {
+			continue // handled den-first by the saga teardown
+		}
 		effective := fate
 		if !mem.Owned && (fate == memory.FateDestroy || fate == memory.FateContribute) {
 			s.printf("notice: memory %q (%s) is not owned; detach-only (never destroy)\n", mem.Name, mem.ID)
@@ -1229,15 +1292,104 @@ func (s Service) applyMemoryFate(ctx context.Context, spacePath string, manifest
 			DryRun:    dryRun,
 			Out:       s.Out,
 		}
-		if effective == memory.FateKeep && !routeRemoved[mem.Provider] {
-			detachOpts.RemoveRoute = true
-			routeRemoved[mem.Provider] = true
+		if effective == memory.FateKeep {
+			if !routeRemoved[mem.Provider] {
+				detachOpts.RemoveRoute = true
+				routeRemoved[mem.Provider] = true
+			}
+			if _, err := prov.Detach(ctx, detachOpts); err != nil {
+				return fmt.Errorf("memory %s fate %s: %w", mem.Name, effective, wrapSourceInUse(spaceID, err))
+			}
+			continue
 		}
-		if _, err := prov.Detach(ctx, detachOpts); err != nil {
-			return fmt.Errorf("memory %s fate %s: %w", mem.Name, effective, err)
+		// Direct `stave space destroy <saga> --memory destroy|contribute` lands
+		// here instead of detachMemoryLocked, and owes the members the same
+		// pre-destroy strip of the saga den's MCP wiring (a member client
+		// started from a stale config could re-acquire the den mid-destroy) and
+		// the same restore when the destroy is refused. No extra lock: the
+		// strip reads member manifests and writes member-side configs only —
+		// the saga manifest is touched exclusively by detachDestroyingAndRecord,
+		// which takes the per-saga lock itself when sagaLockHeld is false.
+		var rewireMembers func(cause error)
+		if !dryRun && manifest.Saga != nil {
+			rewireMembers = s.stripSagaDenMemberWiring(ctx, *manifest, mem)
+		}
+		if err := s.detachDestroyingAndRecord(ctx, prov, detachOpts, spacePath, spaceID, manifest, mem, sagaLockHeld); err != nil {
+			if rewireMembers != nil {
+				rewireMembers(err)
+			}
+			return fmt.Errorf("memory %s fate %s: %w", mem.Name, effective, wrapSourceInUse(spaceID, err))
 		}
 	}
 	return nil
+}
+
+// detachDestroyingAndRecord runs ONE destroying-fate (destroy | contribute)
+// provider Detach and records the outcome durably in the same per-success
+// transaction: the attachment is spliced from manifest.Memories, the manifest
+// saved, and AGENTS.md rewritten (it must not keep advertising a destroyed
+// den — the space directory still exists until Destroy's final RemoveAll).
+// Shared by applyMemoryFate and detachMemoryLocked, whose crash window is
+// identical: provider Detach succeeds, then the process dies before the
+// manifest save — without the den_not_found tolerance below every retry
+// would wedge on the vanished den.
+//
+// den_not_found tolerance: FateDestroy treats the refusal unconditionally as
+// already-done (the desired end state — no den — holds). FateContribute
+// cannot know whether the vanished den's content was ever contributed, so its
+// notice says exactly that; the record is still spliced so retries converge.
+//
+// Save transaction: with manifest.Saga != nil and the per-saga lock NOT held
+// (direct `space destroy <saga> --force`), the splice-save runs as a locked
+// reload → remove-by-StoreID → save, so a concurrent saga writer's rows (e.g.
+// saga sync's PR cache) are never clobbered by this caller's pre-loop
+// snapshot. With the lock held (sagaTeardownLocked, detachMemoryLocked) — or
+// on a plain space — the caller's manifest is spliced and saved directly.
+// Dry-run never saves.
+func (s Service) detachDestroyingAndRecord(ctx context.Context, prov memory.Provider, detachOpts memory.DetachOptions, spacePath, spaceID string, manifest *Manifest, mem MemoryManifest, sagaLockHeld bool) error {
+	if _, err := prov.Detach(ctx, detachOpts); err != nil {
+		switch {
+		case !memory.IsDenNotFound(err):
+			return err
+		case detachOpts.Fate == memory.FateContribute:
+			s.printf("notice: memory %q (%s): den vanished before its contribution could be verified; removing the attachment record so retries converge\n", mem.Name, mem.ID)
+		default: // FateDestroy — the desired end state (no den) already holds.
+			s.printf("notice: memory %q (%s): den not found; already destroyed — treating as done\n", mem.Name, mem.ID)
+		}
+	}
+	if detachOpts.DryRun {
+		return nil
+	}
+	splice := func(m *Manifest) bool {
+		for i, cand := range m.Memories {
+			if cand.ID == mem.ID {
+				m.Memories = append(m.Memories[:i], m.Memories[i+1:]...)
+				return true
+			}
+		}
+		return false
+	}
+	if manifest.Saga != nil && !sagaLockHeld {
+		splice(manifest) // keep the caller's in-memory snapshot in step
+		return s.withSagaLock(spaceID, func() error {
+			fresh, err := LoadManifest(spacePath)
+			if err != nil {
+				return err
+			}
+			if splice(&fresh) {
+				if err := SaveManifest(spacePath, fresh); err != nil {
+					return err
+				}
+			}
+			return s.writeAgents(spacePath, fresh)
+		})
+	}
+	if splice(manifest) {
+		if err := SaveManifest(spacePath, *manifest); err != nil {
+			return err
+		}
+	}
+	return s.writeAgents(spacePath, *manifest)
 }
 
 // DetachMemory removes one attachment from the manifest after provider Detach.
@@ -1304,7 +1456,7 @@ func (s Service) detachMemoryLocked(ctx context.Context, spacePath, spaceID, ali
 		}
 	}
 	lastForProvider := repointID == ""
-	if _, err := prov.Detach(ctx, memory.DetachOptions{
+	detachOpts := memory.DetachOptions{
 		StoreID:             mem.ID,
 		SpacePath:           spacePath,
 		RemoveRoute:         fate == memory.FateKeep && lastForProvider,
@@ -1315,8 +1467,39 @@ func (s Service) detachMemoryLocked(ctx context.Context, spacePath, spaceID, ali
 		Owned:               mem.Owned,
 		DryRun:              dryRun,
 		Out:                 s.Out,
-	}); err != nil {
-		return err
+	}
+	if fate == memory.FateDestroy || fate == memory.FateContribute {
+		// A destroying fate on a SAGA's own den first strips the saga-den MCP
+		// wiring from members (a member client started from a stale config
+		// could re-acquire the den mid-destroy, exactly the hazard the provider
+		// closes for the saga space's own wiring) and re-wires them when the
+		// destroy is refused — the den survived, so members must keep talking
+		// to it. Covers both `stave memory detach <saga> --destroy` and the
+		// den-first saga teardown, which routes through here. Dry-run mutates
+		// no member files.
+		var rewireMembers func(cause error)
+		if !dryRun && manifest.Saga != nil {
+			rewireMembers = s.stripSagaDenMemberWiring(ctx, manifest, mem)
+		}
+		// Destroying fates share applyMemoryFate's crash-window handling: the
+		// splice-save runs in the same transaction as the successful Detach,
+		// and a den that already vanished (den_not_found) still converges.
+		// Any required saga lock is already held on entry (sagaLockHeld=true).
+		if err := s.detachDestroyingAndRecord(ctx, prov, detachOpts, spacePath, spaceID, &manifest, mem, true); err != nil {
+			if rewireMembers != nil {
+				rewireMembers(err)
+			}
+			return wrapSourceInUse(spaceID, err)
+		}
+		if dryRun {
+			s.printf("dry-run: remove memory attachment %q from .stave.yaml\n", mem.Name)
+			return nil
+		}
+		s.printf("detached memory %s from %s\n", mem.Name, spaceID)
+		return nil
+	}
+	if _, err := prov.Detach(ctx, detachOpts); err != nil {
+		return wrapSourceInUse(spaceID, err)
 	}
 	if dryRun {
 		s.printf("dry-run: remove memory attachment %q from .stave.yaml\n", mem.Name)

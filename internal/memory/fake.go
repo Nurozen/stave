@@ -7,7 +7,9 @@ import (
 )
 
 // Fake is a test double for Provider. Recorded calls enable assertions
-// without a marmot binary.
+// without a marmot binary. Attach deliberately mirrors none of Marmot's den
+// vault config write (watch_sources: false) — that is a provider-internal
+// side effect under MARMOT_HOME the space layer never observes.
 type Fake struct {
 	Mu sync.Mutex
 

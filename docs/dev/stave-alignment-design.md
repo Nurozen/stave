@@ -122,9 +122,12 @@ marmot den create myproject \
 - `--dry-run` on every mutating warren/den command, printing exact fs/git ops
   (stave prints `(cd dir && git …)`).
 - `den destroy`: refuses if edit branches have unpushed commits (unless --force);
-  offers promote-on-destroy — fold the task den's vault nodes into a durable den via
-  the existing CRUD classifier (ADD/UPDATE/SUPERSEDE/NOOP) so scratch NOOPs away and
-  real learnings merge into supersede-chain history.
+  also refuses with `source_in_use` when the den is held by a live process (agent
+  session over MCP, `marmot serve --den`, watch/index) — `--force` does NOT bypass
+  that one; the holder must be closed first. Offers promote-on-destroy — fold the
+  task den's vault nodes into a durable den via the existing CRUD classifier
+  (ADD/UPDATE/SUPERSEDE/NOOP) so scratch NOOPs away and real learnings merge into
+  supersede-chain history.
 - `den contribute <link>` (DECIDED 2026-07-13): the warren-bound sibling of promote —
   classify the den vault's nodes against the target warren project's graph and stage the
   results (creates included) as commits on the edit branch; `warren propose` then
@@ -153,7 +156,9 @@ marmot den create myproject \
 - Failure policy: explicit attach/`--memory` fails hard on probe failure; ambient
   `memory.default: true` degrades with a notice. Archive = detach-but-keep + route fix.
   Destroy: `--memory=keep|destroy|contribute` (default keep); `--force` if unproposed
-  edits pend.
+  edits pend (`unpushed_edits`/`unpushed_unknown` only — a `source_in_use` refusal is
+  NOT force-bypassable: close the agent sessions / marmot processes holding the den
+  and retry).
 - DECIDED 2026-07-21: `stave space archive` also accepts `--memory=keep|contribute` —
   contribute-then-keep: fold learnings into the warren PR at parking time, den survives
   with the archived space.
