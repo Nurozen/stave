@@ -88,9 +88,15 @@ func TestPlanPreviewEC2PlaceholderInvariant(t *testing.T) {
 	}
 
 	previews := map[string]func() (Plan, error){
-		"exec":  func() (Plan, error) { return svc.PlanExec(ctx, ExecOptions{SpaceID: "ex-1", PortalID: "aws", Command: []string{"true"}, DryRun: true}) },
-		"shell": func() (Plan, error) { return svc.PlanShell(ctx, ShellOptions{SpaceID: "ex-1", PortalID: "aws", DryRun: true}) },
-		"logs":  func() (Plan, error) { return svc.PlanLogs(ctx, LogsOptions{SpaceID: "ex-1", PortalID: "aws", DryRun: true}) },
+		"exec": func() (Plan, error) {
+			return svc.PlanExec(ctx, ExecOptions{SpaceID: "ex-1", PortalID: "aws", Command: []string{"true"}, DryRun: true})
+		},
+		"shell": func() (Plan, error) {
+			return svc.PlanShell(ctx, ShellOptions{SpaceID: "ex-1", PortalID: "aws", DryRun: true})
+		},
+		"logs": func() (Plan, error) {
+			return svc.PlanLogs(ctx, LogsOptions{SpaceID: "ex-1", PortalID: "aws", DryRun: true})
+		},
 	}
 	for name, build := range previews {
 		plan, err := build()
