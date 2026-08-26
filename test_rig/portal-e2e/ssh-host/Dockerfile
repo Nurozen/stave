@@ -4,7 +4,7 @@ ARG PUBLIC_KEY
 
 # Test-only SSH host. Authentication is key-based via the injected PUBLIC_KEY;
 # password auth is disabled so no credential is baked into the image.
-RUN apk add --no-cache openssh-server rsync \
+RUN apk add --no-cache openssh-server rsync tmux \
     && adduser -D -h /home/stave stave \
     # adduser -D leaves the account locked ('!' in /etc/shadow) and sshd
     # refuses locked accounts even with a valid publickey; '*' unlocks the

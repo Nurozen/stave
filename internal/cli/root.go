@@ -8,8 +8,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Nurozen/stave/internal/agent"
 	"github.com/Nurozen/stave/internal/config"
@@ -19,11 +21,23 @@ import (
 	"github.com/Nurozen/stave/internal/portal"
 	"github.com/Nurozen/stave/internal/space"
 	"github.com/Nurozen/stave/internal/summon"
+	"github.com/Nurozen/stave/internal/tether"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
 
+// Build metadata threaded in from package main's ldflags-populated vars
+// (see cmd/stave/main.go). main.run sets these before ExecuteContext.
+var (
+	BuildVersion string
+	BuildCommit  string
+	BuildDate    string
+)
+
 type app struct {
+	version         string
+	commit          string
+	date            string
 	configPath      string
 	shellChdirFD    int
 	providerFactory agent.ProviderFactory
@@ -35,7 +49,11 @@ type app struct {
 }
 
 func NewRootCommand() *cobra.Command {
-	return newRootCommand(&app{})
+	return newRootCommand(&app{
+		version: BuildVersion,
+		commit:  BuildCommit,
+		date:    BuildDate,
+	})
 }
 
 func newRootCommand(a *app) *cobra.Command {
@@ -66,8 +84,76 @@ func newRootCommand(a *app) *cobra.Command {
 		a.summonCommand(),
 		a.reviewCommand(),
 		a.sagaCommand(),
+		a.versionCommand(),
 	)
 	return cmd
+}
+
+func (a *app) versionCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "version",
+		Short: "Print the Stave version, commit, and build date",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			v, c, d := a.resolveBuildInfo()
+			fmt.Fprintf(cmd.OutOrStdout(), "stave %s\ncommit: %s\ndate: %s\n", v, c, d)
+			return nil
+		},
+	}
+}
+
+// resolveBuildInfo returns the version, commit, and build date for display,
+// preferring values injected via ldflags. When the injected version is empty
+// or the "dev" default, it falls back to runtime/debug build info (e.g. for
+// `go install`ed binaries). Empty fields are normalized to "unknown".
+func (a *app) resolveBuildInfo() (version, commit, date string) {
+	version, commit, date = a.version, a.commit, a.date
+	if version == "" || version == "dev" {
+		if bi, ok := debug.ReadBuildInfo(); ok {
+			v, c, d := fromBuildInfo(bi)
+			if v != "" {
+				version = v
+			}
+			if c != "" {
+				commit = c
+			}
+			if d != "" {
+				date = d
+			}
+		}
+	}
+	if version == "" {
+		version = "unknown"
+	}
+	if commit == "" {
+		commit = "unknown"
+	}
+	if date == "" {
+		date = "unknown"
+	}
+	return version, commit, date
+}
+
+// fromBuildInfo extracts version/commit/date from a debug.BuildInfo. It is a
+// pure helper (no globals, no I/O) so it can be unit-tested directly. The main
+// module version is used unless it is empty or the "(devel)" placeholder; the
+// commit and date come from the vcs.revision / vcs.time build settings.
+func fromBuildInfo(bi *debug.BuildInfo) (v, c, d string) {
+	if bi == nil {
+		return "", "", ""
+	}
+	if bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+		v = bi.Main.Version
+	}
+	for _, s := range bi.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			c = s.Value
+		case "vcs.time":
+			d = s.Value
+		}
+	}
+	return v, c, d
 }
 
 func (a *app) setupCommand() *cobra.Command {
@@ -109,7 +195,16 @@ func groupCommand(use, short string) *cobra.Command {
 
 func (a *app) reposCommand() *cobra.Command {
 	cmd := groupCommand("repos", "Manage registered bare repositories")
-	cmd.AddCommand(a.reposAddCommand(), a.reposListCommand(), a.reposSyncCommand(), a.reposRemoveCommand())
+	cmd.AddCommand(
+		a.reposAddCommand(),
+		a.reposListCommand(),
+		a.reposSyncCommand(),
+		a.reposRemoveCommand(),
+		a.reposDescribeCommand(),
+		a.reposTethersCommand(),
+		a.reposTetherCommand(),
+		a.reposForgetCommand(),
+	)
 	return cmd
 }
 
@@ -179,7 +274,8 @@ func (a *app) reposAddCommand() *cobra.Command {
 }
 
 func (a *app) reposListCommand() *cobra.Command {
-	return &cobra.Command{
+	var verbose bool
+	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List registered repositories",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -192,13 +288,27 @@ func (a *app) reposListCommand() *cobra.Command {
 				names = append(names, name)
 			}
 			sort.Strings(names)
+			tetherCounts := map[string]int{}
+			if verbose {
+				if f, err := tether.Load(tether.Path(*cfg)); err == nil {
+					for _, t := range f.Tethers {
+						tetherCounts[t.From]++
+					}
+				}
+			}
 			for _, name := range names {
 				repo := cfg.Repos[name]
-				fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\n", name, repo.URL, repo.BareRepoPath)
+				if verbose {
+					fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\t%s\ttethers=%d\n", name, repo.URL, repo.BareRepoPath, repo.Description, tetherCounts[name])
+				} else {
+					fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\n", name, repo.URL, repo.BareRepoPath)
+				}
 			}
 			return nil
 		},
 	}
+	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "include descriptions and tether counts")
+	return cmd
 }
 
 func (a *app) reposSyncCommand() *cobra.Command {
@@ -258,6 +368,221 @@ func (a *app) reposRemoveCommand() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+func (a *app) reposDescribeCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "describe <repo> [text]",
+		Short: "Show or set a registered repository's description",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, path, err := a.loadConfig()
+			if err != nil {
+				return err
+			}
+			name := args[0]
+			repo, ok := cfg.Repos[name]
+			if !ok {
+				return fmt.Errorf("repo %q is not registered", name)
+			}
+			if len(args) > 1 {
+				repo.Description = strings.Join(args[1:], " ")
+				cfg.Repos[name] = repo
+				if err := cfg.Save(path); err != nil {
+					return err
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "described %s\n", name)
+				return nil
+			}
+			if repo.Description == "" {
+				return fmt.Errorf("repo %q has no description; set one with: stave repos describe %s <text>", name, name)
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), repo.Description)
+			return nil
+		},
+	}
+}
+
+// tetherRow is the typed --json row for `stave repos tethers`.
+type tetherRow struct {
+	To       string    `json:"to"`
+	ToMode   string    `json:"toMode"`
+	Strength string    `json:"strength"`
+	Count    int       `json:"count"`
+	Pinned   string    `json:"pinned,omitempty"`
+	LastSeen time.Time `json:"lastSeen"`
+}
+
+func (a *app) reposTethersCommand() *cobra.Command {
+	var jsonOut bool
+	cmd := &cobra.Command{
+		Use:   "tethers <repo>",
+		Short: "Show learned co-occurrence tethers originating from a repo",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, _, err := a.loadConfig()
+			if err != nil {
+				return err
+			}
+			name := args[0]
+			if _, ok := cfg.Repos[name]; !ok {
+				return fmt.Errorf("repo %q is not registered", name)
+			}
+			f, err := tether.Load(tether.Path(*cfg))
+			if err != nil {
+				return err
+			}
+			threshold := cfg.Tethers.StrongThreshold
+			rows := make([]tetherRow, 0)
+			for _, t := range f.Tethers {
+				if t.From != name {
+					continue
+				}
+				rows = append(rows, tetherRow{
+					To:       t.To,
+					ToMode:   string(t.ToMode),
+					Strength: string(tether.EffectiveStrength(t, threshold)),
+					Count:    t.Count,
+					Pinned:   string(t.Pinned),
+					LastSeen: t.LastSeen,
+				})
+			}
+			sort.SliceStable(rows, func(i, j int) bool {
+				si, sj := rows[i].Strength == string(tether.Strong), rows[j].Strength == string(tether.Strong)
+				if si != sj {
+					return si // strong before weak
+				}
+				if rows[i].Count != rows[j].Count {
+					return rows[i].Count > rows[j].Count
+				}
+				return rows[i].To < rows[j].To
+			})
+			if jsonOut {
+				return writeJSON(cmd.OutOrStdout(), rows)
+			}
+			for _, row := range rows {
+				pinned := ""
+				if row.Pinned != "" {
+					pinned = fmt.Sprintf(" (pinned %s)", row.Pinned)
+				}
+				lastSeen := "never"
+				if !row.LastSeen.IsZero() {
+					lastSeen = row.LastSeen.Format(time.RFC3339)
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\tcount=%d\tlast-seen=%s%s\n", row.To, row.ToMode, row.Strength, row.Count, lastSeen, pinned)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON")
+	return cmd
+}
+
+func (a *app) reposTetherCommand() *cobra.Command {
+	var strong, weak, edit, reference bool
+	cmd := &cobra.Command{
+		Use:   "tether <from> <to>",
+		Short: "Pin a manual co-occurrence tether between two registered repos",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if strong && weak {
+				return fmt.Errorf("choose at most one of --strong or --weak")
+			}
+			if edit && reference {
+				return fmt.Errorf("choose at most one of --edit or --reference")
+			}
+			cfg, _, err := a.loadConfig()
+			if err != nil {
+				return err
+			}
+			from, to := args[0], args[1]
+			if from == to {
+				return fmt.Errorf("cannot tether repo %q to itself", from)
+			}
+			if _, ok := cfg.Repos[from]; !ok {
+				return fmt.Errorf("repo %q is not registered", from)
+			}
+			if _, ok := cfg.Repos[to]; !ok {
+				return fmt.Errorf("repo %q is not registered", to)
+			}
+			pin := tether.Strong
+			if weak {
+				pin = tether.Weak
+			}
+			// Default association mode is reference (OQ-D); --edit overrides.
+			toMode := tether.ModeReference
+			if edit {
+				toMode = tether.ModeEdit
+			}
+			if err := tether.Update(tether.Path(*cfg), func(f *tether.File) error {
+				tether.Pin(f, from, to, pin)
+				for i := range f.Tethers {
+					if f.Tethers[i].From == from && f.Tethers[i].To == to {
+						if edit || reference {
+							f.Tethers[i].ToMode = toMode
+						}
+						// Recompute-on-write (D6): stamp the effective strength so
+						// the persisted classification reflects the manual pin.
+						f.Tethers[i].Strength = tether.EffectiveStrength(f.Tethers[i], cfg.Tethers.StrongThreshold)
+						break
+					}
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "pinned %s -> %s as %s\n", from, to, pin)
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&strong, "strong", false, "pin the tether as strong (default)")
+	cmd.Flags().BoolVar(&weak, "weak", false, "pin the tether as weak")
+	cmd.Flags().BoolVar(&edit, "edit", false, "record the association mode as edit")
+	cmd.Flags().BoolVar(&reference, "reference", false, "record the association mode as reference (default)")
+	return cmd
+}
+
+func (a *app) reposForgetCommand() *cobra.Command {
+	var all bool
+	cmd := &cobra.Command{
+		Use:   "forget <from> [to]",
+		Short: "Remove co-occurrence tethers originating from a repo",
+		Args:  cobra.RangeArgs(1, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, _, err := a.loadConfig()
+			if err != nil {
+				return err
+			}
+			from := args[0]
+			if _, ok := cfg.Repos[from]; !ok {
+				return fmt.Errorf("repo %q is not registered", from)
+			}
+			if all && len(args) == 2 {
+				return fmt.Errorf("pass either a <to> repo or --all, not both")
+			}
+			if !all && len(args) == 1 {
+				return fmt.Errorf("specify a <to> repo or --all to forget every tether from %q", from)
+			}
+			if err := tether.Update(tether.Path(*cfg), func(f *tether.File) error {
+				if all {
+					tether.RemoveAll(f, from)
+				} else {
+					tether.Remove(f, from, args[1])
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+			if all {
+				fmt.Fprintf(cmd.OutOrStdout(), "forgot all tethers from %s\n", from)
+			} else {
+				fmt.Fprintf(cmd.OutOrStdout(), "forgot tether %s -> %s\n", from, args[1])
+			}
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&all, "all", false, "remove every tether originating from <from>")
+	return cmd
 }
 
 func (a *app) agentCommand() *cobra.Command {
@@ -504,6 +829,9 @@ func (a *app) createCommand() *cobra.Command {
 	var after []string
 	var dryRun bool
 	var summonName string
+	var common bool
+	var includeWeak bool
+	var noLearn bool
 	cmd := &cobra.Command{
 		Use:   "create <space-id>",
 		Short: "Create a workspace and add edit/reference repos in one command",
@@ -528,17 +856,32 @@ func (a *app) createCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := svc.Create(cmd.Context(), space.CreateOptions{
+			createOpts := space.CreateOptions{
 				ID:         spaceID,
 				Kind:       kind,
 				SpecPath:   spec,
 				Edits:      editSpecs,
 				References: refSpecs,
 				Memories:   memories,
+				NoLearn:    noLearn,
 				DryRun:     dryRun,
 				SagaID:     sagaID,
 				After:      after,
-			}); err != nil {
+			}
+			// -c/--common (and --include-weak) expand the edited repos' learned
+			// tethers into extra reference worktrees via the service (D1). The
+			// result feeds CommonReferences, not References (OQ-E).
+			if common || includeWeak {
+				extra, notes, err := svc.ExpandCommonRefs(svc.Config, editSpecs, refSpecs, includeWeak)
+				if err != nil {
+					return err
+				}
+				for _, note := range notes {
+					fmt.Fprintln(cmd.OutOrStdout(), note)
+				}
+				createOpts.CommonReferences = extra
+			}
+			if err := svc.Create(cmd.Context(), createOpts); err != nil {
 				return err
 			}
 			if summonName == "" {
@@ -565,6 +908,9 @@ func (a *app) createCommand() *cobra.Command {
 	cmd.Flags().StringArrayVar(&after, "after", nil, "member id the new space lands behind (requires --saga; repeatable)")
 	cmd.Flags().StringVar(&summonName, "summon", "", "launch a summoner after creation (codex, claude, or cursor)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print operations without changing state")
+	cmd.Flags().BoolVarP(&common, "common", "c", false, "also add reference worktrees for the edited repos' strong learned tethers")
+	cmd.Flags().BoolVar(&includeWeak, "include-weak", false, "with --common, include weak tethers too")
+	cmd.Flags().BoolVar(&noLearn, "no-learn", false, "do not record co-occurrence tethers for this create")
 	cmd.Flags().SetInterspersed(false)
 	return cmd
 }
@@ -1260,7 +1606,6 @@ func (a *app) portalSummonCommand() *cobra.Command {
 }
 
 func (a *app) portalLogsCommand() *cobra.Command {
-	var agentName string
 	var follow, dryRun, printCommand bool
 	var tail int
 	cmd := &cobra.Command{
@@ -1270,11 +1615,10 @@ func (a *app) portalLogsCommand() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			preview := dryRun || printCommand
 			return a.runPortalPlanningCommand(cmd, func(svc portal.Service) (portal.Plan, error) {
-				return svc.PlanLogs(cmd.Context(), portal.LogsOptions{SpaceID: args[0], PortalID: optionalPortalID(args), Agent: agentName, Follow: follow, Tail: tail, DryRun: preview})
+				return svc.PlanLogs(cmd.Context(), portal.LogsOptions{SpaceID: args[0], PortalID: optionalPortalID(args), Follow: follow, Tail: tail, DryRun: preview})
 			}, preview, false)
 		},
 	}
-	cmd.Flags().StringVar(&agentName, "agent", "", "agent session name")
 	cmd.Flags().BoolVar(&follow, "follow", false, "follow logs")
 	cmd.Flags().IntVar(&tail, "tail", 100, "number of lines")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview the commands without running them")
@@ -1302,13 +1646,12 @@ func (a *app) portalDownCommand() *cobra.Command {
 }
 
 func (a *app) portalDetachCommand() *cobra.Command {
-	var dryRun, yes bool
+	var dryRun bool
 	cmd := &cobra.Command{
 		Use:   "detach <space-id> [portal-id]",
 		Short: "Remove attach-only portal metadata",
 		Args:  cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			_ = yes
 			svc, err := a.portalService(cmd)
 			if err != nil {
 				return err
@@ -1322,26 +1665,24 @@ func (a *app) portalDetachCommand() *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview without writing")
-	cmd.Flags().BoolVar(&yes, "yes", false, "confirm detach")
 	return cmd
 }
 
 func (a *app) portalDestroyCommand() *cobra.Command {
 	var timeout int
-	var deleteVolumes, deleteRemoteData, force, dryRun bool
+	var deleteVolumes, force, dryRun bool
 	cmd := &cobra.Command{
 		Use:   "destroy <space-id> [portal-id]",
 		Short: "Destroy Stave-owned portal runtime resources",
 		Args:  cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return a.runPortalPlanningCommand(cmd, func(svc portal.Service) (portal.Plan, error) {
-				return svc.PlanDestroy(cmd.Context(), portal.DestroyOptions{SpaceID: args[0], PortalID: optionalPortalID(args), Timeout: timeout, DeleteVolumes: deleteVolumes, DeleteRemoteData: deleteRemoteData, Force: force, DryRun: dryRun})
+				return svc.PlanDestroy(cmd.Context(), portal.DestroyOptions{SpaceID: args[0], PortalID: optionalPortalID(args), Timeout: timeout, DeleteVolumes: deleteVolumes, Force: force, DryRun: dryRun})
 			}, dryRun, false)
 		},
 	}
 	cmd.Flags().IntVar(&timeout, "timeout", 0, "graceful stop timeout in seconds")
 	cmd.Flags().BoolVar(&deleteVolumes, "delete-volumes", false, "delete recorded Stave-owned volumes")
-	cmd.Flags().BoolVar(&deleteRemoteData, "delete-remote-data", false, "delete exact recorded remote data when supported")
 	cmd.Flags().BoolVar(&force, "force", false, "force destroy")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview the commands without running them")
 	return cmd
@@ -1355,6 +1696,7 @@ func (a *app) addCommand() *cobra.Command {
 	var noFetch bool
 	var dryRun bool
 	var linkMemory bool
+	var noLearn bool
 	cmd := &cobra.Command{
 		Use:   "add <space-id> <repo>",
 		Short: "Add an editable or reference repository worktree to a space",
@@ -1374,15 +1716,17 @@ func (a *app) addCommand() *cobra.Command {
 				return err
 			}
 			return svc.AddRepo(cmd.Context(), space.AddOptions{
-				SpaceID:    args[0],
-				RepoName:   args[1],
-				Mode:       mode,
-				Base:       base,
-				Ref:        ref,
-				Branch:     branch,
-				NoFetch:    noFetch,
-				DryRun:     dryRun,
-				LinkMemory: linkMemory,
+				SpaceID:      args[0],
+				RepoName:     args[1],
+				Mode:         mode,
+				Base:         base,
+				Ref:          ref,
+				Branch:       branch,
+				NoFetch:      noFetch,
+				DryRun:       dryRun,
+				LinkMemory:   linkMemory,
+				CaptureOnAdd: true,
+				NoLearn:      noLearn,
 			})
 		},
 	}
@@ -1393,6 +1737,7 @@ func (a *app) addCommand() *cobra.Command {
 	cmd.Flags().BoolVar(&noFetch, "no-fetch", false, "skip fetching the bare repo before adding the worktree")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print operations without changing state")
 	cmd.Flags().BoolVar(&linkMemory, "link-memory", true, "resolve an added reference repo into a read-only memory link when the space has memory attached")
+	cmd.Flags().BoolVar(&noLearn, "no-learn", false, "do not record co-occurrence tethers for this add")
 	return cmd
 }
 
@@ -1838,6 +2183,10 @@ func (a *app) runPortalPlanningCommand(cmd *cobra.Command, build func(portal.Ser
 	if dryRun || printOnly || len(plan.Commands) == 0 {
 		return nil
 	}
+	// On the execution path the preview plan (with its diagnostics) is not
+	// printed, so surface warn/error diagnostics (e.g. summon.cursor_partial)
+	// to stderr before running the commands. Info-severity notes stay quiet.
+	printPortalPlanWarnings(cmd.ErrOrStderr(), plan)
 	previousFailed := false
 	var suppressed []string
 	for _, command := range plan.Commands {
@@ -1952,10 +2301,26 @@ func printPortalPlan(out io.Writer, errOut io.Writer, plan portal.Plan) {
 	// Diagnostics are advisory, not part of the copy-pasteable preview, so
 	// they go to stderr where they cannot pollute script-captured stdout.
 	for _, diagnostic := range plan.Diagnostics {
-		fmt.Fprintf(errOut, "[%s] %s: %s\n", diagnostic.Severity, diagnostic.Code, diagnostic.Message)
-		if diagnostic.NextAction != "" {
-			fmt.Fprintf(errOut, "  next: %s\n", diagnostic.NextAction)
+		printPortalDiagnostic(errOut, diagnostic)
+	}
+}
+
+// printPortalPlanWarnings surfaces only warn- and error-severity diagnostics.
+// It is used on the execution path, where the full plan preview (and its
+// info-severity notes) is not printed but actionable warnings must still reach
+// the user.
+func printPortalPlanWarnings(errOut io.Writer, plan portal.Plan) {
+	for _, diagnostic := range plan.Diagnostics {
+		if diagnostic.Severity == portal.SeverityWarn || diagnostic.Severity == portal.SeverityError {
+			printPortalDiagnostic(errOut, diagnostic)
 		}
+	}
+}
+
+func printPortalDiagnostic(errOut io.Writer, diagnostic portal.Diagnostic) {
+	fmt.Fprintf(errOut, "[%s] %s: %s\n", diagnostic.Severity, diagnostic.Code, diagnostic.Message)
+	if diagnostic.NextAction != "" {
+		fmt.Fprintf(errOut, "  next: %s\n", diagnostic.NextAction)
 	}
 }
 

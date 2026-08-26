@@ -14,11 +14,13 @@ import (
 	"github.com/Nurozen/stave/internal/git"
 	"github.com/Nurozen/stave/internal/portal"
 	"github.com/Nurozen/stave/internal/space"
+	"github.com/Nurozen/stave/internal/tether"
 )
 
 const (
 	ToolReposList            = "stave_repos_list"
 	ToolReposSync            = "stave_repos_sync"
+	ToolReposTethers         = "stave_repos_tethers"
 	ToolSpaceStatus          = "stave_space_status"
 	ToolSpaceSync            = "stave_space_sync"
 	ToolSpaceCreate          = "stave_space_create"
@@ -148,6 +150,14 @@ func ToolDefinitions() []ToolDefinition {
 			Parameters:  objectSchema(nil, nil),
 		},
 		{
+			Name:        ToolReposTethers,
+			Category:    ToolCategoryRead,
+			Description: "List learned co-occurrence tethers for a registered repo (strong first, with counts). Read-only.",
+			Parameters: objectSchema(map[string]any{
+				"repo": stringSchema("Registered repo name to list tethers for."),
+			}, []string{"repo"}),
+		},
+		{
 			Name:        ToolReposSync,
 			Category:    ToolCategoryMutate,
 			Description: "Propose synchronizing registered bare repository caches with their remotes using fetch/prune. Use this when the user asks to update repo caches, refresh all repos, or sync one registered repo. This is a mutating Git/network operation and will be queued for user confirmation before execution.",
@@ -187,6 +197,8 @@ func ToolDefinitions() []ToolDefinition {
 					"description": "Optional memory attachments as [provider:]<spec> strings; use \".\" for a fresh task store on the default provider.",
 					"items":       map[string]any{"type": "string"},
 				},
+				"common":       boolSchema("When true, expand each editable repo's strong tethers into reference worktrees (-c)."),
+				"include_weak": boolSchema("When true, widen tether expansion to weak tethers (implies common)."),
 			}, []string{"space_id"}),
 		},
 		{
@@ -518,6 +530,12 @@ func (d *ToolDispatcher) dispatch(ctx context.Context, call ToolCall) ToolResult
 	switch call.Name {
 	case ToolReposList:
 		return d.reposList(call)
+	case ToolReposTethers:
+		var args reposTethersArgs
+		if err := decodeToolArgs(call.Arguments, &args); err != nil {
+			return toolError(call, err)
+		}
+		return d.reposTethers(call, args.Repo)
 	case ToolReposSync:
 		var args reposSyncArgs
 		if err := decodeToolArgs(call.Arguments, &args); err != nil {
@@ -547,7 +565,7 @@ func (d *ToolDispatcher) dispatch(ctx context.Context, call ToolCall) ToolResult
 		if err != nil {
 			return toolError(call, err)
 		}
-		op := Operation{Type: OpSpaceCreate, SpaceID: args.SpaceID, Kind: args.Kind, SpecPath: args.SpecPath, Edits: edits, References: args.References, Memories: args.Memories}
+		op := Operation{Type: OpSpaceCreate, SpaceID: args.SpaceID, Kind: args.Kind, SpecPath: args.SpecPath, Edits: edits, References: args.References, Memories: args.Memories, Common: args.Common || args.IncludeWeak, IncludeWeak: args.IncludeWeak}
 		return d.queueOperation(call, op)
 	case ToolSpaceAdd:
 		var args spaceAddArgs
@@ -837,6 +855,46 @@ func (d *ToolDispatcher) reposList(call ToolCall) ToolResult {
 	return result
 }
 
+// reposTethers lists the learned co-occurrence tethers whose From matches repo,
+// strong-first (Count desc, then To), with derived effective strength. It is
+// read-only: it loads the sidecar via tether.Load and queues no operation.
+func (d *ToolDispatcher) reposTethers(call ToolCall, repo string) ToolResult {
+	if _, ok := d.Config.Repos[repo]; !ok {
+		return toolError(call, fmt.Errorf("repo %q is not registered", repo))
+	}
+	f, err := tether.Load(tether.Path(d.Config))
+	if err != nil {
+		return toolError(call, err)
+	}
+	threshold := d.Config.Tethers.StrongThreshold
+	rows := tether.Find(f, repo)
+	tethers := make([]map[string]any, 0, len(rows))
+	for i := range rows {
+		rows[i].Strength = tether.EffectiveStrength(rows[i], threshold)
+	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		si, sj := rows[i].Strength == tether.Strong, rows[j].Strength == tether.Strong
+		if si != sj {
+			return si
+		}
+		if rows[i].Count != rows[j].Count {
+			return rows[i].Count > rows[j].Count
+		}
+		return rows[i].To < rows[j].To
+	})
+	for _, t := range rows {
+		tethers = append(tethers, map[string]any{
+			"to":       t.To,
+			"mode":     string(t.ToMode),
+			"count":    t.Count,
+			"strength": string(t.Strength),
+		})
+	}
+	result := toolOK(call, map[string]any{"repo": repo, "tethers": tethers}, fmt.Sprintf("listed %d tethers for %s", len(tethers), repo))
+	d.Session.ReadResults = append(d.Session.ReadResults, result)
+	return result
+}
+
 func (d *ToolDispatcher) spaceStatus(ctx context.Context, call ToolCall, spaceID string) ToolResult {
 	if err := config.ValidateSpaceID(spaceID); err != nil {
 		return toolError(call, err)
@@ -1023,6 +1081,10 @@ type reposSyncArgs struct {
 	Repo string `json:"repo"`
 }
 
+type reposTethersArgs struct {
+	Repo string `json:"repo"`
+}
+
 type spaceStatusArgs struct {
 	SpaceID string `json:"space_id"`
 }
@@ -1033,12 +1095,14 @@ type spaceSyncArgs struct {
 }
 
 type spaceCreateArgs struct {
-	SpaceID    string    `json:"space_id"`
-	Kind       string    `json:"kind"`
-	SpecPath   string    `json:"spec_path"`
-	Edits      []RepoRef `json:"edits"`
-	References []RepoRef `json:"references"`
-	Memories   []string  `json:"memories"`
+	SpaceID     string    `json:"space_id"`
+	Kind        string    `json:"kind"`
+	SpecPath    string    `json:"spec_path"`
+	Edits       []RepoRef `json:"edits"`
+	References  []RepoRef `json:"references"`
+	Memories    []string  `json:"memories"`
+	Common      bool      `json:"common"`
+	IncludeWeak bool      `json:"include_weak"`
 }
 
 type spaceAddArgs struct {

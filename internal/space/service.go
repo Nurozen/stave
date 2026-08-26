@@ -17,6 +17,7 @@ import (
 	"github.com/Nurozen/stave/internal/gh"
 	"github.com/Nurozen/stave/internal/git"
 	"github.com/Nurozen/stave/internal/memory"
+	"github.com/Nurozen/stave/internal/tether"
 )
 
 type Git interface {
@@ -77,6 +78,20 @@ type CreateOptions struct {
 	SpecPath   string
 	Edits      []RepoSpec
 	References []RepoSpec
+	// CommonReferences are extra reference specs expanded from repo tethers
+	// (-c/--common via ExpandCommonRefs). They get materialized as reference
+	// worktrees exactly like References, but are deliberately NOT fed to
+	// co-occurrence capture: expanded refs earn worktrees, they do not
+	// reinforce the counts that produced them (OQ-E).
+	CommonReferences []RepoSpec
+	// NoLearn suppresses passive co-occurrence capture for this create
+	// (--no-learn). The space is built normally; only the tether recording is
+	// skipped.
+	NoLearn bool
+	// suppressCapture (unexported) blocks capture on the inner non-saga Create
+	// composed by createInSaga, so the saga member's realized set is captured
+	// exactly once, OUTSIDE the per-saga lock (D2).
+	suppressCapture bool
 	// Memories are raw `[provider:]<spec>` values from --memory (repeatable).
 	// Empty with config memory.default:true triggers ambient attach.
 	Memories []string
@@ -124,6 +139,13 @@ type AddOptions struct {
 	// den link) so the den gains a read-only link (S4 §3.6 space add parity).
 	// Soft: link failures print a notice, the repo is added regardless.
 	LinkMemory bool
+	// CaptureOnAdd records the delta co-occurrence tethers implied by this add
+	// (D5). A plain `stave space add` sets it; Create's internal loops leave it
+	// false so the whole realized set is captured once by captureCoOccurrence
+	// (no double count).
+	CaptureOnAdd bool
+	// NoLearn suppresses the CaptureOnAdd delta recording (--no-learn).
+	NoLearn bool
 	// sagaLockHeld: the caller already holds this space's per-saga lock, so
 	// the saga-manifest lock wiring must not re-acquire it (non-reentrant).
 	sagaLockHeld bool
@@ -384,7 +406,15 @@ func (s Service) Create(ctx context.Context, opts CreateOptions) error {
 		return fmt.Errorf("--after requires --saga")
 	}
 	if opts.SagaID != "" {
-		return s.createInSaga(ctx, opts)
+		if err := s.createInSaga(ctx, opts); err != nil {
+			return err
+		}
+		// Capture the realized set OUTSIDE the per-saga lock (D2): the inner
+		// Create ran with suppressCapture set, so this is the only recording.
+		if !opts.DryRun && !opts.NoLearn {
+			s.captureCoOccurrence(opts.Edits, opts.References)
+		}
+		return nil
 	}
 	if opts.DryRun {
 		return s.createDryRun(ctx, opts)
@@ -404,7 +434,25 @@ func (s Service) Create(ctx context.Context, opts CreateOptions) error {
 			return err
 		}
 	}
-	return s.attachMemoriesAfterCreate(ctx, opts)
+	// Tether-expanded references (-c/--common) get worktrees exactly like
+	// explicit references, but are excluded from capture below (OQ-E).
+	for _, spec := range opts.CommonReferences {
+		if err := s.AddRepo(ctx, AddOptions{SpaceID: opts.ID, RepoName: spec.Name, Mode: ModeReference, Ref: spec.Ref, DryRun: opts.DryRun, LinkMemory: true, sagaLockHeld: opts.sagaLockHeld}); err != nil {
+			return err
+		}
+	}
+	// The repos are durably materialized before memory attach runs; capture is
+	// tied to durable materialization, not command success (a failed explicit
+	// --memory attach must not lose the co-occurrence record). Hold the attach
+	// error, run capture, then surface it.
+	memErr := s.attachMemoriesAfterCreate(ctx, opts)
+	// Passive co-occurrence capture: only the explicit realized set (edits and
+	// -r references), never the -c expansion (OQ-E). suppressCapture is set by
+	// createInSaga so the saga path records once, outside the lock (D2).
+	if !opts.DryRun && !opts.suppressCapture && !opts.NoLearn {
+		s.captureCoOccurrence(opts.Edits, opts.References)
+	}
+	return memErr
 }
 
 func (s Service) createDryRun(ctx context.Context, opts CreateOptions) error {
@@ -448,16 +496,43 @@ func (s Service) createDryRun(ctx context.Context, opts CreateOptions) error {
 		s.printf("dry-run: fetch %s\n", repoCfg.BareRepoPath)
 		s.printf("dry-run: add reference worktree %s at %s\n", ref, filepath.Join(spacePath, "references", spec.Name))
 	}
+	for _, spec := range opts.CommonReferences {
+		repoCfg, ok := s.Config.Repos[spec.Name]
+		if !ok {
+			return fmt.Errorf("repo %q is not registered", spec.Name)
+		}
+		ref := normalizeRemoteRef(firstNonEmpty(spec.Ref, repoCfg.DefaultBranch, s.Config.DefaultBase))
+		s.printf("dry-run: fetch %s\n", repoCfg.BareRepoPath)
+		s.printf("dry-run: add reference worktree %s at %s (from repo tethers)\n", ref, filepath.Join(spacePath, "references", spec.Name))
+	}
 	// Memory dry-run lines (no binary invoke).
 	return s.attachMemoriesAfterCreate(ctx, opts)
 }
 
 // attachMemoriesAfterCreate runs explicit --memory specs and/or ambient default.
+//
+// Memory linking sees BOTH explicit -r references AND tether-expanded
+// -c/--common references (deduplicated by Name): every materialized reference
+// worktree earns its read-only memory/vault link. This is deliberately wider
+// than co-occurrence capture, which stays edits ∪ explicit references only
+// (-c refs earn worktrees + memory links but do not reinforce counts — OQ-E).
 func (s Service) attachMemoriesAfterCreate(ctx context.Context, opts CreateOptions) error {
+	refs := append([]RepoSpec(nil), opts.References...)
+	seen := map[string]bool{}
+	for _, r := range refs {
+		seen[r.Name] = true
+	}
+	for _, r := range opts.CommonReferences {
+		if seen[r.Name] {
+			continue
+		}
+		seen[r.Name] = true
+		refs = append(refs, r)
+	}
 	return s.AttachMemories(ctx, AttachMemoriesOptions{
 		SpaceID:      opts.ID,
 		Specs:        opts.Memories,
-		References:   opts.References,
+		References:   refs,
 		SkipAmbient:  opts.SkipAmbientMemory,
 		DryRun:       opts.DryRun,
 		Lifetime:     opts.ownedMemoryLifetime,
@@ -760,6 +835,9 @@ func (s Service) AddRepo(ctx context.Context, opts AddOptions) error {
 	if err != nil {
 		return err
 	}
+	// Snapshot the repo slice BEFORE the new entry is appended: captureDeltaOnAdd
+	// records only pairs involving the added repo, against this prior set (D13).
+	priorRepos := append([]RepoManifest(nil), manifest.Repos...)
 	if manifest.Saga != nil {
 		if opts.Mode == ModeEdit {
 			return fmt.Errorf("saga space %q holds no edit worktrees; add the repo to a member space instead", opts.SpaceID)
@@ -868,6 +946,15 @@ func (s Service) AddRepo(ctx context.Context, opts AddOptions) error {
 	sort.Slice(manifest.Repos, func(i, j int) bool { return manifest.Repos[i].Path < manifest.Repos[j].Path })
 	if err := SaveManifest(spacePath, manifest); err != nil {
 		return err
+	}
+	// Delta co-occurrence capture (D5): after the manifest is durably saved,
+	// before best-effort AGENTS.md / memory linking. Best-effort itself.
+	if !opts.DryRun && opts.CaptureOnAdd && !opts.NoLearn {
+		addedMode := tether.ModeReference
+		if opts.Mode == ModeEdit {
+			addedMode = tether.ModeEdit
+		}
+		s.captureDeltaOnAdd(priorRepos, opts.RepoName, addedMode)
 	}
 	if err := s.writeAgents(spacePath, manifest); err != nil {
 		return err

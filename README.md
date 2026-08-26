@@ -43,6 +43,8 @@ configured coding agent is summoned into it.
 go install github.com/Nurozen/stave/cmd/stave@latest
 ```
 
+Run `stave version` to print the installed version, commit, and build date.
+
 To let `stave space create` and `stave review` enter the new space in your
 current shell, inscribe the matching shell integration once:
 
@@ -74,6 +76,7 @@ administrator symlink privileges.
 ```text
 stave
 ├── setup
+├── version
 ├── inscribe
 │   └── shell --zsh|--bash
 ├── shell-init bash|zsh
@@ -97,9 +100,13 @@ stave
 │   └── down|detach|destroy <space-id> [portal-id]
 ├── repos
 │   ├── add <name> <url>
-│   ├── list
+│   ├── list [--verbose]
 │   ├── sync [name]
-│   └── remove <name>
+│   ├── remove <name>
+│   ├── describe <repo> [text]
+│   ├── tethers <repo> [--json]
+│   ├── tether <from> <to> [--strong|--weak|--edit|--reference]
+│   └── forget <from> [to] [--all]
 ├── memory
 │   ├── providers
 │   ├── attach <space-id>
@@ -109,7 +116,7 @@ stave
 │   ├── propose <space-id>
 │   └── detach <space-id> [--keep|--destroy]
 ├── saga
-│   ├── create <saga-id> [--memory ...] [--summon ...]
+│   ├── create <saga-id> [--memory ...] [--summon ...] [--no-learn]
 │   ├── list [--json]
 │   ├── status <saga-id> [--json]
 │   ├── sync <saga-id>
@@ -119,8 +126,8 @@ stave
 │   └── destroy <saga-id> [--memory keep|destroy|contribute]
 └── space
     ├── init <space-id>
-    ├── create <space-id> [--memory ...] [--saga <saga-id> [--after ...]]
-    ├── add <space-id> <repo>
+    ├── create <space-id> [--memory ...] [--saga <saga-id> [--after ...]] [-c/--common] [--include-weak] [--no-learn]
+    ├── add <space-id> <repo> [--no-learn]
     ├── sync <space-id>
     ├── status <space-id>
     ├── archive <space-id>
@@ -299,6 +306,16 @@ Global flag on all commands: `--config <path>` (default `~/.config/stave/config.
 |---------|-------------|
 | `stave setup` | Create root directories and write config |
 
+### `stave version`
+
+| Command | Description |
+|---------|-------------|
+| `stave version` | Print the Stave version, commit, and build date |
+
+Release builds carry the values injected at link time; `go install`ed binaries
+fall back to `runtime/debug` build info, and any missing field prints as
+`unknown`.
+
 ### `stave inscribe`
 
 | Command | Description |
@@ -325,11 +342,18 @@ migrated into the managed block.
 | Command | Description |
 |---------|-------------|
 | `stave repos add <name> <url>` | Clone bare mirror and register |
-| `stave repos list` | List registered repos |
+| `stave repos list [--verbose]` | List registered repos; `--verbose` appends each repo's description and learned tether count |
 | `stave repos sync [name]` | `git fetch --all --prune` on bare mirror(s) |
 | `stave repos remove <name>` | Unregister (does not delete bare cache) |
+| `stave repos describe <repo> [text]` | Set the repo's description when text is given; print it otherwise (non-zero exit if unset) |
+| `stave repos tethers <repo> [--json]` | List the repo's learned co-occurrence tethers, strong first, with mode, effective strength, and count |
+| `stave repos tether <from> <to> [--strong\|--weak] [--edit\|--reference]` | Manually pin a tether without waiting for it to be learned; strength defaults to strong, association mode to reference |
+| `stave repos forget <from> [<to>] [--all]` | Remove one `<from> → <to>` tether, or every tether from `<from>` with `--all` |
 
-Flags: `--dry-run` on `add`.
+Flags: `--dry-run` on `add`. `--strong`/`--weak` and `--edit`/`--reference` are
+each mutually exclusive on `tether`; `forget` requires exactly one of a `<to>`
+argument or `--all`. See [Learned repo tethers](#learned-repo-tethers) for the
+model behind these commands.
 
 ### `stave agent`
 
@@ -357,6 +381,7 @@ The agent uses provider-native tool calls, not a free-form JSON response. OpenAI
 | Tool | Behavior |
 |------|----------|
 | `stave_repos_list` | Read registered repos during planning |
+| `stave_repos_tethers` | Read a repo's learned co-occurrence tethers during planning |
 | `stave_space_status` | Read one existing space during planning |
 | `stave_repos_sync` | Queue repo cache sync for confirmation |
 | `stave_space_sync` | Queue space sync for confirmation |
@@ -370,6 +395,12 @@ The agent uses provider-native tool calls, not a free-form JSON response. OpenAI
 | `stave_finish` | Finish planning with a summary, notes, and warnings |
 
 Read-only tools can run immediately while the model is planning. Mutating tools never apply changes inside the model loop; they only create a validated operation plan that Stave executes after confirmation, `--incant`, or `agent.autoIncant: true`. Summoning is interactive, so `--json` and non-interactive executions include the summon command but skip the launch.
+
+`stave_space_create` exposes the `-c/--common` behavior as two boolean args:
+`common` expands each editable repo's strong tethers into references, and
+`include_weak` widens that to weak tethers (and implies `common`). The planner
+and CLI share the same expansion, so a planned create behaves identically to the
+typed command.
 
 Destructive operations such as archive, destroy, repo removal, reset, delete, push, PR creation, issue tracker updates, and arbitrary shell commands are intentionally not executable by the agent in v1. The same exclusion covers saga mutation beyond membership: saga archive, saga destroy, saga remove, and space retarget remain non-executable by the agent, which records such requests via `stave_explain_unsupported`.
 
@@ -405,6 +436,9 @@ Space flags:
 | `--saga` | `create` | Register the new space as a member of this saga |
 | `--after` | `create` | Member id the new space lands behind (requires `--saga`; repeatable) |
 | `--summon` | `create` | Launch `codex`, `claude`, or `cursor` after the space is created |
+| `--common`, `-c` | `create` | Also add reference worktrees for the edited repos' **strong** learned tethers (see [Learned repo tethers](#learned-repo-tethers)) |
+| `--include-weak` | `create` | With `--common`, widen the expansion to weak tethers too (implies `-c`) |
+| `--no-learn` | `create`, `add` | Do not record co-occurrence tethers for this invocation |
 | `--edit`, `-e` / `--reference`, `-r` | `add` | Mode (exactly one required) |
 | `--base`, `-b` | `add` | Base branch/ref for edits (`space:<id>` sugar accepted), or ref for references |
 | `--branch` | `add` | Branch name for editable repos |
@@ -463,6 +497,29 @@ same base sugar and canonicalization apply, and a resolved `stave/...` base
 must exist in the bare repo. Archiving or destroying a space that a sibling
 still stacks on fails closed unless `--force` is given.
 
+### Learned repo tethers
+
+Stave already sees every `-e`/`-r` you pass, so it quietly remembers which repos
+you use together. Every non-dry-run `stave space create` and `stave space add`
+(and their agent-planner equivalents, and `stave review` pairings) records a
+directed **tether** from each editable repo to every other repo in the space,
+counting how often the pairing recurs and whether the other repo showed up as an
+edit or a reference. A tether crosses from **weak** to **strong** once its count
+reaches `tethers.strongThreshold` (default 3); you can also pin either strength
+by hand with `stave repos tether`.
+
+That learning pays off with `-c/--common` on `stave space create`: instead of
+re-typing the usual reference set, `-c` auto-pulls every strong tether of the
+repos you are editing as reference worktrees (`--include-weak` widens that to
+weak ones too), de-duplicated against your explicit `-e`/`-r` and skipping any
+repo that is no longer registered. `-c` only ever adds references — it never
+materializes extra editable worktrees — and the repos it pulls in do not
+themselves reinforce the counts, so the numbers stay a record of what you
+actually typed. Inspect what has been learned with `stave repos tethers <repo>`
+or `stave repos list --verbose`, and prune with `stave repos forget`. Learning
+is passive but easy to opt out of: pass `--no-learn` for a single create/add, or
+set `tethers.enabled: false` to turn capture off machine-wide.
+
 ### `stave saga`
 
 A **saga** is a coordinating space for work that spans several dependent
@@ -493,6 +550,7 @@ Saga flags:
 | `--reference`, `-r` | `create` | Detached reference worktree (`repo` or `repo:ref`; repeatable) |
 | `--memory` | `create` | Attach memory: `[provider:]<spec>`; `.` creates a fresh store (repeatable, at most one fresh) |
 | `--summon` | `create` | Launch `codex`, `claude`, or `cursor` after the saga is created |
+| `--no-learn` | `create` | Suppress tether learning for this invocation only — kept for surface symmetry with space `create`. The saga root is a reference-only space with no editable anchor, so the flag is effectively a no-op for the root and is not persisted to members; each member still learns unless it passes `--no-learn` on its own create |
 | `--after` | `add` | Member id this space lands behind (repeatable) |
 | `--clear-after` | `add` | Reset the member's `after` edges before applying `--after` |
 | `--json` | `list`, `status` | Emit machine-readable JSON (for `status`, the frozen `SagaStatus` contract) |
@@ -551,6 +609,11 @@ because a saga holds no edit worktrees — create a member instead. And
 `stave space init`/`create` refuse `-k saga`, because the kind is reserved for
 `stave saga create` (which sets it, and the member roster that goes with it).
 Anything after a literal `--` still forwards to the summoned agent as usual.
+
+`saga create` also rejects `-c`/`--common` and `--include-weak`: tether
+expansion is anchored on an editable repo, and a saga has none. Members created
+through `stave space create --saga … -e <repo> -c` still expand normally, since
+that path does carry an editable anchor.
 
 `saga status` lists members in dependency order, each with its lifecycle state
 (`live`, `archived`, `missing`, or `corrupt`), its `after` predecessors, and —
@@ -624,6 +687,15 @@ space as the source of truth.
 | `stave portal attach ec2 <space-id> <instance-id> --region <region>` | Attach an existing EC2 instance |
 | `stave portal status <space-id> --json` | Emit stable portal status JSON |
 | `stave portal summon <space-id> --with codex --mode print` | Print the in-portal agent launch command |
+| `stave portal summon <space-id> --with codex --mode tmux` | Launch the agent inside a detached tmux session on the portal target |
+
+`stave portal summon` takes `--mode foreground` (default), `tmux`, `headless`,
+or `print`. In `tmux` mode Stave starts the summoner inside a detached,
+idempotently-created tmux session named `stave-<space>-<portal>` on the target,
+then attaches only when a real terminal is present (headless and non-interactive
+runs stay detached and print how to attach). `tmux` mode requires `tmux` on the
+target; `stave portal logs` can read the session's pane back only for ssh/ec2
+portals (docker/devcontainer logs read container stdout, not the tmux pane).
 
 Local login credentials are never copied silently. Use `stave portal auth
 login` to authenticate inside the portal target, or explicit `auth inherit`
@@ -647,6 +719,10 @@ repos:
     url: https://github.com/you/api.git
     bareRepoPath: ~/stave/bare-repos/api.git
     defaultBranch: main
+    description: Core HTTP API service   # optional; set via `stave repos describe`
+tethers:
+  enabled: true          # global kill switch for passive tether learning
+  strongThreshold: 3     # co-occurrence count at which a tether becomes "strong"
 agent:
   defaultProvider: openai
   autoIncant: false
@@ -672,8 +748,18 @@ summon:
 - **`agent.providers.*.apiKeyRef`** — secret reference; either `keychain:stave/agent/<provider>` or `env:<NAME>`.
 - **`summon.default`** — summoner used when `stave summon` omits `--with`.
 - **`summon.commands.*`** — command names or paths for `codex`, `claude`, and `cursor`.
+- **`repos.<name>.description`** — optional free-text label shown by `stave repos list --verbose` and `stave repos describe`; set it via `stave repos describe <repo> "text"`.
+- **`tethers.enabled`** — global kill switch for passive tether learning (default `true`). When `false`, captures are skipped and `-c/--common` errors with a hint to re-enable.
+- **`tethers.strongThreshold`** — co-occurrence count at which a learned tether is classified **strong** (default `3`; values below `1` are clamped back to `3`).
 
 Editable branches default to `stave/<space-id>/<repo>` unless `--branch` is set.
+
+Learned tethers themselves are **not** stored in `config.yaml`. They live in a
+machine-local sidecar at `~/stave/repo-tethers.yaml` (under `config.Root`), with
+a companion `~/stave/repo-tethers.yaml.lock`. The file is purely machine-generated
+co-occurrence data — safe to delete and regenerate, never committed to a repo,
+and ignored entirely by older Stave binaries. Human input (repo descriptions)
+lives on the registry instead, so wiping the sidecar loses no hand-authored data.
 
 ## Development
 

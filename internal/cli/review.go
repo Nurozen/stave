@@ -227,17 +227,18 @@ func (a *app) setUpReviewSpace(cmd *cobra.Command, cfg *config.Config, cfgPath s
 		return reviewResult{}, err
 	}
 	if err := svc.AddRepo(ctx, space.AddOptions{
-		SpaceID:    spaceID,
-		RepoName:   repoName,
-		Mode:       space.ModeEdit,
-		Base:       baseBranch,
-		StartPoint: prHeadRef,
-		NoFetch:    true, // fetched above, including the PR ref
+		SpaceID:      spaceID,
+		RepoName:     repoName,
+		Mode:         space.ModeEdit,
+		Base:         baseBranch,
+		StartPoint:   prHeadRef,
+		NoFetch:      true, // fetched above, including the PR ref
+		CaptureOnAdd: true, // OQ-A: review learns prHead -> sibling references
 	}); err != nil {
 		return reviewResult{}, err
 	}
 	for _, spec := range references {
-		if err := svc.AddRepo(ctx, space.AddOptions{SpaceID: spaceID, RepoName: spec.Name, Mode: space.ModeReference, Ref: spec.Ref}); err != nil {
+		if err := svc.AddRepo(ctx, space.AddOptions{SpaceID: spaceID, RepoName: spec.Name, Mode: space.ModeReference, Ref: spec.Ref, CaptureOnAdd: true}); err != nil {
 			return reviewResult{}, err
 		}
 	}

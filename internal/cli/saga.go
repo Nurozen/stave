@@ -52,6 +52,7 @@ func (a *app) sagaCreateCommand() *cobra.Command {
 	var memories []string
 	var dryRun bool
 	var summonName string
+	var noLearn bool
 	cmd := &cobra.Command{
 		Use:   "create <saga-id>",
 		Short: "Create a saga space that coordinates member spaces",
@@ -77,6 +78,7 @@ func (a *app) sagaCreateCommand() *cobra.Command {
 				SpecPath:   spec,
 				References: refSpecs,
 				Memories:   memories,
+				NoLearn:    noLearn,
 				DryRun:     dryRun,
 			}); err != nil {
 				return err
@@ -114,6 +116,7 @@ func (a *app) sagaCreateCommand() *cobra.Command {
 	cmd.Flags().StringArrayVar(&memories, "memory", nil, "attach memory: [provider:]<spec>; '.' = fresh durable store shared with members (repeatable)")
 	cmd.Flags().StringVar(&summonName, "summon", "", "launch a summoner after creation (codex, claude, or cursor)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print operations without changing state")
+	cmd.Flags().BoolVar(&noLearn, "no-learn", false, "do not record repo tethers for this command (saga roots have no editable anchor, so this is a no-op for the saga root itself; members learn unless they pass --no-learn)")
 	cmd.Flags().SetInterspersed(false)
 	return cmd
 }

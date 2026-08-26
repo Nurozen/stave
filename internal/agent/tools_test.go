@@ -8,16 +8,19 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Nurozen/stave/internal/git"
 	"github.com/Nurozen/stave/internal/portal"
 	"github.com/Nurozen/stave/internal/space"
+	"github.com/Nurozen/stave/internal/tether"
 )
 
 func TestToolDefinitions(t *testing.T) {
 	defs := ToolDefinitions()
 	want := []string{
 		ToolReposList,
+		ToolReposTethers,
 		ToolReposSync,
 		ToolSpaceStatus,
 		ToolSpaceSync,
@@ -69,6 +72,9 @@ func TestToolDefinitions(t *testing.T) {
 	}
 	if seen[ToolReposList].Category != ToolCategoryRead {
 		t.Fatalf("repos list category = %s", seen[ToolReposList].Category)
+	}
+	if seen[ToolReposTethers].Category != ToolCategoryRead {
+		t.Fatalf("repos tethers category = %s", seen[ToolReposTethers].Category)
 	}
 	if seen[ToolSpaceCreate].Category != ToolCategoryMutate {
 		t.Fatalf("space create category = %s", seen[ToolSpaceCreate].Category)
@@ -647,6 +653,101 @@ type branchExistsGitRunner struct{}
 
 func (r *branchExistsGitRunner) Run(ctx context.Context, bin string, args []string, opts git.RunOptions) (git.Result, error) {
 	return git.Result{}, nil
+}
+
+func TestToolDispatcherReposTethers(t *testing.T) {
+	cfg := testConfig(t)
+	if err := tether.Update(tether.Path(cfg), func(f *tether.File) error {
+		now := time.Now()
+		for i := 0; i < 3; i++ {
+			tether.Bump(f, "api", "web", tether.ModeReference, now)
+		}
+		tether.Bump(f, "api", "lib", tether.ModeReference, now)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dispatcher := NewToolDispatcher(cfg, nil, nil)
+
+	result := dispatcher.Dispatch(context.Background(), toolCall(ToolReposTethers, map[string]any{"repo": "api"}))
+	if result.Error {
+		t.Fatalf("repos tethers result = %#v", result)
+	}
+	if len(dispatcher.Session.ReadResults) != 1 {
+		t.Fatalf("read results = %#v", dispatcher.Session.ReadResults)
+	}
+	if len(dispatcher.Session.Plan.Operations) != 0 {
+		t.Fatalf("plan should not grow on read tool: %#v", dispatcher.Session.Plan.Operations)
+	}
+	// Payload round-trips through JSON in redactAny, so it decodes as generic
+	// maps/slices.
+	payload, ok := result.Payload.(map[string]any)
+	if !ok {
+		t.Fatalf("payload type = %T", result.Payload)
+	}
+	tethers, ok := payload["tethers"].([]any)
+	if !ok || len(tethers) != 2 {
+		t.Fatalf("tethers payload = %#v", payload["tethers"])
+	}
+	first := tethers[0].(map[string]any)
+	second := tethers[1].(map[string]any)
+	// Strong-first ordering: web (count 3, strong) before lib (count 1, weak).
+	if first["to"] != "web" || first["strength"] != string(tether.Strong) {
+		t.Fatalf("first tether = %#v", first)
+	}
+	if second["to"] != "lib" || second["strength"] != string(tether.Weak) {
+		t.Fatalf("second tether = %#v", second)
+	}
+
+	unknown := dispatcher.Dispatch(context.Background(), toolCall(ToolReposTethers, map[string]any{"repo": "nope"}))
+	if !unknown.Error || !strings.Contains(unknown.Summary, "not registered") {
+		t.Fatalf("unknown repo result = %#v", unknown)
+	}
+}
+
+func TestToolDispatcherSpaceCreateCommonFlags(t *testing.T) {
+	cfg := testConfig(t)
+	dispatcher := NewToolDispatcher(cfg, nil, nil)
+
+	result := dispatcher.Dispatch(context.Background(), toolCall(ToolSpaceCreate, map[string]any{
+		"space_id":     "ex-2",
+		"edits":        []map[string]any{{"name": "api"}},
+		"include_weak": true,
+	}))
+	if result.Error {
+		t.Fatalf("space create result = %#v", result)
+	}
+	op := dispatcher.Session.Plan.Operations[0]
+	// include_weak implies common.
+	if !op.Common || !op.IncludeWeak {
+		t.Fatalf("op flags = %#v", op)
+	}
+	if got := EquivalentCommand(op); got != "stave space create ex-2 -e api -c --include-weak" {
+		t.Fatalf("EquivalentCommand = %q", got)
+	}
+
+	// common alone (no include_weak) renders -c only.
+	d2 := NewToolDispatcher(cfg, nil, nil)
+	r2 := d2.Dispatch(context.Background(), toolCall(ToolSpaceCreate, map[string]any{
+		"space_id": "ex-3",
+		"edits":    []map[string]any{{"name": "api"}},
+		"common":   true,
+	}))
+	if r2.Error {
+		t.Fatalf("space create result = %#v", r2)
+	}
+	op2 := d2.Session.Plan.Operations[0]
+	if !op2.Common || op2.IncludeWeak {
+		t.Fatalf("op2 flags = %#v", op2)
+	}
+	if got := EquivalentCommand(op2); got != "stave space create ex-3 -e api -c" {
+		t.Fatalf("EquivalentCommand = %q", got)
+	}
+	// Redaction preserves the bool copy-through.
+	run := d2.Session.RunResult()
+	if !run.Plan.Operations[0].Common {
+		t.Fatalf("redacted op lost Common: %#v", run.Plan.Operations[0])
+	}
 }
 
 func toolCall(name string, args map[string]any) ToolCall {

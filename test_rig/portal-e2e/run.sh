@@ -229,8 +229,11 @@ run_stave "portal sync ssh dry-run" portal sync "$SPACE_ID" ssh-live --direction
 run_stave "portal sync ssh write" portal sync "$SPACE_ID" ssh-live --direction to --mode rsync
 run_stave "portal exec ssh destination" portal exec "$SPACE_ID" ssh-live -- sh -lc "test -f .stave.yaml && test -f .stave-portal.yaml && test -d fixture && echo ssh-destination-ok > .stave-ssh-portal-ok"
 run_shell "verify ssh destination marker" "ssh -p $SSH_PORT -i '$SSH_KEY' -o UserKnownHostsFile='$SSH_KNOWN_HOSTS' -o StrictHostKeyChecking=yes stave@127.0.0.1 'cat /home/stave/portal-work/.stave-ssh-portal-ok' | grep ssh-destination-ok"
-# Preview only: the disposable sshd fixture has no tmux, so executing the
-# agent-log capture would rightly fail with exit 127.
+# Preview only: the sshd fixture now ships tmux (see ssh-host/Dockerfile), so the
+# tmux summon path can be exercised there. This leg stays a --dry-run to keep the
+# harness deterministic; a real check could summon in --mode tmux, then assert
+# `tmux has-session -t <session>` and `tmux capture-pane -p` over the ssh fixture
+# rather than adding a blocking/flaky live agent-log capture here.
 run_stave "portal logs ssh plan" portal logs "$SPACE_ID" ssh-live --tail 10 --dry-run
 run_stave "portal detach ssh dry-run" portal detach "$SPACE_ID" ssh-live --dry-run
 

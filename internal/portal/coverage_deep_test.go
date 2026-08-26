@@ -342,7 +342,7 @@ func TestManageBranches(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got := remoteLogs.EquivalentCommands()[0]; !strings.Contains(got, "stave-ex-1-default-agent") || !strings.Contains(got, "-S -100") {
+		if got := remoteLogs.EquivalentCommands()[0]; !strings.Contains(got, "stave-ex-1-default") || strings.Contains(got, "stave-ex-1-default-agent") || !strings.Contains(got, "-S -100") {
 			t.Fatalf("remote logs = %s", got)
 		}
 	})

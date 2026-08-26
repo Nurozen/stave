@@ -74,6 +74,38 @@ func TestCLIPortalLogsExecutesAndPreviews(t *testing.T) {
 	}
 }
 
+// TestCLIPortalSummonCursorWarnsOnExecutionPath pins that warn-severity
+// diagnostics (summon.cursor_partial) reach stderr even on the execution path,
+// where the full plan preview is not printed. It must run the commands (not
+// dry-run) and still surface the warning before doing so.
+func TestCLIPortalSummonCursorWarnsOnExecutionPath(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	runCLI(t, "setup")
+	runCLI(t, "space", "init", "ex-1234")
+	runCLI(t, "portal", "init", "container", "ex-1234")
+
+	runner := &fakePortalRunner{result: portal.RunResult{Stdout: "ok\n"}}
+	cmd := newRootCommand(&app{portalRunner: runner, isTerminal: func(cmd *cobra.Command) bool { return true }})
+	cmd.SetArgs([]string{"portal", "summon", "ex-1234", "--with", "cursor"})
+	var out, errBuf bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&errBuf)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("portal summon error = %v\nstdout=%s\nstderr=%s", err, out.String(), errBuf.String())
+	}
+	if len(runner.runs) == 0 {
+		t.Fatalf("summon did not execute (expected execution path): stderr=%s", errBuf.String())
+	}
+	if !strings.Contains(errBuf.String(), "summon.cursor_partial") {
+		t.Fatalf("cursor warn missing from stderr on execution path: %s", errBuf.String())
+	}
+	// The plan preview (Plan:/Commands:) must NOT be printed on execution.
+	if strings.Contains(out.String(), "Plan:") {
+		t.Fatalf("execution path leaked full plan preview to stdout: %s", out.String())
+	}
+}
+
 // TestCLIPortalShellNonTTYNoticeGoesToStderr verifies the non-interactive
 // notice is written to stderr while stdout carries only the copy-pasteable
 // Plan/Commands preview.

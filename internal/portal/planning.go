@@ -184,9 +184,92 @@ func (s Service) PlanSummon(ctx context.Context, opts SummonOptions) (Plan, erro
 			NextAction: fmt.Sprintf("run portal auth login --provider %s before summoning", summoner),
 		})
 	}
-	interactive := opts.Mode != "headless"
-	plan.Commands = append(plan.Commands, s.portalExecCommand(portal, agentCommand, portalCWD(portal, ""), "", TTYAuto, interactive))
+	if summoner == "cursor" {
+		plan.Diagnostics = append(plan.Diagnostics, Diagnostic{
+			Component:  "summon",
+			Severity:   SeverityWarn,
+			Code:       "summon.cursor_partial",
+			Message:    "cursor summon launches cursor-agent without prompt or permission wiring",
+			NextAction: "drive cursor-agent interactively after it starts",
+		})
+	}
+	cwd := portalCWD(portal, "")
+	switch opts.Mode {
+	case "tmux":
+		session := tmuxSessionName(opts.SpaceID, portal.ID)
+		plan.Diagnostics = append(plan.Diagnostics, Diagnostic{
+			Component: "summon",
+			Severity:  SeverityInfo,
+			Code:      "summon.tmux_requires_tmux",
+			Message:   "tmux mode requires tmux installed on the portal target",
+		})
+		// `tmux new-session -A -d` does NOT stay detached on an existing
+		// session: with -A, new-session behaves like attach-session and only -D
+		// (not lowercase -d) is honored on that path, so a re-summon would try to
+		// attach — blocking on a TTY or failing "open terminal failed" on a
+		// non-TTY. Guard the detached create with has-session so a fresh session
+		// is created detached and an existing one is a true no-op. The guard is a
+		// single shell compound, so it works in both the CLI and agent executors
+		// without relying on ContinueOnError/RunIfPreviousFailed (D15).
+		plan.Commands = append(plan.Commands, s.tmuxCreateCommand(portal, session, agentCommand, cwd))
+		// attach-session blocks without a PTY, so only append it when a real
+		// terminal is attached and we are not merely previewing (dry-run /
+		// print-command). Otherwise start detached and tell the user how to
+		// attach (D18 — prevents CI/agent-executor hangs; P2 — no attach in
+		// preview).
+		if !opts.DryRun && s.stdioIsTerminal() {
+			attachArgv := []string{"tmux", "attach-session", "-t", session}
+			plan.Commands = append(plan.Commands, s.portalExecCommandFor(portal, attachArgv, cwd, "", TTYAuto, true, agentCommand[0]))
+		} else {
+			plan.Diagnostics = append(plan.Diagnostics, Diagnostic{
+				Component:  "summon",
+				Severity:   SeverityInfo,
+				Code:       "summon.tmux_detached",
+				Message:    fmt.Sprintf("session %s started; attach with: tmux attach -t %s", session, session),
+				NextAction: fmt.Sprintf("tmux attach -t %s", session),
+			})
+		}
+	default:
+		interactive := opts.Mode != "headless"
+		plan.Commands = append(plan.Commands, s.portalExecCommand(portal, agentCommand, cwd, "", TTYAuto, interactive))
+	}
 	return plan, nil
+}
+
+// tmuxCreateCommand builds the guarded, always-detached tmux create for summon
+// (tmux mode):
+//
+//	tmux has-session -t <session> 2>/dev/null || tmux new-session -d -s <session> <agent...>
+//
+// For ssh/ec2 the command is already serialized into a remote shell string, so
+// the `||` compound is embedded directly, preserving the per-arg shell quoting
+// of the agent argv (including the free-text prompt). For docker/devcontainer
+// the executor runs argv directly with no shell, so the compound is wrapped in
+// `sh -c "..."` to give it a shell. Provider auth-env propagation is keyed off
+// the nested summoner (agentCommand[0]) either way (D16).
+func (s Service) tmuxCreateCommand(portal Portal, session string, agentCommand []string, cwd string) Command {
+	envProgram := agentCommand[0]
+	newSession := append([]string{"tmux", "new-session", "-d", "-s", session}, agentCommand...)
+	switch portal.Driver {
+	case DriverSSH, DriverEC2Attach:
+		guard := "tmux has-session -t " + quoteRemote(session) + " 2>/dev/null || exec " + joinRemote(newSession)
+		// Group the guard so a failed `cd` gates BOTH branches (otherwise
+		// `cd && A || B` runs B in the wrong directory on cd failure).
+		remote := "cd " + quoteRemotePath(cwd) + " && { " + guard + " ; }"
+		cmd := sshCommandWithEnv(portal, inheritedEnvNames(portal, envProgram), remote)
+		cmd.Interactive = false
+		return cmd
+	default:
+		guard := "tmux has-session -t " + quoteShell(session) + " 2>/dev/null || " + joinRemote(newSession)
+		return s.portalExecCommandFor(portal, []string{"sh", "-c", guard}, cwd, "", TTYAuto, false, envProgram)
+	}
+}
+
+// tmuxSessionName is the summoner-independent session name shared by summon
+// (tmux mode) and logs pane-capture. Portals do not persist a summoner (D17),
+// so the name keys only off space and portal.
+func tmuxSessionName(spaceID, portalID string) string {
+	return fmt.Sprintf("stave-%s-%s", spaceID, portalID)
 }
 
 func (s Service) PlanSync(ctx context.Context, opts SyncOptions) (Plan, error) {
@@ -243,7 +326,20 @@ func (s Service) PlanSync(ctx context.Context, opts SyncOptions) (Plan, error) {
 }
 
 func (s Service) portalExecCommand(portal Portal, argv []string, cwd, user string, tty TTYMode, interactive bool) Command {
-	providerEnv := inheritedEnvNames(portal, argv)
+	program := ""
+	if len(argv) > 0 {
+		program = argv[0]
+	}
+	return s.portalExecCommandFor(portal, argv, cwd, user, tty, interactive, program)
+}
+
+// portalExecCommandFor behaves like portalExecCommand but derives inherited
+// provider env from envProgram rather than argv[0]. This matters when the real
+// program is wrapped by another (e.g. tmux new-session <agent...>): argv[0]
+// becomes "tmux", but the provider env that must survive belongs to the nested
+// summoner (D16).
+func (s Service) portalExecCommandFor(portal Portal, argv []string, cwd, user string, tty TTYMode, interactive bool, envProgram string) Command {
+	providerEnv := inheritedEnvNames(portal, envProgram)
 	tty = s.resolveTTY(tty)
 	wantTTY := tty == TTYAlways || (tty == TTYAuto && interactive)
 	switch portal.Driver {
@@ -613,11 +709,11 @@ func sshDestination(portal Portal) string {
 	return host
 }
 
-func inheritedEnvNames(portal Portal, argv []string) []string {
-	if len(argv) == 0 {
+func inheritedEnvNames(portal Portal, program string) []string {
+	if program == "" {
 		return nil
 	}
-	provider := commandProvider(argv[0])
+	provider := commandProvider(program)
 	if provider == "" {
 		return nil
 	}

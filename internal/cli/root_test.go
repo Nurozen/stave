@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"testing"
@@ -73,6 +74,7 @@ func TestCLIHelpCommands(t *testing.T) {
 		{"saga", "remove", "--help"},
 		{"saga", "archive", "--help"},
 		{"saga", "destroy", "--help"},
+		{"version", "--help"},
 		{"space", "create", "example", "--help"},
 	} {
 		cmd := NewRootCommand()
@@ -1866,4 +1868,60 @@ func runGit(t *testing.T, dir string, args ...string) {
 	if err != nil {
 		t.Fatalf("git %v error = %v\n%s", args, err, out)
 	}
+}
+
+func TestCLIVersion(t *testing.T) {
+	out := runCLIWithApp(t, &app{version: "1.2.3", commit: "abc123", date: "2026-08-26"}, "version")
+	for _, want := range []string{"stave 1.2.3", "commit: abc123", "date: 2026-08-26"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("version output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestCLIVersionFallback(t *testing.T) {
+	out := runCLIWithApp(t, &app{}, "version")
+	if strings.TrimSpace(out) == "" {
+		t.Fatalf("version output empty")
+	}
+	if !strings.HasPrefix(out, "stave ") {
+		t.Fatalf("version output should start with %q:\n%s", "stave ", out)
+	}
+}
+
+func TestCLIVersionNoArgs(t *testing.T) {
+	_, err := runCLIError(t, &app{version: "1.2.3"}, "version", "extra")
+	if err == nil {
+		t.Fatalf("version with extra arg unexpectedly succeeded")
+	}
+}
+
+func TestFromBuildInfo(t *testing.T) {
+	t.Run("populated", func(t *testing.T) {
+		bi := &debug.BuildInfo{
+			Main: debug.Module{Version: "v1.4.0"},
+			Settings: []debug.BuildSetting{
+				{Key: "vcs.revision", Value: "cafebabe"},
+				{Key: "vcs.time", Value: "2026-02-01T00:00:00Z"},
+				{Key: "vcs.modified", Value: "false"},
+			},
+		}
+		v, c, d := fromBuildInfo(bi)
+		if v != "v1.4.0" || c != "cafebabe" || d != "2026-02-01T00:00:00Z" {
+			t.Fatalf("fromBuildInfo = %q, %q, %q", v, c, d)
+		}
+	})
+	t.Run("devel version ignored", func(t *testing.T) {
+		bi := &debug.BuildInfo{Main: debug.Module{Version: "(devel)"}}
+		v, c, d := fromBuildInfo(bi)
+		if v != "" || c != "" || d != "" {
+			t.Fatalf("fromBuildInfo(devel) = %q, %q, %q; want empties", v, c, d)
+		}
+	})
+	t.Run("nil", func(t *testing.T) {
+		v, c, d := fromBuildInfo(nil)
+		if v != "" || c != "" || d != "" {
+			t.Fatalf("fromBuildInfo(nil) = %q, %q, %q; want empties", v, c, d)
+		}
+	})
 }

@@ -55,13 +55,12 @@ type DetachOptions struct {
 }
 
 type DestroyOptions struct {
-	SpaceID          string
-	PortalID         string
-	Timeout          int
-	DeleteVolumes    bool
-	DeleteRemoteData bool
-	Force            bool
-	DryRun           bool
+	SpaceID       string
+	PortalID      string
+	Timeout       int
+	DeleteVolumes bool
+	Force         bool
+	DryRun        bool
 }
 
 func (s Service) Configure(opts ConfigureOptions) (Plan, error) {
@@ -191,6 +190,15 @@ func (s Service) planAuthCommand(ctx context.Context, operation string, opts Aut
 		return Plan{}, err
 	}
 	plan := Plan{Operation: operation, DryRun: opts.DryRun, Mutates: true, Summary: fmt.Sprintf("%s for %s in portal %s", operation, opts.Provider, portal.ID)}
+	if opts.Provider == "cursor" {
+		plan.Diagnostics = append(plan.Diagnostics, Diagnostic{
+			Component:  "auth",
+			Severity:   SeverityWarn,
+			Code:       "summon.cursor_partial",
+			Message:    "cursor auth login only probes cursor-agent status; it does not complete a login flow",
+			NextAction: "run cursor-agent login manually if status reports unauthenticated",
+		})
+	}
 	plan.Commands = append(plan.Commands, s.portalExecCommand(portal, argv, portalCWD(portal, ""), "", TTYAuto, true))
 	return plan, nil
 }
@@ -213,7 +221,10 @@ func (s Service) PlanLogs(ctx context.Context, opts LogsOptions) (Plan, error) {
 		args = append(args, portal.Runtime.ContainerName)
 		plan.Commands = append(plan.Commands, command(portal.Runtime.Engine, args...))
 	default:
-		session := fmt.Sprintf("stave-%s-%s-%s", opts.SpaceID, portal.ID, firstString(opts.Agent, "agent"))
+		// Pane-capture is meaningful only for ssh/ec2 tmux summons; docker logs
+		// read container stdout, not the tmux pane (D17). The session name is
+		// summoner-independent and matches PlanSummon's tmux mode.
+		session := tmuxSessionName(opts.SpaceID, portal.ID)
 		plan.Commands = append(plan.Commands, sshCommand(portal, "tmux capture-pane -pt "+quoteRemote(session)+" -S -"+fmt.Sprintf("%d", opts.Tail)))
 	}
 	return plan, nil

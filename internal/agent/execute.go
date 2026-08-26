@@ -14,6 +14,7 @@ import (
 	"github.com/Nurozen/stave/internal/portal"
 	"github.com/Nurozen/stave/internal/space"
 	"github.com/Nurozen/stave/internal/summon"
+	"github.com/Nurozen/stave/internal/tether"
 )
 
 type Executor struct {
@@ -34,6 +35,7 @@ var executableOperations = map[string]bool{
 	OpSpaceSync:            true,
 	OpSpaceStatus:          true,
 	OpReposList:            true,
+	OpReposTethers:         true,
 	OpReposSync:            true,
 	OpSummon:               true,
 	OpSagaCreate:           true,
@@ -108,13 +110,31 @@ func (e Executor) executeOperation(ctx context.Context, op Operation) error {
 	svc := space.NewService(e.Config, client, out)
 	switch op.Type {
 	case OpSpaceCreate:
+		editSpecs := repoRefsToSpecs(op.Edits)
+		refSpecs := repoRefsToSpecs(op.References)
+		var commonRefs []space.RepoSpec
+		if op.Common {
+			// D9/D1: expand the editable repos' tethers into reference worktrees
+			// at execute time, reusing the same space.ExpandCommonRefs the CLI
+			// calls. Expanded refs land in CommonReferences (not References) so
+			// capture never reinforces them (OQ-E).
+			extra, notes, err := svc.ExpandCommonRefs(e.Config, editSpecs, refSpecs, op.IncludeWeak)
+			if err != nil {
+				return err
+			}
+			for _, note := range notes {
+				fmt.Fprintln(out, note)
+			}
+			commonRefs = extra
+		}
 		return svc.Create(ctx, space.CreateOptions{
-			ID:         op.SpaceID,
-			Kind:       op.Kind,
-			SpecPath:   op.SpecPath,
-			Edits:      repoRefsToSpecs(op.Edits),
-			References: repoRefsToSpecs(op.References),
-			Memories:   op.Memories,
+			ID:               op.SpaceID,
+			Kind:             op.Kind,
+			SpecPath:         op.SpecPath,
+			Edits:            editSpecs,
+			References:       refSpecs,
+			CommonReferences: commonRefs,
+			Memories:         op.Memories,
 		})
 	case OpSpaceAdd:
 		mode := space.ModeEdit
@@ -122,14 +142,15 @@ func (e Executor) executeOperation(ctx context.Context, op Operation) error {
 			mode = space.ModeReference
 		}
 		return svc.AddRepo(ctx, space.AddOptions{
-			SpaceID:    op.SpaceID,
-			RepoName:   op.Repo,
-			Mode:       mode,
-			Base:       op.Base,
-			Ref:        firstNonEmpty(op.Ref, op.Base),
-			Branch:     op.Branch,
-			NoFetch:    op.NoFetch,
-			LinkMemory: true, // S4 space add parity: mirror the CLI default
+			SpaceID:      op.SpaceID,
+			RepoName:     op.Repo,
+			Mode:         mode,
+			Base:         op.Base,
+			Ref:          firstNonEmpty(op.Ref, op.Base),
+			Branch:       op.Branch,
+			NoFetch:      op.NoFetch,
+			LinkMemory:   true, // S4 space add parity: mirror the CLI default
+			CaptureOnAdd: true, // learn co-occurrence like the CLI default
 		})
 	case OpSpaceSync:
 		return svc.Sync(ctx, space.SyncOptions{SpaceID: op.SpaceID, ReferencesOnly: op.ReferencesOnly})
@@ -149,6 +170,16 @@ func (e Executor) executeOperation(ctx context.Context, op Operation) error {
 		for _, name := range names {
 			repo := e.Config.Repos[name]
 			fmt.Fprintf(out, "%s\t%s\t%s\n", name, repo.URL, repo.BareRepoPath)
+		}
+		return nil
+	case OpReposTethers:
+		f, err := tether.Load(tether.Path(e.Config))
+		if err != nil {
+			return err
+		}
+		threshold := e.Config.Tethers.StrongThreshold
+		for _, t := range tether.Common(f, op.Repo, true, threshold) {
+			fmt.Fprintf(out, "%s\t%s\t%s\t%d\n", t.To, t.ToMode, t.Strength, t.Count)
 		}
 		return nil
 	case OpReposSync:
@@ -281,6 +312,16 @@ func (e Executor) executePortalPlan(ctx context.Context, out io.Writer, build fu
 	plan, err := build(svc)
 	if err != nil {
 		return err
+	}
+	// Surface actionable diagnostics (e.g. summon.cursor_partial) before running
+	// the plan; info-severity notes stay quiet to avoid spamming the executor.
+	for _, diagnostic := range plan.Diagnostics {
+		if diagnostic.Severity == portal.SeverityWarn || diagnostic.Severity == portal.SeverityError {
+			fmt.Fprintf(out, "[%s] %s: %s\n", diagnostic.Severity, diagnostic.Code, diagnostic.Message)
+			if diagnostic.NextAction != "" {
+				fmt.Fprintf(out, "  next: %s\n", diagnostic.NextAction)
+			}
+		}
 	}
 	for _, command := range plan.Commands {
 		fmt.Fprintf(out, "%s\n", command.String())

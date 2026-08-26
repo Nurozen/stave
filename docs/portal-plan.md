@@ -612,11 +612,13 @@ Purpose: remove portal attachment metadata for attach-only targets.
 ```text
 stave portal detach <space-id> [portal-id]
   --dry-run
-  --yes
 ```
 
 Rules:
 
+- `--yes` was removed in the repo-tethers change (see
+  `docs/dev/repo-tethers-design.md`, BF5); `detach` never prompted, so the flag
+  was inert.
 - For SSH/EC2, this removes local portal metadata and optional local sync cache.
 - It does not delete remote paths unless the user later requests an explicit
   remote-data deletion command.
@@ -630,7 +632,6 @@ Purpose: delete Stave-owned runtime resources and portal-owned data.
 stave portal destroy <space-id> [portal-id]
   --timeout <seconds>
   --delete-volumes
-  --delete-remote-data
   --force
   --dry-run
 ```
@@ -642,8 +643,9 @@ Rules:
   network/image prune.
 - `--delete-volumes` applies only to Stave-owned named volumes recorded in the
   portal manifest.
-- `--delete-remote-data` requires exact recorded remote root and refuses empty
-  paths, `/`, home root, glob-derived roots, and paths outside the portal root.
+- `--delete-remote-data` was removed in the repo-tethers change (see
+  `docs/dev/repo-tethers-design.md`, BF2); it was never implemented. Remote paths
+  are not deleted by `destroy`.
 - For SSH/EC2, default to `detach`, not `destroy`.
 
 ## Auth Design

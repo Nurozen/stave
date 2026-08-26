@@ -16,13 +16,14 @@ const (
 	ProviderOpenAI    = "openai"
 	ProviderAnthropic = "anthropic"
 
-	OpSpaceCreate = "space_create"
-	OpSpaceAdd    = "space_add"
-	OpSpaceSync   = "space_sync"
-	OpSpaceStatus = "space_status"
-	OpReposList   = "repos_list"
-	OpReposSync   = "repos_sync"
-	OpSummon      = "summon"
+	OpSpaceCreate  = "space_create"
+	OpSpaceAdd     = "space_add"
+	OpSpaceSync    = "space_sync"
+	OpSpaceStatus  = "space_status"
+	OpReposList    = "repos_list"
+	OpReposSync    = "repos_sync"
+	OpReposTethers = "repos_tethers"
+	OpSummon       = "summon"
 
 	OpSagaCreate = "saga_create"
 	OpSagaStatus = "saga_status"
@@ -91,6 +92,11 @@ type Operation struct {
 	References []RepoRef `json:"references,omitempty"`
 	// Memories are raw `[provider:]<spec>` values (space create --memory sugar).
 	Memories []string `json:"memories,omitempty"`
+	// Common requests expanding an editable repo's tethers into reference
+	// worktrees at execute time (space create -c). IncludeWeak widens that
+	// expansion to weak tethers (--include-weak, which implies Common).
+	Common      bool `json:"common,omitempty"`
+	IncludeWeak bool `json:"include_weak,omitempty"`
 	// MemoryFate is keep|destroy|contribute for space destroy (default keep).
 	MemoryFate       string   `json:"memory_fate,omitempty"`
 	Repo             string   `json:"repo,omitempty"`
@@ -298,6 +304,12 @@ func EquivalentCommand(op Operation) string {
 		for _, mem := range op.Memories {
 			parts = append(parts, "--memory", shellQuote(mem))
 		}
+		if op.Common {
+			parts = append(parts, "-c")
+		}
+		if op.IncludeWeak {
+			parts = append(parts, "--include-weak")
+		}
 		return strings.Join(parts, " ")
 	case OpSpaceAdd:
 		parts := []string{"stave", "space", "add", shellQuote(op.SpaceID), shellQuote(op.Repo)}
@@ -326,6 +338,8 @@ func EquivalentCommand(op Operation) string {
 		return strings.Join([]string{"stave", "space", "status", shellQuote(op.SpaceID)}, " ")
 	case OpReposList:
 		return "stave repos list"
+	case OpReposTethers:
+		return strings.Join([]string{"stave", "repos", "tethers", shellQuote(op.Repo)}, " ")
 	case OpReposSync:
 		if op.Repo != "" {
 			return strings.Join([]string{"stave", "repos", "sync", shellQuote(op.Repo)}, " ")

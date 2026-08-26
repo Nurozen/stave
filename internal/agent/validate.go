@@ -322,6 +322,10 @@ func validateOperation(cfg config.Config, op Operation, plannedSpaces map[string
 		}
 	case OpReposList:
 		return nil
+	case OpReposTethers:
+		if _, ok := cfg.Repos[op.Repo]; !ok {
+			return fmt.Errorf("repo %q is not registered", op.Repo)
+		}
 	case OpReposSync:
 		if op.Repo != "" {
 			if _, ok := cfg.Repos[op.Repo]; !ok {

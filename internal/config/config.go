@@ -35,6 +35,7 @@ type Config struct {
 	Agent        AgentConfig           `mapstructure:"agent" yaml:"agent,omitempty"`
 	Summon       SummonConfig          `mapstructure:"summon" yaml:"summon,omitempty"`
 	Memory       MemoryConfig          `mapstructure:"memory" yaml:"memory,omitempty"`
+	Tethers      TethersConfig         `mapstructure:"tethers" yaml:"tethers,omitempty"`
 }
 
 type Repository struct {
@@ -45,6 +46,9 @@ type Repository struct {
 	// MarmotVault is an optional manual override/suppression for reference→vault
 	// resolution on memory attach (S4). Values: a vault id, or "off" to suppress.
 	MarmotVault string `mapstructure:"marmotVault,omitempty" yaml:"marmotVault,omitempty"`
+	// Description is an optional free-text human description of the repo, set via
+	// `stave repos describe`. No validation; empty means no description.
+	Description string `mapstructure:"description,omitempty" yaml:"description,omitempty"`
 }
 
 // MemoryConfig selects the memory provider and ambient attach behaviour.
@@ -58,6 +62,22 @@ type MemoryConfig struct {
 	// Binary is the provider executable path/name (default "marmot").
 	Binary string `mapstructure:"binary" yaml:"binary,omitempty"`
 }
+
+// TethersConfig controls passive learning of repo co-occurrence tethers.
+type TethersConfig struct {
+	// Enabled is the global kill switch. A *bool (not a plain bool) is
+	// load-bearing: a plain bool + omitempty would drop `false` on save and
+	// SetDefault would restore true, so the kill switch could never persist.
+	// nil = default-enabled; *false survives yaml omitempty + reload.
+	Enabled *bool `mapstructure:"enabled" yaml:"enabled,omitempty"`
+	// StrongThreshold is the co-occurrence count at which a tether is "strong".
+	// Clamped to a sane default when < 1 (a 0/negative threshold would make
+	// everything strong).
+	StrongThreshold int `mapstructure:"strongThreshold" yaml:"strongThreshold,omitempty"`
+}
+
+// IsEnabled reports whether tether learning is on (nil Enabled = default-true).
+func (c TethersConfig) IsEnabled() bool { return c.Enabled == nil || *c.Enabled }
 
 type AgentConfig struct {
 	DefaultProvider string                         `mapstructure:"defaultProvider" yaml:"defaultProvider,omitempty"`
@@ -105,6 +125,7 @@ func Default() (*Config, error) {
 		Agent:        DefaultAgentConfig(),
 		Summon:       DefaultSummonConfig(),
 		Memory:       DefaultMemoryConfig(),
+		Tethers:      DefaultTethersConfig(),
 	}, nil
 }
 
@@ -132,6 +153,7 @@ func Load(path string) (*Config, string, error) {
 	v.SetDefault("agent", defaults.Agent)
 	v.SetDefault("summon", defaults.Summon)
 	v.SetDefault("memory", defaults.Memory)
+	v.SetDefault("tethers", defaults.Tethers)
 
 	if err := v.ReadInConfig(); err != nil && !missingConfig(err) {
 		return nil, path, fmt.Errorf("read config: %w", err)
@@ -196,6 +218,7 @@ func (c *Config) ApplyDefaults() error {
 	c.Agent.ApplyDefaults()
 	c.Summon.ApplyDefaults()
 	c.Memory.ApplyDefaults()
+	c.Tethers.ApplyDefaults()
 	return nil
 }
 
@@ -297,6 +320,26 @@ func DefaultMemoryConfig() MemoryConfig {
 		Binary:   "marmot",
 	}
 }
+
+// DefaultTethersConfig returns the default tethers settings (enabled, strong at
+// a co-occurrence count of 3).
+func DefaultTethersConfig() TethersConfig {
+	return TethersConfig{
+		Enabled:         boolPtr(true),
+		StrongThreshold: 3,
+	}
+}
+
+func (c *TethersConfig) ApplyDefaults() {
+	if c.Enabled == nil {
+		c.Enabled = boolPtr(true)
+	}
+	if c.StrongThreshold < 1 {
+		c.StrongThreshold = 3
+	}
+}
+
+func boolPtr(b bool) *bool { return &b }
 
 func (c *AgentConfig) ApplyDefaults() {
 	defaults := DefaultAgentConfig()

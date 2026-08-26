@@ -119,7 +119,7 @@ func TestOpenAISchemaStrictCompatibility(t *testing.T) {
 	}
 
 	createSchema := openAISchema(spaceCreate.Parameters)
-	if got := createSchema["required"]; !reflect.DeepEqual(got, []string{"edits", "kind", "memories", "references", "space_id", "spec_path"}) {
+	if got := createSchema["required"]; !reflect.DeepEqual(got, []string{"common", "edits", "include_weak", "kind", "memories", "references", "space_id", "spec_path"}) {
 		t.Fatalf("space create required = %#v", got)
 	}
 	edits := createSchema["properties"].(map[string]any)["edits"].(map[string]any)

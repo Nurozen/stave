@@ -55,6 +55,113 @@ func TestLoadMissingConfigUsesDefaults(t *testing.T) {
 	if cfg.Memory.Binary != "marmot" {
 		t.Fatalf("Memory.Binary = %q", cfg.Memory.Binary)
 	}
+	if cfg.Tethers.Enabled == nil || !*cfg.Tethers.Enabled {
+		t.Fatalf("Tethers.Enabled = %v, want non-nil true", cfg.Tethers.Enabled)
+	}
+	if !cfg.Tethers.IsEnabled() {
+		t.Fatal("Tethers.IsEnabled() = false, want true")
+	}
+	if cfg.Tethers.StrongThreshold != 3 {
+		t.Fatalf("Tethers.StrongThreshold = %d, want 3", cfg.Tethers.StrongThreshold)
+	}
+}
+
+func TestTethersKillSwitchRoundTrip(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	path := filepath.Join(home, ".config", "stave", "config.yaml")
+
+	cfg, err := Default()
+	if err != nil {
+		t.Fatalf("Default() error = %v", err)
+	}
+	disabled := false
+	cfg.Tethers.Enabled = &disabled
+	if err := cfg.Save(path); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	loaded, _, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if loaded.Tethers.Enabled == nil {
+		t.Fatal("Tethers.Enabled = nil after load, kill switch did not persist")
+	}
+	if *loaded.Tethers.Enabled {
+		t.Fatal("Tethers.Enabled = true after load, kill switch did not survive")
+	}
+	if loaded.Tethers.IsEnabled() {
+		t.Fatal("Tethers.IsEnabled() = true after load, kill switch did not survive")
+	}
+}
+
+func TestRepositoryDescriptionRoundTrip(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	path := filepath.Join(home, ".config", "stave", "config.yaml")
+
+	cfg, err := Default()
+	if err != nil {
+		t.Fatalf("Default() error = %v", err)
+	}
+	if _, err := cfg.RegisterRepository("api", "https://example.test/api.git", "main"); err != nil {
+		t.Fatalf("RegisterRepository() error = %v", err)
+	}
+	repo := cfg.Repos["api"]
+	repo.Description = "the API service"
+	cfg.Repos["api"] = repo
+	if err := cfg.Save(path); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	loaded, _, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if loaded.Repos["api"].Description != "the API service" {
+		t.Fatalf("Description = %q, want %q", loaded.Repos["api"].Description, "the API service")
+	}
+}
+
+func TestTethersStrongThresholdClamp(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	path := filepath.Join(home, "config.yaml")
+
+	for _, raw := range []string{"tethers:\n  strongThreshold: 0\n", "tethers:\n  strongThreshold: -5\n"} {
+		if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		loaded, _, err := Load(path)
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if loaded.Tethers.StrongThreshold != 3 {
+			t.Fatalf("StrongThreshold = %d after clamp, want 3 (input %q)", loaded.Tethers.StrongThreshold, raw)
+		}
+	}
+}
+
+func TestTethersApplyDefaults(t *testing.T) {
+	c := TethersConfig{}
+	c.ApplyDefaults()
+	if c.Enabled == nil || !*c.Enabled {
+		t.Fatalf("Enabled = %v, want non-nil true", c.Enabled)
+	}
+	if c.StrongThreshold != 3 {
+		t.Fatalf("StrongThreshold = %d, want 3", c.StrongThreshold)
+	}
+
+	disabled := false
+	c2 := TethersConfig{Enabled: &disabled, StrongThreshold: 7}
+	c2.ApplyDefaults()
+	if c2.Enabled == nil || *c2.Enabled {
+		t.Fatalf("Enabled = %v, want non-nil false (preserved)", c2.Enabled)
+	}
+	if c2.StrongThreshold != 7 {
+		t.Fatalf("StrongThreshold = %d, want 7 (preserved)", c2.StrongThreshold)
+	}
 }
 
 func TestSaveAndLoadRoundTrip(t *testing.T) {

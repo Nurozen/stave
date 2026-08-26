@@ -10,6 +10,15 @@ import (
 	"github.com/Nurozen/stave/internal/cli"
 )
 
+// Build metadata, populated at release time via
+// -ldflags "-X main.version=... -X main.commit=... -X main.date=..."
+// (see .goreleaser.yml). They stay in package main so those ldflags resolve.
+var (
+	version = "dev"
+	commit  = ""
+	date    = ""
+)
+
 func main() {
 	if err := run(); err != nil {
 		code := 1
@@ -33,5 +42,6 @@ func run() error {
 	// instead of leaving them orphaned.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	cli.BuildVersion, cli.BuildCommit, cli.BuildDate = version, commit, date
 	return cli.ExecuteContext(ctx)
 }

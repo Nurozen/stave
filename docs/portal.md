@@ -517,7 +517,6 @@ Other destroy flags:
 |------|---------|
 | `--force` | Force destroy even when the runtime does not stop cleanly |
 | `--timeout <seconds>` | Graceful stop timeout before forcing |
-| `--delete-remote-data` | Delete the exact recorded remote data when supported |
 
 For SSH and EC2 portals, use `detach`. Portal v1 does not delete arbitrary
 remote hosts, terminate EC2 instances, or remove files outside the exact

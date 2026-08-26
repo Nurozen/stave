@@ -131,6 +131,9 @@ type SagaCreateOptions struct {
 	// SkipAmbientMemory disables ambient memory.default attach.
 	SkipAmbientMemory bool
 	DryRun            bool
+	// NoLearn suppresses passive co-occurrence capture. A saga space holds no
+	// edits, so capture records nothing regardless; threaded for uniformity.
+	NoLearn bool
 }
 
 // CreateSaga creates a saga space: a version-2 manifest with an empty member
@@ -165,6 +168,7 @@ func (s Service) CreateSaga(ctx context.Context, opts SagaCreateOptions) error {
 		Memories:            opts.Memories,
 		SkipAmbientMemory:   opts.SkipAmbientMemory,
 		DryRun:              opts.DryRun,
+		NoLearn:             opts.NoLearn,
 		Saga:                &SagaManifest{},
 		viaSaga:             true,
 		sagaLockHeld:        true,
@@ -341,6 +345,9 @@ func (s Service) createInSaga(ctx context.Context, opts CreateOptions) error {
 		inner := opts
 		inner.SagaID = ""
 		inner.After = nil
+		// The saga member's realized set is captured by the OUTER Create,
+		// outside the per-saga lock (D2); suppress the inner recording.
+		inner.suppressCapture = true
 		inner.Edits, err = s.resolveAfterBases(opts)
 		if err != nil {
 			return err

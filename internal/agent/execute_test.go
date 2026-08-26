@@ -15,6 +15,7 @@ import (
 	"github.com/Nurozen/stave/internal/portal"
 	"github.com/Nurozen/stave/internal/space"
 	"github.com/Nurozen/stave/internal/summon"
+	"github.com/Nurozen/stave/internal/tether"
 )
 
 func TestExecutorRunsPortalInitAndLifecyclePlan(t *testing.T) {
@@ -129,6 +130,47 @@ func TestExecutorRunsSpaceCreateAddAndRepoSyncAll(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "created space ex-2") || !strings.Contains(out.String(), "added edit repo web") {
 		t.Fatalf("output = %s", out.String())
+	}
+}
+
+func TestExecutorSpaceCreateExpandsCommonReferences(t *testing.T) {
+	cfg := executorConfig(t)
+	cfg.Tethers = config.TethersConfig{StrongThreshold: 3}
+	cfg.Repos["api"] = config.Repository{Name: "api", URL: "https://example.test/api.git", BareRepoPath: filepath.Join(cfg.BareReposDir, "api.git"), DefaultBranch: "main"}
+	cfg.Repos["web"] = config.Repository{Name: "web", URL: "https://example.test/web.git", BareRepoPath: filepath.Join(cfg.BareReposDir, "web.git"), DefaultBranch: "main"}
+	// Seed a strong api->web tether so -c/Common expands web as a reference.
+	if err := tether.Update(tether.Path(cfg), func(f *tether.File) error {
+		now := time.Now()
+		for i := 0; i < 3; i++ {
+			tether.Bump(f, "api", "web", tether.ModeReference, now)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	executor := Executor{Config: cfg, Git: git.New(git.WithRunner(&executorGitRunner{})), Out: &out}
+
+	if err := executor.executeOperation(context.Background(), Operation{
+		Type:    OpSpaceCreate,
+		SpaceID: "ex-c",
+		Edits:   []RepoRef{{Name: "api"}},
+		Common:  true,
+	}); err != nil {
+		t.Fatalf("executeOperation error = %v", err)
+	}
+	manifest, err := space.LoadManifest(filepath.Join(cfg.AgentWorkDir, "ex-c"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var foundRef bool
+	for _, repo := range manifest.Repos {
+		if repo.Name == "web" && repo.Mode == space.ModeReference {
+			foundRef = true
+		}
+	}
+	if !foundRef {
+		t.Fatalf("expected web expanded as reference worktree, manifest = %#v", manifest.Repos)
 	}
 }
 
@@ -286,7 +328,7 @@ func TestExecutePlanRunsPortalReadOps(t *testing.T) {
 func TestExecutableOperationsCoverValidatedOps(t *testing.T) {
 	validated := []string{
 		OpSpaceCreate, OpSpaceAdd, OpSpaceSync, OpSpaceStatus,
-		OpReposList, OpReposSync, OpSummon,
+		OpReposList, OpReposTethers, OpReposSync, OpSummon,
 		OpSagaCreate, OpSagaStatus, OpSagaAdd,
 		OpPortalInit, OpPortalAttach, OpPortalConfigure,
 		OpPortalList, OpPortalStatus, OpPortalDoctor, OpPortalInspect, OpPortalAuthStatus, OpPortalLogs,
@@ -495,6 +537,31 @@ func TestExecutePortalPlanPropagatesRunnerError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "boom") {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+// TestExecutorSurfacesPortalWarnDiagnostics pins that the executor prints
+// warn-severity diagnostics (summon.cursor_partial) before running a portal
+// plan, so agents see actionable warnings that only rode on plan.Diagnostics.
+func TestExecutorSurfacesPortalWarnDiagnostics(t *testing.T) {
+	cfg := executorConfig(t)
+	writeExecutorSpace(t, cfg, "ex-1")
+	saveExecutorPortal(t, cfg, "ex-1", "local", portal.DriverDocker)
+	var out bytes.Buffer
+	executor := Executor{Config: cfg, PortalRunner: &executorPortalRunner{}, AllowInteractive: true, Out: &out}
+
+	err := executor.executeOperation(context.Background(), Operation{
+		Type:     OpPortalSummon,
+		SpaceID:  "ex-1",
+		PortalID: "local",
+		Summoner: "cursor",
+		Mode:     "foreground",
+	})
+	if err != nil {
+		t.Fatalf("executeOperation(summon cursor) error = %v", err)
+	}
+	if !strings.Contains(out.String(), "summon.cursor_partial") {
+		t.Fatalf("executor did not surface cursor warn diagnostic:\n%s", out.String())
 	}
 }
 
