@@ -229,11 +229,20 @@ run_stave "portal sync ssh dry-run" portal sync "$SPACE_ID" ssh-live --direction
 run_stave "portal sync ssh write" portal sync "$SPACE_ID" ssh-live --direction to --mode rsync
 run_stave "portal exec ssh destination" portal exec "$SPACE_ID" ssh-live -- sh -lc "test -f .stave.yaml && test -f .stave-portal.yaml && test -d fixture && echo ssh-destination-ok > .stave-ssh-portal-ok"
 run_shell "verify ssh destination marker" "ssh -p $SSH_PORT -i '$SSH_KEY' -o UserKnownHostsFile='$SSH_KNOWN_HOSTS' -o StrictHostKeyChecking=yes stave@127.0.0.1 'cat /home/stave/portal-work/.stave-ssh-portal-ok' | grep ssh-destination-ok"
-# Preview only: the sshd fixture now ships tmux (see ssh-host/Dockerfile), so the
-# tmux summon path can be exercised there. This leg stays a --dry-run to keep the
-# harness deterministic; a real check could summon in --mode tmux, then assert
-# `tmux has-session -t <session>` and `tmux capture-pane -p` over the ssh fixture
-# rather than adding a blocking/flaky live agent-log capture here.
+# Real tmux summon over the ssh fixture (which ships tmux + a /usr/bin/codex
+# stub; see ssh-host/Dockerfile). `< /dev/null` forces a non-terminal stdin so
+# the off-TTY flip-skip executes the detached `tmux new-session -d` create
+# directly and PlanSummon never appends the blocking attach — regardless of
+# whether run.sh itself was launched from a terminal. It returns promptly under
+# run_stave's timeout. We then assert the session is live, its pane shows the
+# stub agent's marker, and re-summoning is idempotent. Each assertion ssh carries
+# ConnectTimeout so a wedged connection fails the leg instead of stalling the loop.
+run_stave "portal summon tmux (real)" portal summon "$SPACE_ID" ssh-live --with codex --mode tmux < /dev/null
+run_shell "verify tmux session live" "ssh -o ConnectTimeout=10 -p $SSH_PORT -i '$SSH_KEY' -o UserKnownHostsFile='$SSH_KNOWN_HOSTS' -o StrictHostKeyChecking=yes stave@127.0.0.1 tmux has-session -t stave-$SPACE_ID-ssh-live"
+run_shell "verify tmux pane marker" "for i in {1..30}; do ssh -o ConnectTimeout=10 -p $SSH_PORT -i '$SSH_KEY' -o UserKnownHostsFile='$SSH_KNOWN_HOSTS' -o StrictHostKeyChecking=yes stave@127.0.0.1 tmux capture-pane -pt stave-$SPACE_ID-ssh-live | grep -q STAVE-STUB-AGENT-READY && exit 0; sleep 1; done; exit 1"
+run_stave "portal summon tmux (idempotent)" portal summon "$SPACE_ID" ssh-live --with codex --mode tmux < /dev/null
+run_shell "verify tmux session still live" "ssh -o ConnectTimeout=10 -p $SSH_PORT -i '$SSH_KEY' -o UserKnownHostsFile='$SSH_KNOWN_HOSTS' -o StrictHostKeyChecking=yes stave@127.0.0.1 tmux has-session -t stave-$SPACE_ID-ssh-live"
+run_shell "verify single tmux session" "[ \"\$(ssh -o ConnectTimeout=10 -p $SSH_PORT -i '$SSH_KEY' -o UserKnownHostsFile='$SSH_KNOWN_HOSTS' -o StrictHostKeyChecking=yes stave@127.0.0.1 tmux list-sessions | grep -c stave-$SPACE_ID-ssh-live)\" -eq 1 ]"
 run_stave "portal logs ssh plan" portal logs "$SPACE_ID" ssh-live --tail 10 --dry-run
 run_stave "portal detach ssh dry-run" portal detach "$SPACE_ID" ssh-live --dry-run
 

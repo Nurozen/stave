@@ -18,6 +18,12 @@ RUN apk add --no-cache openssh-server rsync tmux \
     && chmod 600 /home/stave/.ssh/authorized_keys \
     && printf 'PasswordAuthentication no\nPermitRootLogin no\n' >> /etc/ssh/sshd_config
 
+# Stub coding agent so `stave portal summon --mode tmux` has a launchable agent
+# in the fixture. Installed at /usr/bin (on the non-login sshd PATH, unlike
+# /usr/local/bin) and kept alive so the tmux session/pane persists for capture.
+RUN printf '#!/bin/sh\necho STAVE-STUB-AGENT-READY\nwhile :; do sleep 3600; done\n' > /usr/bin/codex \
+    && chmod +x /usr/bin/codex
+
 EXPOSE 22
 
 CMD ["/usr/sbin/sshd", "-D", "-e"]

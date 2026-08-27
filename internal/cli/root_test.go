@@ -622,6 +622,81 @@ func TestCLIPortalDryRunShellSummonAndDetach(t *testing.T) {
 	}
 }
 
+func TestCLISummonTmuxOffTTYExecutesDetachedCreate(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	runCLI(t, "setup")
+	runCLI(t, "space", "init", "ex-1234")
+	// A default ssh portal so the tmux summon plan has a target to build against.
+	runCLIWithApp(t, &app{portalRunner: &fakePortalRunner{}}, "portal", "attach", "ssh", "ex-1234", "devbox.example")
+
+	commandsContain := func(runs []portal.Command, needle string) bool {
+		for _, c := range runs {
+			if strings.Contains(c.String(), needle) {
+				return true
+			}
+		}
+		return false
+	}
+
+	for _, tc := range []struct {
+		name        string
+		args        []string
+		isTerminal  bool
+		wantExec    bool // create command actually ran against the runner
+		wantAttach  bool // attach-session command was appended
+		wantPrinted bool // plan text printed to stdout (preview)
+	}{
+		{
+			name:       "off-tty mode tmux executes detached create, no attach",
+			args:       []string{"portal", "summon", "ex-1234", "--with", "codex", "--mode", "tmux"},
+			isTerminal: false,
+			wantExec:   true,
+			wantAttach: false,
+		},
+		{
+			name:        "off-tty mode tmux with print-command prints only",
+			args:        []string{"portal", "summon", "ex-1234", "--with", "codex", "--mode", "tmux", "--print-command"},
+			isTerminal:  false,
+			wantExec:    false,
+			wantAttach:  false,
+			wantPrinted: true,
+		},
+		{
+			name:       "real tty mode tmux executes create and attach",
+			args:       []string{"portal", "summon", "ex-1234", "--with", "codex", "--mode", "tmux"},
+			isTerminal: true,
+			wantExec:   true,
+			wantAttach: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := &fakePortalRunner{}
+			isTerm := tc.isTerminal
+			out := runCLIWithApp(t, &app{portalRunner: runner, isTerminal: func(*cobra.Command) bool { return isTerm }}, tc.args...)
+
+			ranCreate := commandsContain(runner.runs, "new-session -d -s stave-ex-1234-default")
+			if ranCreate != tc.wantExec {
+				t.Fatalf("executed detached create = %v, want %v (runs=%#v)", ranCreate, tc.wantExec, runner.runs)
+			}
+			if got := commandsContain(runner.runs, "attach-session"); got != tc.wantAttach {
+				t.Fatalf("appended attach-session = %v, want %v (runs=%#v)", got, tc.wantAttach, runner.runs)
+			}
+			if tc.wantExec && strings.Contains(out, "Non-interactive terminal detected") {
+				t.Fatalf("mode tmux degraded to preview: %s", out)
+			}
+			if tc.wantPrinted {
+				if len(runner.runs) != 0 {
+					t.Fatalf("print-command executed commands: %#v", runner.runs)
+				}
+				if !strings.Contains(out, "new-session -d -s stave-ex-1234-default") {
+					t.Fatalf("print-command did not print create command: %s", out)
+				}
+			}
+		})
+	}
+}
+
 func TestCLIPortalPlanningCommandsExecuteAndPreview(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

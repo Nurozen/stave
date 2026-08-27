@@ -1587,7 +1587,10 @@ func (a *app) portalSummonCommand() *cobra.Command {
 			if mode == "print" {
 				printCommand = true
 			}
-			if !printCommand && !a.commandIsTerminal(cmd) {
+			// A detached `tmux new-session -d` needs no TTY and the blocking
+			// attach stays gated off-TTY (planning.go), so `--mode tmux` should
+			// run the detached create off-TTY rather than degrade to a preview.
+			if !printCommand && !a.commandIsTerminal(cmd) && mode != "tmux" {
 				printCommand = true
 				fmt.Fprintln(cmd.ErrOrStderr(), "Non-interactive terminal detected; printing summon command instead of launching.")
 			}
