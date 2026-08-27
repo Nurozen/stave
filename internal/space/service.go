@@ -407,6 +407,14 @@ func (s Service) Create(ctx context.Context, opts CreateOptions) error {
 	}
 	if opts.SagaID != "" {
 		if err := s.createInSaga(ctx, opts); err != nil {
+			// Recovery-learning: the inner member Create is suppressed and the
+			// success capture below never runs on error, so a member whose repos
+			// are durably built but whose create failed (e.g. --memory attach)
+			// would stay unlearned. Capture now — post-lock (createInSaga released
+			// the locks), best-effort, only if the member is durably materialized.
+			if !opts.DryRun && !opts.NoLearn && s.spaceHasRepos(opts.ID) {
+				s.captureCoOccurrence(opts.Edits, opts.References)
+			}
 			return err
 		}
 		// Capture the realized set OUTSIDE the per-saga lock (D2): the inner
@@ -1830,6 +1838,14 @@ func (s Service) ListSpaces() ([]SpaceEntry, error) {
 
 func (s Service) SpacePath(id string) string {
 	return filepath.Join(s.Config.AgentWorkDir, id)
+}
+
+// spaceHasRepos reports whether the space is durably materialized: its manifest
+// loads and lists at least one repo. Used by the saga-create error path to gate
+// recovery-learning capture to members whose repos are actually built.
+func (s Service) spaceHasRepos(id string) bool {
+	m, err := LoadManifest(s.SpacePath(id))
+	return err == nil && len(m.Repos) > 0
 }
 
 // resolveSpacePath validates id before joining it under AgentWorkDir so verbs
