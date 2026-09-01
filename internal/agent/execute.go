@@ -183,17 +183,24 @@ func (e Executor) executeOperation(ctx context.Context, op Operation) error {
 		}
 		return nil
 	case OpReposSync:
-		if op.Repo != "" {
-			return client.FetchAllPrune(ctx, e.Config.Repos[op.Repo].BareRepoPath)
+		names := []string{op.Repo}
+		if op.Repo == "" {
+			names = names[:0]
+			for name := range e.Config.Repos {
+				names = append(names, name)
+			}
+			sort.Strings(names)
 		}
-		names := make([]string, 0, len(e.Config.Repos))
-		for name := range e.Config.Repos {
-			names = append(names, name)
-		}
-		sort.Strings(names)
 		for _, name := range names {
-			if err := client.FetchAllPrune(ctx, e.Config.Repos[name].BareRepoPath); err != nil {
+			bare := e.Config.Repos[name].BareRepoPath
+			if err := client.FetchAllPrune(ctx, bare); err != nil {
 				return err
+			}
+			// Parity with `stave repos sync`: keep origin/HEAD current so the
+			// offline default-branch fast path works. Best-effort — a failure
+			// here must not fail an otherwise successful fetch.
+			if err := client.SetRemoteHead(ctx, bare); err != nil {
+				fmt.Fprintf(out, "note: could not set origin/HEAD for %q: %v\n", name, err)
 			}
 		}
 		return nil

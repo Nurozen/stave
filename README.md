@@ -192,7 +192,58 @@ stave review owner/repo#123 --summon claude
 
 # Pull in sibling repos as read-only context
 stave review owner/repo#123 -r other-repo --summon claude
+
+# Review in a registered repo the PR URL does not resolve to (SSH alias, other name)
+stave review owner/repo#123 --repo my-alias
+
+# Re-fetch PR metadata into an existing review space (e.g. after fixing gh auth)
+stave review owner/repo#123 --refresh
 ```
+
+Flags: `--summon`, `--prompt`, `-r/--reference` (repeatable), `--memory`
+(repeatable), `--repo <name>`, `--refresh`, `--no-summon`.
+
+**How review finds your repo.** `stave review` maps the PR onto a registered
+repo in this order: a registered repo with the PR's repo name (refused if that
+registration's URL parses to a different `owner/repo`; a registration whose
+URL is a local path, `file://`, or otherwise unparsable is trusted by name,
+since there is nothing to compare), then a registered repo whose URL is
+exactly `github.com/<owner>/<repo>` under any scheme (HTTPS, SSH, `ssh://`;
+the scheme's default port spelled out, `:443` or `:22`, still counts). If
+nothing matches but a registered repo names the same `owner/repo` under
+another host — an SSH-config alias, a GitHub Enterprise host, or `github.com`
+on a non-default port such as `ssh://git@github.com:2222/owner/repo` — review
+stops with an error that names that repo and tells you to re-run with
+`--repo <name>`, since stave cannot know whether that host is GitHub. If more
+than one registered repo matches, review errors and asks for `--repo <name>`.
+If nothing matches at all it auto-registers the repo from its public
+`https://github.com` clone URL; setting `origin/HEAD` and recording the
+default branch are best-effort there (a failure is a note, not an error). If
+the clone itself fails, the registration is unwound and the error names the
+recovery (`--repo`, or `stave repos add` with an SSH URL for a private repo);
+if a later step fails after the clone succeeded, the clone is kept and the
+error says to retry with `stave repos add <name> <url> --adopt`.
+`--repo <name>` forces a registered repo and skips every check above; PR
+metadata still comes from the PR as typed. For the `<name>#N` form the owner
+is derived from the registered URL only when that URL is a plain `github.com`
+URL; otherwise the spec is written without metadata and the note proposes the
+owner-qualified command instead — `stave review <owner>/<repo>#N --repo <name>
+--refresh`, with `owner/repo` read from the registered URL for you to confirm
+(or an `<owner>/<repo>` placeholder when the URL has none, e.g. a local path).
+
+**`--refresh`** re-fetches PR metadata into an existing review space and
+rewrites only `spec/pr-<N>.md` — useful when the space was created with a
+minimal spec because `gh` was not authenticated. It cannot be combined with
+`--reference`, `--memory`, `--summon`, `--prompt`, or passthrough agent
+arguments, never auto-registers a repo, and never touches worktrees or the
+manifest (it does fetch the mirror and the PR head); if metadata still cannot
+be fetched, the existing spec is left unchanged. Drift is disclosed, never
+repaired: on stderr and under "Refresh notes" in the spec, refresh reports
+when the worktree's actual `HEAD` (a detached checkout counts) is no longer
+the PR head and suggests recreating the space, when the PR's base branch
+differs from the one the space was created against, and when `origin/<base>`
+is missing from the mirror after the fetch (quickstart commands will fail
+until it is fetched). None of these abort the refresh.
 
 After the inscribed shell integration is loaded, `stave review` enters the
 review space root after setup (and after the summoned session exits when
@@ -341,19 +392,63 @@ migrated into the managed block.
 
 | Command | Description |
 |---------|-------------|
-| `stave repos add <name> <url>` | Clone bare mirror and register |
+| `stave repos add <name> <url>` | Clone bare mirror, register it, and (best-effort) set `origin/HEAD` and record the default branch; `--adopt` reuses an existing cache at the derived path |
 | `stave repos list [--verbose]` | List registered repos; `--verbose` appends each repo's description and learned tether count |
-| `stave repos sync [name]` | `git fetch --all --prune` on bare mirror(s) |
-| `stave repos remove <name>` | Unregister (does not delete bare cache) |
+| `stave repos sync [name]` | Fetch + prune bare mirror(s), then (best-effort) re-point `origin/HEAD` and backfill a missing `defaultBranch` |
+| `stave repos remove <name>` | Unregister; keeps the cache unless `--purge` |
 | `stave repos describe <repo> [text]` | Set the repo's description when text is given; print it otherwise (non-zero exit if unset) |
 | `stave repos tethers <repo> [--json]` | List the repo's learned co-occurrence tethers, strong first, with mode, effective strength, and count |
 | `stave repos tether <from> <to> [--strong\|--weak] [--edit\|--reference]` | Manually pin a tether without waiting for it to be learned; strength defaults to strong, association mode to reference |
 | `stave repos forget <from> [<to>] [--all]` | Remove one `<from> → <to>` tether, or every tether from `<from>` with `--all` |
 
-Flags: `--dry-run` on `add`. `--strong`/`--weak` and `--edit`/`--reference` are
-each mutually exclusive on `tether`; `forget` requires exactly one of a `<to>`
-argument or `--all`. See [Learned repo tethers](#learned-repo-tethers) for the
-model behind these commands.
+Flags: `--dry-run` and `--adopt` on `add`; `--purge` and `--dry-run` on
+`remove`. `--strong`/`--weak` and `--edit`/`--reference` are each mutually
+exclusive on `tether`; `forget` requires exactly one of a `<to>` argument or
+`--all`. See [Learned repo tethers](#learned-repo-tethers) for the model behind
+these commands.
+
+**`add`** clones `<url>` as a bare mirror, configures branch tracking, fetches,
+then — best-effort — sets `origin/HEAD` and records the remote's default
+branch in config. A failure in either of those last two steps is a note on
+stderr, not an error; the add still succeeds and the note says which fallback
+space operations will use (re-run `stave repos sync` later to fix it).
+Tracking and fetch failures are errors, and if one happens after the clone
+itself succeeded the clone is kept on disk and the error says to retry with
+`--adopt`. If a bare repo already sits at the derived path (for example after
+`stave repos remove`, which keeps the cache), `add` refuses unless `--adopt`
+is given. With `--adopt` the existing cache is reused when it is a bare repo
+whose `origin` names the same repository — the same `owner/repo` for remote
+URLs (host is ignored, so SSH-config aliases count) or the same local path for
+path/`file://` URLs. Adoption re-points `origin` to `<url>` and runs the same
+finishing steps as a fresh clone, so the cache reaches the state stave relies
+on (origin URL, tracking refspec, remote-tracking refs, `origin/HEAD`, default
+branch); pre-existing local branches in the cache are left as-is. If the
+post-adopt fetch fails, the cache's `origin` is restored to its previous URL
+and nothing is registered.
+
+**`sync`** runs `git fetch --all --prune` on one or all mirrors, then —
+best-effort — re-points `origin/HEAD` at the remote's current default branch
+and, when config has no `defaultBranch` recorded for a repo, discovers and
+records it. A fetch failure is an error; set-head and discovery failures are
+notes, and when set-head fails discovery is skipped rather than trusting a
+stale `origin/HEAD`. That backfill is the only config write, and it is skipped
+when nothing changed. A recorded `defaultBranch` that disagrees with the
+remote is reported as a note, never rewritten. `sync` does not touch fetch
+refspecs.
+
+**`remove`** prints `unregistered <name>` on stdout and explains the cache on
+stderr: either that it was kept (with its path and, when no space uses it, a
+`mv <old-path> <new-path> && stave repos add <new-name> <url> --adopt` recipe
+for re-registering under a new name) or a warning that N spaces still use it.
+`--purge` deletes the cache as well, but refuses when any space under the agent
+work directory still references it (by name or by path; archived spaces are not
+counted), when a space manifest cannot be read, or when the cache path is not a
+bare git repository (delete it manually if intended). The cache is deleted
+before the registry entry is dropped, so a failed delete leaves the repo
+registered for a re-run. `--dry-run` previews what would happen and prints the
+same kept-cache warning or re-register recipe as the real run; with `--purge`
+it applies every refusal above. Recovery commands in these messages are
+shell-quoted, so paths with spaces or special characters paste verbatim.
 
 ### `stave agent`
 
@@ -665,6 +760,8 @@ exists.
 | `stave review <pr>` | One-step PR review space: fetch the PR head, check it out, record metadata under `spec/` |
 | `stave review <pr> --summon claude` | Same, then launch Claude Code in the review space |
 | `stave review <pr> -r <repo> --summon claude --prompt "/skill"` | Add read-only reference repos and launch straight into a review skill |
+| `stave review <pr> --repo <name>` | Review in a specific registered repo when the PR URL does not resolve to it (SSH alias, other name) |
+| `stave review <pr> --refresh` | Re-fetch PR metadata into an existing review space; rewrites `spec/pr-<N>.md` only |
 | `stave summon <space-id> --with cursor` | Start Cursor Agent in the space root |
 
 Summoned agents always launch from `agent-work/<space-id>`, not from an individual repo. That gives them the manifest, generated `AGENTS.md`, copied specs, editable top-level repos, and `references/` context in one working directory.
@@ -742,7 +839,7 @@ summon:
 ```
 
 - **`defaultBase`** — fallback ref when a repo or `--edit` / `--reference` spec omits a branch.
-- **`defaultBranch`** (per repo) — detected on `repos add` when possible; overrides `defaultBase` for that repo.
+- **`defaultBranch`** (per repo) — detected on `repos add` and backfilled by `repos sync` when missing; overrides `defaultBase` for that repo.
 - **`agent.defaultProvider`** — provider used by `stave agent` unless `--provider` is set.
 - **`agent.autoIncant`** — when true, `stave agent` executes validated plans without prompting or requiring `--incant`; `--no-incant` still wins.
 - **`agent.providers.*.apiKeyRef`** — secret reference; either `keychain:stave/agent/<provider>` or `env:<NAME>`.

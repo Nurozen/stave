@@ -210,10 +210,24 @@ func (a *app) reposCommand() *cobra.Command {
 
 func (a *app) reposAddCommand() *cobra.Command {
 	var dryRun bool
+	var adopt bool
 	cmd := &cobra.Command{
 		Use:   "add <name> <url>",
-		Short: "Clone and register a bare repository",
-		Args:  cobra.ExactArgs(2),
+		Short: "Clone and register a bare repository (or adopt an existing cache)",
+		Long: `Clone <url> as a bare mirror under the bare-repos directory and register it
+under <name>. After cloning, stave configures branch tracking and fetches,
+then attempts to set origin/HEAD and record the remote's default branch in
+the registry so space operations can base new branches on it; those last two
+steps are best-effort and failures are reported as notes.
+
+If a bare repo already exists at the derived path (for example after
+'stave repos remove', which keeps the cache), the add is refused unless
+--adopt is given. With --adopt the existing cache is reused when it is a bare
+clone of the same repository: its origin URL is rewritten to <url> and it
+reaches the same state stave relies on (origin URL, tracking refspec,
+remote-tracking refs, origin/HEAD, default branch); pre-existing local
+branches in the cache are left as-is.`,
+		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, path, err := a.loadConfig()
 			if err != nil {
@@ -236,33 +250,59 @@ func (a *app) reposAddCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if !dryRun {
+			// A plain dry-run skips the collision stat so the plan prints even
+			// over a stale cache; --adopt needs the answer to say whether it
+			// would adopt or clone.
+			existing := false
+			if adopt || !dryRun {
 				if _, err := os.Stat(repo.BareRepoPath); err == nil {
-					return fmt.Errorf("bare repo path already exists: %s", repo.BareRepoPath)
+					existing = true
 				} else if !os.IsNotExist(err) {
 					return err
 				}
+			}
+			if existing && !adopt {
+				return fmt.Errorf("bare repo path already exists: %s; run '%s' to reuse it, or delete it to re-clone", repo.BareRepoPath, adoptRetryHint(name, url))
 			}
 			client := git.New(git.WithDryRun(dryRun, func(format string, args ...any) {
 				fmt.Fprintf(cmd.OutOrStdout(), format+"\n", args...)
 			}))
 			ctx := cmd.Context()
-			if err := client.CloneBare(ctx, url, repo.BareRepoPath); err != nil {
+			var adopted adoption
+			if existing {
+				adopted, err = adoptBareRepo(ctx, cmd, client, repo.BareRepoPath, name, url, dryRun)
+				if err != nil {
+					return err
+				}
+			} else if err := cloneBareFresh(ctx, client, url, repo.BareRepoPath, dryRun); err != nil {
+				return fmt.Errorf("clone %q: %w", name, err)
+			}
+			// Past this point the cache on disk is real. A failure must not
+			// leave an adopted cache pointing at a URL (or carrying a fetch
+			// refspec) for a registration that never happened, and must tell
+			// the user a fresh clone survived. The rollback runs under a
+			// context that ignores cancellation: an interrupt is a likely
+			// cause of the failure and must not also skip the cleanup.
+			failAfterCache := func(err error) error {
+				switch {
+				case existing && !dryRun:
+					return restoreAdoption(context.WithoutCancel(ctx), client, repo.BareRepoPath, adopted, err)
+				case !existing && !dryRun:
+					return fmt.Errorf("%w; the clone was kept at %s — retry with '%s'", err, shellQuote(repo.BareRepoPath), adoptRetryHint(name, url))
+				}
 				return err
 			}
-			if err := client.ConfigureBareRemoteTracking(ctx, repo.BareRepoPath); err != nil {
-				return err
+			branch, err := finalizeBareMirror(ctx, cmd, client, name, repo.BareRepoPath, "", cfg.DefaultBase, true, dryRun)
+			if err != nil {
+				return failAfterCache(err)
 			}
-			if err := client.FetchAllPrune(ctx, repo.BareRepoPath); err != nil {
-				return err
-			}
-			if branch, err := client.RemoteDefaultBranch(ctx, repo.BareRepoPath); err == nil && branch != "" {
+			if branch != "" {
 				repo.DefaultBranch = branch
 				cfg.Repos[name] = repo
 			}
 			if !dryRun {
 				if err := cfg.Save(path); err != nil {
-					return err
+					return failAfterCache(err)
 				}
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "registered %s at %s\n", name, repo.BareRepoPath)
@@ -270,6 +310,7 @@ func (a *app) reposAddCommand() *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print operations without changing state")
+	cmd.Flags().BoolVar(&adopt, "adopt", false, "reuse an existing bare repo cache at the derived path if it is a clone of the same repository; it reaches the same state stave relies on (origin URL, tracking refspec, remote-tracking refs, origin/HEAD, default branch) and pre-existing local branches are left as-is")
 	return cmd
 }
 
@@ -283,11 +324,7 @@ func (a *app) reposListCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			names := make([]string, 0, len(cfg.Repos))
-			for name := range cfg.Repos {
-				names = append(names, name)
-			}
-			sort.Strings(names)
+			names := sortedRepoNames(cfg)
 			tetherCounts := map[string]int{}
 			if verbose {
 				if f, err := tether.Load(tether.Path(*cfg)); err == nil {
@@ -314,10 +351,15 @@ func (a *app) reposListCommand() *cobra.Command {
 func (a *app) reposSyncCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "sync [name]",
-		Short: "Fetch and prune registered bare repositories",
-		Args:  cobra.MaximumNArgs(1),
+		Short: "Fetch and prune registered bare repositories (best-effort origin/HEAD refresh)",
+		Long: `Fetch and prune one or all registered bare mirrors. Each sync also attempts
+to re-point origin/HEAD at the remote's current default branch and, when the
+registry has no default branch recorded for a repo, to discover and record
+it; both steps are best-effort and failures are reported as notes. A registry
+entry that disagrees with the remote is reported but never rewritten.`,
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, _, err := a.loadConfig()
+			cfg, cfgPath, err := a.loadConfig()
 			if err != nil {
 				return err
 			}
@@ -328,18 +370,49 @@ func (a *app) reposSyncCommand() *cobra.Command {
 				}
 				targets = append(targets, args[0])
 			} else {
-				for name := range cfg.Repos {
-					targets = append(targets, name)
-				}
-				sort.Strings(targets)
+				targets = sortedRepoNames(cfg)
 			}
 			client := git.New()
+			ctx := cmd.Context()
+			backfill := map[string]string{}
 			for _, name := range targets {
 				repo := cfg.Repos[name]
-				if err := client.FetchAllPrune(cmd.Context(), repo.BareRepoPath); err != nil {
+				branch, err := finalizeBareMirror(ctx, cmd, client, name, repo.BareRepoPath, repo.DefaultBranch, cfg.DefaultBase, false, false)
+				if err != nil {
 					return err
 				}
+				if repo.DefaultBranch == "" && branch != "" {
+					backfill[name] = branch
+				}
 				fmt.Fprintf(cmd.OutOrStdout(), "synced %s\n", name)
+			}
+			if len(backfill) == 0 {
+				return nil
+			}
+			// Re-load before writing so a long fetch loop never clobbers edits
+			// made to the registry in the meantime; only fill still-empty slots
+			// whose registration is still the one that was synced.
+			fresh, freshPath, err := a.loadConfig()
+			if err != nil {
+				return err
+			}
+			if freshPath == "" {
+				freshPath = cfgPath
+			}
+			changed, skipped := applyBackfill(fresh, cfg.Repos, backfill)
+			for _, name := range skipped {
+				fmt.Fprintf(cmd.ErrOrStderr(), "note: skipped default-branch backfill for %q: registration changed during sync\n", name)
+			}
+			if len(changed) == 0 {
+				return nil
+			}
+			// Say "recorded" only once it is true on disk: a failed save must
+			// not leave the user believing the registry was updated.
+			if err := fresh.Save(freshPath); err != nil {
+				return err
+			}
+			for _, name := range changed {
+				fmt.Fprintf(cmd.ErrOrStderr(), "note: recorded default branch %q for %q\n", backfill[name], name)
 			}
 			return nil
 		},
@@ -347,27 +420,144 @@ func (a *app) reposSyncCommand() *cobra.Command {
 }
 
 func (a *app) reposRemoveCommand() *cobra.Command {
-	return &cobra.Command{
+	var purge bool
+	var dryRun bool
+	cmd := &cobra.Command{
 		Use:   "remove <name>",
-		Short: "Unregister a repository without deleting its bare repo cache",
-		Args:  cobra.ExactArgs(1),
+		Short: "Unregister a repository (keeps its bare repo cache unless --purge)",
+		Long: `Remove <name> from the registry. By default the bare repo cache on disk is
+kept so it can be re-registered later with
+'stave repos add <name> <url> --adopt'; a note on stderr says where it is
+and whether any spaces still use it.
+
+With --purge the cache directory is deleted as well. The purge is refused when
+any space under the agent work directory still references the cache (by name
+or by path), when a space manifest cannot be read, when the path is not a
+bare git repository, or when its origin remote does not name the registered
+repository; archive or destroy those spaces first, or fix the registration.
+The cache is deleted before the registry entry is dropped, so a failed delete
+leaves the repo registered and the command can be re-run.
+
+--dry-run prints what would happen without changing anything; the same
+reference scan and purge guards apply.`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, path, err := a.loadConfig()
 			if err != nil {
 				return err
 			}
 			name := args[0]
-			if _, ok := cfg.Repos[name]; !ok {
+			repoCfg, ok := cfg.Repos[name]
+			if !ok {
 				return fmt.Errorf("repo %q is not registered", name)
+			}
+			barePath := repoCfg.BareRepoPath
+			if barePath == "" {
+				barePath = cfg.BareRepoPath(name)
+			}
+			refs, walkErr := spacesReferencingRepo(cfg.AgentWorkDir, name, barePath)
+			stdout, stderr := cmd.OutOrStdout(), cmd.ErrOrStderr()
+
+			if purge {
+				if walkErr != nil {
+					return fmt.Errorf("refusing to purge: %w; fix or delete that space first", walkErr)
+				}
+				if len(refs) > 0 {
+					return fmt.Errorf("refusing to purge: %d space(s) reference this cache (%s); archive or destroy them first", len(refs), strings.Join(refs, ", "))
+				}
+				existed := true
+				if _, err := os.Lstat(barePath); err != nil {
+					if !os.IsNotExist(err) {
+						return fmt.Errorf("inspect bare repo cache at %s: %w (repo %q is still registered; re-run to retry)", barePath, err, name)
+					}
+					existed = false
+				}
+				if existed {
+					// Never RemoveAll a path the registry merely claims is a
+					// cache: a mis-edited bareRepoPath must not take a
+					// user's directory with it.
+					client := git.New()
+					isBare, err := client.IsBareRepo(cmd.Context(), barePath)
+					if err != nil {
+						return fmt.Errorf("refusing to purge: %s is not a bare git repository (%v); delete it manually if intended", barePath, err)
+					}
+					if !isBare {
+						return fmt.Errorf("refusing to purge: %s is not a bare git repository; delete it manually if intended", barePath)
+					}
+					// Being a bare repo is not enough: the registry may point
+					// at somebody else's mirror. Only delete a cache whose
+					// origin (as configured, not insteadOf-rewritten) names
+					// the registered repository.
+					origin, err := client.RemoteConfigURL(cmd.Context(), barePath, "origin")
+					if err != nil {
+						return fmt.Errorf("refusing to purge: could not read origin remote of %s (%v); delete it manually if intended", barePath, err)
+					}
+					if ok, _ := sameRepoURL(origin, repoCfg.URL); !ok {
+						return fmt.Errorf("refusing to purge: %s is a bare repo for %s, not %s; fix the registration or delete it manually", barePath, redactURL(origin), redactURL(repoCfg.URL))
+					}
+				}
+				if dryRun {
+					if existed {
+						fmt.Fprintf(stdout, "dry-run: remove directory %s\n", barePath)
+					}
+					fmt.Fprintf(stdout, "dry-run: unregister %s\n", name)
+					if existed {
+						fmt.Fprintf(stderr, "note: would delete bare repo cache at %s\n", barePath)
+					} else {
+						fmt.Fprintf(stderr, "note: no bare repo cache at %s\n", barePath)
+					}
+					return nil
+				}
+				if existed {
+					if err := os.RemoveAll(barePath); err != nil {
+						return fmt.Errorf("delete bare repo cache at %s: %w (repo %q is still registered; re-run to retry)", barePath, err, name)
+					}
+				}
+				cfg.UnregisterRepository(name)
+				if err := cfg.Save(path); err != nil {
+					return err
+				}
+				fmt.Fprintf(stdout, "unregistered %s\n", name)
+				if existed {
+					fmt.Fprintf(stderr, "note: deleted bare repo cache at %s\n", barePath)
+				} else {
+					fmt.Fprintf(stderr, "note: no bare repo cache at %s\n", barePath)
+				}
+				return nil
+			}
+
+			// keepNotes explains the kept cache identically for the real run
+			// ("kept") and the dry-run ("would keep"), so a dry-run surfaces
+			// the same reference warning or re-register recipe.
+			keepNotes := func(verb string) {
+				switch {
+				case walkErr != nil:
+					fmt.Fprintf(stderr, "note: %s bare repo cache at %s (could not scan spaces: %v)\n", verb, barePath, walkErr)
+				case len(refs) > 0:
+					fmt.Fprintf(stderr, "note: %s bare repo cache at %s; %d space(s) still use it (%s) — do not move or delete it\n", verb, barePath, len(refs), strings.Join(refs, ", "))
+				default:
+					fmt.Fprintf(stderr, "note: %s bare repo cache at %s\n", verb, barePath)
+					target := shellQuote(cfg.BareReposDir) + string(filepath.Separator) + "<new-name>.git"
+					fmt.Fprintf(stderr, "note: to re-register under a new name: mv %s %s && stave repos add <new-name> %s --adopt\n", shellQuote(barePath), target, pasteableURL(repoCfg.URL))
+				}
+			}
+			if dryRun {
+				fmt.Fprintf(stdout, "dry-run: unregister %s\n", name)
+				keepNotes("would keep")
+				return nil
 			}
 			cfg.UnregisterRepository(name)
 			if err := cfg.Save(path); err != nil {
 				return err
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "unregistered %s\n", name)
+			fmt.Fprintf(stdout, "unregistered %s\n", name)
+			keepNotes("kept")
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&purge, "purge", false, "also delete the bare repo cache")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "show what would happen without changing anything")
+	return cmd
 }
 
 func (a *app) reposDescribeCommand() *cobra.Command {
@@ -2668,6 +2858,17 @@ func (a *app) commandIsTerminal(cmd *cobra.Command) bool {
 	}
 	file, ok := cmd.InOrStdin().(*os.File)
 	return ok && term.IsTerminal(int(file.Fd()))
+}
+
+// sortedRepoNames returns the registered repo names in lexical order so
+// listings, sync order, and resolution errors are deterministic across runs.
+func sortedRepoNames(cfg *config.Config) []string {
+	names := make([]string, 0, len(cfg.Repos))
+	for name := range cfg.Repos {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func firstNonEmpty(values ...string) string {

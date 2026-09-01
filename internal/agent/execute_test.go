@@ -719,3 +719,67 @@ func saveExecutorPortal(t *testing.T, cfg config.Config, spaceID, portalID strin
 		t.Fatal(err)
 	}
 }
+
+func TestExecuteOperationReposSyncSetsRemoteHead(t *testing.T) {
+	cfg := executorConfig(t)
+	cfg.Repos["api"] = config.Repository{Name: "api", BareRepoPath: filepath.Join(cfg.BareReposDir, "api.git")}
+	cfg.Repos["web"] = config.Repository{Name: "web", BareRepoPath: filepath.Join(cfg.BareReposDir, "web.git")}
+
+	// Single-repo form.
+	gitRunner := &executorGitRunner{}
+	executor := Executor{Config: cfg, Git: git.New(git.WithRunner(gitRunner))}
+	if err := executor.executeOperation(context.Background(), Operation{Type: OpReposSync, Repo: "api"}); err != nil {
+		t.Fatal(err)
+	}
+	want := [][]string{
+		{"--git-dir", cfg.Repos["api"].BareRepoPath, "fetch", "--all", "--prune"},
+		{"--git-dir", cfg.Repos["api"].BareRepoPath, "remote", "set-head", "origin", "--auto"},
+	}
+	if len(gitRunner.calls) != len(want) {
+		t.Fatalf("git calls = %#v, want %#v", gitRunner.calls, want)
+	}
+	for i := range want {
+		if strings.Join(gitRunner.calls[i], " ") != strings.Join(want[i], " ") {
+			t.Fatalf("git call %d = %v, want %v", i, gitRunner.calls[i], want[i])
+		}
+	}
+
+	// All-repos form: fetch then set-head for each, in sorted order.
+	gitRunner = &executorGitRunner{}
+	executor = Executor{Config: cfg, Git: git.New(git.WithRunner(gitRunner))}
+	if err := executor.executeOperation(context.Background(), Operation{Type: OpReposSync}); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"api", "web"} {
+		if !containsGitCall(gitRunner.calls, "remote set-head origin --auto", cfg.Repos[name].BareRepoPath) {
+			t.Fatalf("missing set-head for %s: %#v", name, gitRunner.calls)
+		}
+	}
+	if len(gitRunner.calls) != 4 || !strings.Contains(strings.Join(gitRunner.calls[0], " "), "fetch") || !strings.Contains(strings.Join(gitRunner.calls[1], " "), "set-head") {
+		t.Fatalf("git calls = %#v", gitRunner.calls)
+	}
+}
+
+func TestExecuteOperationReposSyncSetHeadFailureIsNote(t *testing.T) {
+	cfg := executorConfig(t)
+	cfg.Repos["api"] = config.Repository{Name: "api", BareRepoPath: filepath.Join(cfg.BareReposDir, "api.git")}
+	var out bytes.Buffer
+	executor := Executor{Config: cfg, Git: git.New(git.WithRunner(&failingSetHeadRunner{})), Out: &out}
+
+	if err := executor.executeOperation(context.Background(), Operation{Type: OpReposSync, Repo: "api"}); err != nil {
+		t.Fatalf("set-head failure must not fail repos_sync: %v", err)
+	}
+	if !strings.Contains(out.String(), `note: could not set origin/HEAD for "api"`) {
+		t.Fatalf("out = %q", out.String())
+	}
+}
+
+// failingSetHeadRunner succeeds on everything except `remote set-head`.
+type failingSetHeadRunner struct{}
+
+func (r *failingSetHeadRunner) Run(ctx context.Context, bin string, args []string, opts git.RunOptions) (git.Result, error) {
+	if strings.Contains(strings.Join(args, " "), "set-head") {
+		return git.Result{}, &git.GitError{Args: args, ExitCode: 1, Stderr: "no such remote HEAD"}
+	}
+	return git.Result{}, nil
+}

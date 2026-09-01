@@ -151,39 +151,124 @@ func TestInvalidJSON(t *testing.T) {
 	}
 }
 
+// ownerRepoCase is one row of a ParseOwnerRepo / ParseAnyOwnerRepo table.
+type ownerRepoCase struct {
+	name     string
+	cloneURL string
+	host     string
+	owner    string
+	repo     string
+	ok       bool
+}
+
+// parseOwnerRepoCases is the ParseOwnerRepo (GitHub-gated) table. It is a
+// package-level var so TestParseOwnerRepoMatchesGatedAny can replay every row
+// through the lenient parser as a refactor regression guard.
+var parseOwnerRepoCases = []ownerRepoCase{
+	{"https", "https://github.com/acme/widgets", "github.com", "acme", "widgets", true},
+	{"https .git", "https://github.com/acme/widgets.git", "github.com", "acme", "widgets", true},
+	{"https trailing slash", "https://github.com/acme/widgets/", "github.com", "acme", "widgets", true},
+	{"scp-like ssh", "git@github.com:acme/widgets.git", "github.com", "acme", "widgets", true},
+	{"scp-like ssh no .git", "git@github.com:acme/widgets", "github.com", "acme", "widgets", true},
+	{"ssh url", "ssh://git@github.com/acme/widgets", "github.com", "acme", "widgets", true},
+	{"ssh url .git", "ssh://git@github.com/acme/widgets.git", "github.com", "acme", "widgets", true},
+	{"enterprise https", "https://github.example.com/acme/widgets.git", "github.example.com", "acme", "widgets", true},
+	{"enterprise scp-like", "git@github.example.com:acme/widgets.git", "github.example.com", "acme", "widgets", true},
+	{"enterprise ghe.com", "https://acme.ghe.com/acme/widgets", "acme.ghe.com", "acme", "widgets", true},
+	{"non-GitHub", "https://gitlab.com/acme/widgets.git", "", "", "", false},
+	{"non-GitHub scp-like", "git@bitbucket.org:acme/widgets.git", "", "", "", false},
+	{"extra path segment", "https://github.com/acme/widgets/tree/main", "", "", "", false},
+	{"missing repo", "https://github.com/acme", "", "", "", false},
+	{"garbage", "not a url at all", "", "", "", false},
+	{"empty", "", "", "", "", false},
+	{"local path", "/srv/git/widgets.git", "", "", "", false},
+	// Sanctioned widening: a userinfo prefix on an https URL is stripped so
+	// the bare host survives the GitHub gate.
+	{"https userinfo", "https://git@github.com/o/r.git", "github.com", "o", "r", true},
+	{"https user:pass", "https://user:pass@github.com/o/r", "github.com", "o", "r", true},
+	// Pinned pre-existing behavior (verified against HEAD before the
+	// parser refactor): ssh:// port handling is untouched, so the port stays
+	// glued to the host as "github.com:2222". That still passes
+	// isGitHubHost because splitting on "." yields a bare "github" label, so
+	// the gated parser accepts it with the port-bearing host intact.
+	{"ssh url with port", "ssh://git@github.com:2222/o/r", "github.com:2222", "o", "r", true},
+	// ssh:// userinfo is stripped on the last "@" of the authority, so a
+	// "user:pass@" prefix no longer leaks into the host (and the bare host
+	// then passes the GitHub gate); a port after the host is unaffected.
+	{"ssh url user:pass", "ssh://user:pass@github.com/o/r", "github.com", "o", "r", true},
+	{"ssh url user:pass with port", "ssh://user:pass@github.com:2222/o/r", "github.com:2222", "o", "r", true},
+	{"non-GitHub https no .git", "https://gitlab.com/o/r", "", "", "", false},
+}
+
 func TestParseOwnerRepo(t *testing.T) {
-	tests := []struct {
-		name     string
-		cloneURL string
-		host     string
-		owner    string
-		repo     string
-		ok       bool
-	}{
-		{"https", "https://github.com/acme/widgets", "github.com", "acme", "widgets", true},
-		{"https .git", "https://github.com/acme/widgets.git", "github.com", "acme", "widgets", true},
-		{"https trailing slash", "https://github.com/acme/widgets/", "github.com", "acme", "widgets", true},
-		{"scp-like ssh", "git@github.com:acme/widgets.git", "github.com", "acme", "widgets", true},
-		{"scp-like ssh no .git", "git@github.com:acme/widgets", "github.com", "acme", "widgets", true},
-		{"ssh url", "ssh://git@github.com/acme/widgets", "github.com", "acme", "widgets", true},
-		{"ssh url .git", "ssh://git@github.com/acme/widgets.git", "github.com", "acme", "widgets", true},
-		{"enterprise https", "https://github.example.com/acme/widgets.git", "github.example.com", "acme", "widgets", true},
-		{"enterprise scp-like", "git@github.example.com:acme/widgets.git", "github.example.com", "acme", "widgets", true},
-		{"enterprise ghe.com", "https://acme.ghe.com/acme/widgets", "acme.ghe.com", "acme", "widgets", true},
-		{"non-GitHub", "https://gitlab.com/acme/widgets.git", "", "", "", false},
-		{"non-GitHub scp-like", "git@bitbucket.org:acme/widgets.git", "", "", "", false},
-		{"extra path segment", "https://github.com/acme/widgets/tree/main", "", "", "", false},
-		{"missing repo", "https://github.com/acme", "", "", "", false},
-		{"garbage", "not a url at all", "", "", "", false},
-		{"empty", "", "", "", "", false},
-		{"local path", "/srv/git/widgets.git", "", "", "", false},
-	}
-	for _, tt := range tests {
+	for _, tt := range parseOwnerRepoCases {
 		t.Run(tt.name, func(t *testing.T) {
 			host, owner, repo, ok := ParseOwnerRepo(tt.cloneURL)
 			if host != tt.host || owner != tt.owner || repo != tt.repo || ok != tt.ok {
 				t.Fatalf("ParseOwnerRepo(%q) = (%q, %q, %q, %v), want (%q, %q, %q, %v)",
 					tt.cloneURL, host, owner, repo, ok, tt.host, tt.owner, tt.repo, tt.ok)
+			}
+		})
+	}
+}
+
+func TestParseAnyOwnerRepo(t *testing.T) {
+	tests := []ownerRepoCase{
+		// SSH config alias in scp-like form: the host is the alias verbatim,
+		// and owner/repo case is preserved.
+		{"scp-like alias", "git@hl_external:hiddenlayerai/hiddenlayer-nemo-guardrails.git",
+			"hl_external", "hiddenlayerai", "hiddenlayer-nemo-guardrails", true},
+		{"ssh url alias", "ssh://git@alias/o/r", "alias", "o", "r", true},
+		{"scp-like alias no user", "alias:o/r", "alias", "o", "r", true},
+		{"non-GitHub https", "https://gitlab.com/o/r.git", "gitlab.com", "o", "r", true},
+		{"https userinfo", "https://user@github.com/o/r", "github.com", "o", "r", true},
+		{"https user:pass", "https://user:pass@gitlab.com/o/r", "gitlab.com", "o", "r", true},
+		{"mixed case preserved", "git@GitHub.com:Acme/Widgets.git", "GitHub.com", "Acme", "Widgets", true},
+		// Lenient: ssh:// port handling is untouched, so the port stays
+		// glued to the host. ParseOwnerRepo rejects this same input.
+		{"ssh url with port", "ssh://git@github.com:2222/o/r", "github.com:2222", "o", "r", true},
+		// ssh:// userinfo with a password is stripped like https userinfo.
+		{"ssh url user:pass", "ssh://user:pass@gitlab.com/o/r", "gitlab.com", "o", "r", true},
+		{"ssh url user:pass with port", "ssh://user:pass@gitlab.com:2222/o/r", "gitlab.com:2222", "o", "r", true},
+		// Pinned current behavior for file:// URLs: there is no file scheme
+		// branch, so looksSCPLike claims it (colon before the first slash),
+		// the scheme becomes the "host", and the leading slashes are trimmed
+		// off the path. Nonsense, but acceptable for the lenient parser;
+		// this row exists so any change to it is deliberate.
+		{"file url", "file:///srv/repo.git", "file", "srv", "repo", true},
+		{"local path", "/srv/git/x.git", "", "", "", false},
+		{"relative path", "./x", "", "", "", false},
+		{"bare owner/repo", "owner/repo", "", "", "", false},
+		{"empty", "", "", "", "", false},
+		{"garbage", "not a url at all", "", "", "", false},
+		{"missing repo", "git@alias:owner", "", "", "", false},
+		{"extra path segment", "https://gitlab.com/o/r/tree/main", "", "", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			host, owner, repo, ok := ParseAnyOwnerRepo(tt.cloneURL)
+			if host != tt.host || owner != tt.owner || repo != tt.repo || ok != tt.ok {
+				t.Fatalf("ParseAnyOwnerRepo(%q) = (%q, %q, %q, %v), want (%q, %q, %q, %v)",
+					tt.cloneURL, host, owner, repo, ok, tt.host, tt.owner, tt.repo, tt.ok)
+			}
+		})
+	}
+}
+
+// TestParseOwnerRepoMatchesGatedAny guards the refactor: ParseOwnerRepo must
+// equal ParseAnyOwnerRepo filtered through isGitHubHost for every input in
+// the gated table, so the two can never drift apart in parsing.
+func TestParseOwnerRepoMatchesGatedAny(t *testing.T) {
+	for _, tt := range parseOwnerRepoCases {
+		t.Run(tt.name, func(t *testing.T) {
+			gotHost, gotOwner, gotRepo, gotOK := ParseOwnerRepo(tt.cloneURL)
+			wantHost, wantOwner, wantRepo, wantOK := ParseAnyOwnerRepo(tt.cloneURL)
+			if !wantOK || !isGitHubHost(wantHost) {
+				wantHost, wantOwner, wantRepo, wantOK = "", "", "", false
+			}
+			if gotHost != wantHost || gotOwner != wantOwner || gotRepo != wantRepo || gotOK != wantOK {
+				t.Fatalf("ParseOwnerRepo(%q) = (%q, %q, %q, %v); gated ParseAnyOwnerRepo = (%q, %q, %q, %v)",
+					tt.cloneURL, gotHost, gotOwner, gotRepo, gotOK, wantHost, wantOwner, wantRepo, wantOK)
 			}
 		})
 	}

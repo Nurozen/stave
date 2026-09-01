@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -268,6 +269,9 @@ func TestCLIReposAddDryRunAndDuplicate(t *testing.T) {
 	dryRun := runCLI(t, "repos", "add", "dry", src, "--dry-run")
 	if !strings.Contains(dryRun, "dry-run: create") || !strings.Contains(dryRun, "registered dry") {
 		t.Fatalf("repos add dry-run output = %s", dryRun)
+	}
+	if strings.Contains(dryRun, "could not discover") {
+		t.Fatalf("dry-run emitted a false discovery failure:\n%s", dryRun)
 	}
 	if list := runCLI(t, "repos", "list"); strings.Contains(list, "dry\t") {
 		t.Fatalf("dry-run repo was persisted:\n%s", list)
@@ -1999,4 +2003,719 @@ func TestFromBuildInfo(t *testing.T) {
 			t.Fatalf("fromBuildInfo(nil) = %q, %q, %q; want empties", v, c, d)
 		}
 	})
+}
+
+func bareOriginHead(t *testing.T, bare string) string {
+	t.Helper()
+	cmd := exec.Command("git", "--git-dir", bare, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("origin/HEAD unresolved in %s: %v\n%s", bare, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func TestCLIReposAddSetsOriginHead(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	src := createGitRepo(t, "repo-a")
+	runCLI(t, "setup")
+	runCLI(t, "repos", "add", "repo-a", src)
+
+	bare := filepath.Join(home, "stave", "bare-repos", "repo-a.git")
+	if head := bareOriginHead(t, bare); head != "origin/main" {
+		t.Fatalf("origin/HEAD = %q, want origin/main", head)
+	}
+	cfg, _, err := config.Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Repos["repo-a"].DefaultBranch != "main" {
+		t.Fatalf("defaultBranch = %q, want main", cfg.Repos["repo-a"].DefaultBranch)
+	}
+}
+
+func TestCLIReposAddTrunkDefaultBranch(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	src := filepath.Join(t.TempDir(), "trunky")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, "", "init", "-b", "trunk", src)
+	runGit(t, src, "config", "user.name", "Test User")
+	runGit(t, src, "config", "user.email", "test@example.test")
+	if err := os.WriteFile(filepath.Join(src, "README.md"), []byte("# trunky\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, src, "add", "README.md")
+	runGit(t, src, "commit", "-m", "initial")
+
+	runCLI(t, "setup")
+	out := runCLI(t, "repos", "add", "trunky", src)
+	if strings.Contains(out, "could not discover") {
+		t.Fatalf("unexpected discovery note:\n%s", out)
+	}
+	bare := filepath.Join(home, "stave", "bare-repos", "trunky.git")
+	if head := bareOriginHead(t, bare); head != "origin/trunk" {
+		t.Fatalf("origin/HEAD = %q, want origin/trunk", head)
+	}
+	cfg, _, err := config.Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Repos["trunky"].DefaultBranch != "trunk" {
+		t.Fatalf("defaultBranch = %q, want trunk", cfg.Repos["trunky"].DefaultBranch)
+	}
+}
+
+func TestCLIReposSyncBackfillsDefaultBranch(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	src := createGitRepo(t, "repo-a")
+	runCLI(t, "setup")
+	runCLI(t, "repos", "add", "repo-a", src)
+
+	cfg, path, err := config.Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := cfg.Repos["repo-a"]
+	repo.DefaultBranch = ""
+	cfg.Repos["repo-a"] = repo
+	if err := cfg.Save(path); err != nil {
+		t.Fatal(err)
+	}
+
+	out := runCLI(t, "repos", "sync")
+	if !strings.Contains(out, "synced repo-a") || !strings.Contains(out, `recorded default branch "main" for "repo-a"`) {
+		t.Fatalf("first sync output = %s", out)
+	}
+	cfg, path, err = config.Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Repos["repo-a"].DefaultBranch != "main" {
+		t.Fatalf("defaultBranch after backfill = %q", cfg.Repos["repo-a"].DefaultBranch)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Second sync is a no-op: no note, no write.
+	out = runCLI(t, "repos", "sync")
+	if !strings.Contains(out, "synced repo-a") || strings.Contains(out, "recorded default branch") {
+		t.Fatalf("second sync output = %s", out)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("config rewritten by no-op sync:\n--- before\n%s\n--- after\n%s", before, after)
+	}
+}
+
+func TestCLIReposSyncBackfillSaveFailureEmitsNoRecordedNote(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("directory permission bits are not enforced on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permission bits")
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	src := createGitRepo(t, "repo-a")
+	runCLI(t, "setup")
+	runCLI(t, "repos", "add", "repo-a", src)
+
+	cfg, path, err := config.Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := cfg.Repos["repo-a"]
+	repo.DefaultBranch = ""
+	cfg.Repos["repo-a"] = repo
+	if err := cfg.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	// The registry is written atomically via a sibling temp file, so a
+	// read-only config directory makes the save (and only the save) fail.
+	dir := filepath.Dir(path)
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+
+	out, err := runCLIError(t, nil, "repos", "sync")
+	if err == nil {
+		t.Fatalf("expected save failure, got success:\n%s", out)
+	}
+	if !strings.Contains(out, "synced repo-a") {
+		t.Fatalf("sync itself should have run:\n%s", out)
+	}
+	if strings.Contains(out, "recorded default branch") {
+		t.Fatalf("must not claim the default branch was recorded when the save failed:\n%s", out)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, err = config.Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Repos["repo-a"].DefaultBranch != "" {
+		t.Fatalf("defaultBranch = %q, want still empty after failed save", cfg.Repos["repo-a"].DefaultBranch)
+	}
+}
+
+func TestCLIReposSyncDriftNote(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	src := createGitRepo(t, "repo-a")
+	runCLI(t, "setup")
+	runCLI(t, "repos", "add", "repo-a", src)
+
+	cfg, path, err := config.Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := cfg.Repos["repo-a"]
+	repo.DefaultBranch = "nope"
+	cfg.Repos["repo-a"] = repo
+	if err := cfg.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out := runCLI(t, "repos", "sync", "repo-a")
+	if !strings.Contains(out, "synced repo-a") || !strings.Contains(out, "is now") || !strings.Contains(out, `registry has "nope"`) {
+		t.Fatalf("drift sync output = %s", out)
+	}
+	if strings.Contains(out, "recorded default branch") {
+		t.Fatalf("drift must not auto-update:\n%s", out)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("config rewritten on drift:\n--- before\n%s\n--- after\n%s", before, after)
+	}
+	cfg, _, err = config.Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Repos["repo-a"].DefaultBranch != "nope" {
+		t.Fatalf("defaultBranch = %q, want nope (unchanged)", cfg.Repos["repo-a"].DefaultBranch)
+	}
+}
+
+func setupRemoveFixture(t *testing.T) (home, bare, cfgPath, src string) {
+	t.Helper()
+	home = t.TempDir()
+	t.Setenv("HOME", home)
+	src = createGitRepo(t, "repo-a")
+	runCLI(t, "setup")
+	runCLI(t, "repos", "add", "repo-a", src)
+	bare = filepath.Join(home, "stave", "bare-repos", "repo-a.git")
+	if _, err := os.Stat(filepath.Join(bare, "HEAD")); err != nil {
+		t.Fatalf("bare repo cache missing after add: %v", err)
+	}
+	cfgPath = filepath.Join(home, ".config", "stave", "config.yaml")
+	return home, bare, cfgPath, src
+}
+
+func repoRegistered(t *testing.T, cfgPath, name string) bool {
+	t.Helper()
+	cfg, _, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	_, ok := cfg.Repos[name]
+	return ok
+}
+
+func TestCLIReposRemoveNotesKeptCache(t *testing.T) {
+	_, bare, cfgPath, src := setupRemoveFixture(t)
+	stdout, stderr, err := runCLISplit(t, "repos", "remove", "repo-a")
+	if err != nil {
+		t.Fatalf("remove error = %v\n%s%s", err, stdout, stderr)
+	}
+	if stdout != "unregistered repo-a\n" {
+		t.Fatalf("stdout = %q, want exactly %q", stdout, "unregistered repo-a\n")
+	}
+	for _, want := range []string{"note: kept bare repo cache at " + bare, "--adopt", "<new-name>", src} {
+		if !strings.Contains(stderr, want) {
+			t.Fatalf("stderr missing %q:\n%s", want, stderr)
+		}
+	}
+	if strings.Contains(stderr, "still use it") {
+		t.Fatalf("unexpected reference warning:\n%s", stderr)
+	}
+	if repoRegistered(t, cfgPath, "repo-a") {
+		t.Fatal("repo-a still registered after remove")
+	}
+	if _, err := os.Stat(filepath.Join(bare, "HEAD")); err != nil {
+		t.Fatalf("cache should be kept: %v", err)
+	}
+}
+
+func TestCLIReposRemoveWarnsWhenReferenced(t *testing.T) {
+	_, bare, _, _ := setupRemoveFixture(t)
+	runCLI(t, "space", "create", "s1", "-e", "repo-a")
+	out := runCLI(t, "repos", "remove", "repo-a")
+	if !strings.HasPrefix(out, "unregistered repo-a\n") {
+		t.Fatalf("output should start with unregistered line:\n%s", out)
+	}
+	if !strings.Contains(out, "still use it (s1)") || !strings.Contains(out, "do not move or delete it") {
+		t.Fatalf("expected reference warning:\n%s", out)
+	}
+	if strings.Contains(out, "--adopt") {
+		t.Fatalf("re-register hint should be suppressed when referenced:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(bare, "HEAD")); err != nil {
+		t.Fatalf("cache should be kept: %v", err)
+	}
+}
+
+func TestCLIReposRemovePurgeDeletesCache(t *testing.T) {
+	_, bare, cfgPath, _ := setupRemoveFixture(t)
+	out := runCLI(t, "repos", "remove", "repo-a", "--purge")
+	if !strings.HasPrefix(out, "unregistered repo-a\n") || !strings.Contains(out, "deleted bare repo cache at "+bare) {
+		t.Fatalf("purge output = %s", out)
+	}
+	if _, err := os.Stat(bare); !os.IsNotExist(err) {
+		t.Fatalf("cache should be deleted, stat err = %v", err)
+	}
+	if repoRegistered(t, cfgPath, "repo-a") {
+		t.Fatal("repo-a still registered after purge")
+	}
+}
+
+func TestCLIReposRemovePurgeRefusedBySpace(t *testing.T) {
+	_, bare, cfgPath, _ := setupRemoveFixture(t)
+	runCLI(t, "space", "create", "s1", "-e", "repo-a")
+	_, err := runCLIError(t, nil, "repos", "remove", "repo-a", "--purge")
+	if err == nil || !strings.Contains(err.Error(), "refusing to purge") || !strings.Contains(err.Error(), "s1") {
+		t.Fatalf("expected refusal naming s1, err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(bare, "HEAD")); err != nil {
+		t.Fatalf("cache should be intact after refusal: %v", err)
+	}
+	if !repoRegistered(t, cfgPath, "repo-a") {
+		t.Fatal("repo-a should still be registered after refusal")
+	}
+	runCLI(t, "space", "destroy", "s1", "--force")
+	out := runCLI(t, "repos", "remove", "repo-a", "--purge")
+	if !strings.Contains(out, "deleted bare repo cache at "+bare) {
+		t.Fatalf("purge after destroy output = %s", out)
+	}
+	if _, err := os.Stat(bare); !os.IsNotExist(err) {
+		t.Fatalf("cache should be deleted, stat err = %v", err)
+	}
+}
+
+// TestCLIReposRemovePurgeRefusedByReviewSpace pins the guard against a
+// review-created space, whose manifest records the repo as an edit worktree.
+func TestCLIReposRemovePurgeRefusedByReviewSpace(t *testing.T) {
+	home, _, _ := reviewTestFixture(t)
+	reviewTestCreateSpace(t, nil, "review", "repo-a#7")
+	bare := filepath.Join(home, "stave", "bare-repos", "repo-a.git")
+	cfgPath := filepath.Join(home, ".config", "stave", "config.yaml")
+
+	_, err := runCLIError(t, nil, "repos", "remove", "repo-a", "--purge")
+	if err == nil || !strings.Contains(err.Error(), "refusing to purge") || !strings.Contains(err.Error(), "review-repo-a-7") {
+		t.Fatalf("expected refusal naming review-repo-a-7, err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(bare, "HEAD")); err != nil {
+		t.Fatalf("cache should be intact after refusal: %v", err)
+	}
+	if !repoRegistered(t, cfgPath, "repo-a") {
+		t.Fatal("repo-a should still be registered after refusal")
+	}
+}
+
+func TestCLIReposRemovePurgeFailsClosedOnCorruptManifest(t *testing.T) {
+	home, bare, cfgPath, _ := setupRemoveFixture(t)
+	corrupt := filepath.Join(home, "stave", "agent-work", "broken-space")
+	if err := os.MkdirAll(corrupt, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(corrupt, space.ManifestName), []byte("repos: [unterminated"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := runCLIError(t, nil, "repos", "remove", "repo-a", "--purge")
+	if err == nil || !strings.Contains(err.Error(), "refusing to purge") || !strings.Contains(err.Error(), "broken-space") {
+		t.Fatalf("expected fail-closed error naming broken-space, err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(bare, "HEAD")); err != nil {
+		t.Fatalf("cache should be intact: %v", err)
+	}
+	if !repoRegistered(t, cfgPath, "repo-a") {
+		t.Fatal("repo-a should still be registered")
+	}
+	// Without --purge the removal proceeds but the note explains the scan failure.
+	out := runCLI(t, "repos", "remove", "repo-a")
+	if !strings.HasPrefix(out, "unregistered repo-a\n") || !strings.Contains(out, "could not scan spaces") {
+		t.Fatalf("remove output = %s", out)
+	}
+}
+
+func TestCLIReposRemovePurgeMissingWorkDir(t *testing.T) {
+	home, bare, cfgPath, _ := setupRemoveFixture(t)
+	if err := os.RemoveAll(filepath.Join(home, "stave", "agent-work")); err != nil {
+		t.Fatal(err)
+	}
+	out := runCLI(t, "repos", "remove", "repo-a", "--purge")
+	if !strings.Contains(out, "deleted bare repo cache at "+bare) {
+		t.Fatalf("purge output = %s", out)
+	}
+	if _, err := os.Stat(bare); !os.IsNotExist(err) {
+		t.Fatalf("cache should be deleted, stat err = %v", err)
+	}
+	if repoRegistered(t, cfgPath, "repo-a") {
+		t.Fatal("repo-a still registered after purge")
+	}
+}
+
+func TestCLIReposRemoveDryRun(t *testing.T) {
+	_, bare, cfgPath, _ := setupRemoveFixture(t)
+	for _, args := range [][]string{
+		{"repos", "remove", "repo-a", "--dry-run"},
+		{"repos", "remove", "repo-a", "--purge", "--dry-run"},
+	} {
+		out := runCLI(t, args...)
+		if !strings.Contains(out, "dry-run: unregister repo-a") || !strings.Contains(out, "would") || !strings.Contains(out, bare) {
+			t.Fatalf("%v output = %s", args, out)
+		}
+		if strings.Contains(out, "unregistered repo-a") {
+			t.Fatalf("%v dry-run printed the real completion line:\n%s", args, out)
+		}
+		if !repoRegistered(t, cfgPath, "repo-a") {
+			t.Fatalf("%v unregistered the repo", args)
+		}
+		if _, err := os.Stat(filepath.Join(bare, "HEAD")); err != nil {
+			t.Fatalf("%v touched the cache: %v", args, err)
+		}
+	}
+	keep := runCLI(t, "repos", "remove", "repo-a", "--dry-run")
+	if !strings.Contains(keep, "would keep bare repo cache") || strings.Contains(keep, "remove directory") {
+		t.Fatalf("keep dry-run output = %s", keep)
+	}
+	purge := runCLI(t, "repos", "remove", "repo-a", "--purge", "--dry-run")
+	if !strings.Contains(purge, "would delete bare repo cache") || !strings.Contains(purge, "dry-run: remove directory "+bare) {
+		t.Fatalf("purge dry-run output = %s", purge)
+	}
+}
+
+func TestCLIReposRemovePurgeDeleteFailureKeepsRegistration(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("directory permission bits are not enforced on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permission bits")
+	}
+	_, bare, cfgPath, _ := setupRemoveFixture(t)
+	// Strip write permission from every directory in the cache so RemoveAll
+	// cannot unlink anything inside it.
+	chmodDirs := func(mode os.FileMode) {
+		t.Helper()
+		if err := filepath.WalkDir(bare, func(p string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() {
+				return os.Chmod(p, mode)
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("chmod cache dirs: %v", err)
+		}
+	}
+	chmodDirs(0o500)
+	t.Cleanup(func() {
+		// Best-effort: the cache is gone once the retry purge succeeds.
+		_ = filepath.WalkDir(bare, func(p string, d os.DirEntry, err error) error {
+			if err == nil && d.IsDir() {
+				_ = os.Chmod(p, 0o755)
+			}
+			return nil
+		})
+	})
+
+	_, err := runCLIError(t, nil, "repos", "remove", "repo-a", "--purge")
+	if err == nil || !strings.Contains(err.Error(), "delete bare repo cache at "+bare) || !strings.Contains(err.Error(), "still registered") {
+		t.Fatalf("expected delete failure that keeps registration, err = %v", err)
+	}
+	if !repoRegistered(t, cfgPath, "repo-a") {
+		t.Fatal("repo-a should still be registered after a failed purge")
+	}
+	if _, err := os.Stat(filepath.Join(bare, "HEAD")); err != nil {
+		t.Fatalf("cache HEAD should survive a failed purge: %v", err)
+	}
+
+	chmodDirs(0o755)
+	out := runCLI(t, "repos", "remove", "repo-a", "--purge")
+	if !strings.Contains(out, "deleted bare repo cache at "+bare) {
+		t.Fatalf("retry purge output = %s", out)
+	}
+	if _, err := os.Stat(bare); !os.IsNotExist(err) {
+		t.Fatalf("cache should be deleted on retry, stat err = %v", err)
+	}
+	if repoRegistered(t, cfgPath, "repo-a") {
+		t.Fatal("repo-a still registered after retry")
+	}
+}
+
+func TestCLIReposRemovePurgeRefusesNonBarePath(t *testing.T) {
+	_, bare, cfgPath, _ := setupRemoveFixture(t)
+	plain := filepath.Join(t.TempDir(), "precious")
+	if err := os.MkdirAll(plain, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	keep := filepath.Join(plain, "keep.txt")
+	if err := os.WriteFile(keep, []byte("do not delete"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Config surgery: point the registration at a directory that is not a
+	// bare repo, as a mis-edited config might.
+	cfg, _, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := cfg.Repos["repo-a"]
+	repo.BareRepoPath = plain
+	cfg.Repos["repo-a"] = repo
+	if err := cfg.Save(cfgPath); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, args := range [][]string{
+		{"repos", "remove", "repo-a", "--purge"},
+		{"repos", "remove", "repo-a", "--purge", "--dry-run"},
+	} {
+		_, err := runCLIError(t, nil, args...)
+		if err == nil || !strings.Contains(err.Error(), "refusing to purge: "+plain+" is not a bare git repository (git --git-dir "+plain+" rev-parse --is-bare-repository failed") || !strings.Contains(err.Error(), "delete it manually") {
+			t.Fatalf("%v err = %v, want not-bare refusal naming the git error", args, err)
+		}
+		if data, err := os.ReadFile(keep); err != nil || string(data) != "do not delete" {
+			t.Fatalf("%v touched the directory: data=%q err=%v", args, data, err)
+		}
+		if !repoRegistered(t, cfgPath, "repo-a") {
+			t.Fatalf("%v unregistered the repo", args)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(bare, "HEAD")); err != nil {
+		t.Fatalf("real cache should be untouched: %v", err)
+	}
+}
+
+// TestCLIReposRemovePurgeRefusesForeignBareRepo pins that --purge deletes
+// only a cache whose origin names the registered repository: a registration
+// re-pointed at somebody else's bare repo must not take it down.
+func TestCLIReposRemovePurgeRefusesForeignBareRepo(t *testing.T) {
+	_, bare, cfgPath, src := setupRemoveFixture(t)
+	srcB := createGitRepo(t, "repo-b")
+	foreign := filepath.Join(t.TempDir(), "b.git")
+	runGit(t, "", "clone", "--bare", srcB, foreign)
+
+	pointAt := func(path string) {
+		t.Helper()
+		cfg, _, err := config.Load(cfgPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		repo := cfg.Repos["repo-a"]
+		repo.BareRepoPath = path
+		cfg.Repos["repo-a"] = repo
+		if err := cfg.Save(cfgPath); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pointAt(foreign)
+
+	want := "refusing to purge: " + foreign + " is a bare repo for " + srcB + ", not " + src + "; fix the registration or delete it manually"
+	for _, args := range [][]string{
+		{"repos", "remove", "repo-a", "--purge"},
+		{"repos", "remove", "repo-a", "--purge", "--dry-run"},
+	} {
+		_, err := runCLIError(t, nil, args...)
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("%v err = %v, want %q", args, err, want)
+		}
+		if _, err := os.Stat(filepath.Join(foreign, "HEAD")); err != nil {
+			t.Fatalf("%v deleted the foreign bare repo: %v", args, err)
+		}
+		if !repoRegistered(t, cfgPath, "repo-a") {
+			t.Fatalf("%v unregistered the repo", args)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(bare, "HEAD")); err != nil {
+		t.Fatalf("real cache should be untouched: %v", err)
+	}
+
+	// A cache with no origin at all cannot prove its identity either.
+	pointAt(bare)
+	runGit(t, "", "--git-dir", bare, "remote", "remove", "origin")
+	_, err := runCLIError(t, nil, "repos", "remove", "repo-a", "--purge")
+	if err == nil || !strings.Contains(err.Error(), "refusing to purge: could not read origin remote of "+bare) {
+		t.Fatalf("missing origin: err = %v, want refusal", err)
+	}
+	if _, err := os.Stat(filepath.Join(bare, "HEAD")); err != nil {
+		t.Fatalf("cache without origin was deleted: %v", err)
+	}
+	if !repoRegistered(t, cfgPath, "repo-a") {
+		t.Fatal("repo-a was unregistered despite refused purge")
+	}
+
+	// With the registration pointing at its own cache again, purge proceeds.
+	runGit(t, "", "--git-dir", bare, "remote", "add", "origin", src)
+	out := runCLI(t, "repos", "remove", "repo-a", "--purge")
+	if !strings.Contains(out, "deleted bare repo cache at "+bare) {
+		t.Fatalf("purge output = %s", out)
+	}
+	if _, err := os.Stat(bare); !os.IsNotExist(err) {
+		t.Fatalf("cache should be deleted, stat err = %v", err)
+	}
+	if repoRegistered(t, cfgPath, "repo-a") {
+		t.Fatal("repo-a still registered after purge")
+	}
+	if _, err := os.Stat(filepath.Join(foreign, "HEAD")); err != nil {
+		t.Fatalf("foreign bare repo should survive the real purge: %v", err)
+	}
+}
+
+// TestCLIReposRemovePurgeAcceptsEquivalentOriginSpelling pins that the
+// identity check tolerates the same repository spelled differently (here a
+// file:// URL for a local path), so a legitimately adopted cache still purges.
+func TestCLIReposRemovePurgeAcceptsEquivalentOriginSpelling(t *testing.T) {
+	_, bare, cfgPath, src := setupRemoveFixture(t)
+	runGit(t, "", "--git-dir", bare, "remote", "set-url", "origin", "file://"+src)
+	out := runCLI(t, "repos", "remove", "repo-a", "--purge")
+	if !strings.Contains(out, "deleted bare repo cache at "+bare) {
+		t.Fatalf("purge output = %s", out)
+	}
+	if _, err := os.Stat(bare); !os.IsNotExist(err) {
+		t.Fatalf("cache should be deleted, stat err = %v", err)
+	}
+	if repoRegistered(t, cfgPath, "repo-a") {
+		t.Fatal("repo-a still registered after purge")
+	}
+}
+
+func TestCLIReposRemoveDryRunReportsReferences(t *testing.T) {
+	_, bare, cfgPath, _ := setupRemoveFixture(t)
+	runCLI(t, "space", "create", "s1", "-e", "repo-a")
+
+	stdout, stderr, err := runCLISplit(t, "repos", "remove", "repo-a", "--dry-run")
+	if err != nil {
+		t.Fatalf("dry-run error = %v\n%s%s", err, stdout, stderr)
+	}
+	if stdout != "dry-run: unregister repo-a\n" {
+		t.Fatalf("stdout = %q", stdout)
+	}
+	if !strings.Contains(stderr, "note: would keep bare repo cache at "+bare+"; 1 space(s) still use it (s1)") || !strings.Contains(stderr, "do not move or delete it") {
+		t.Fatalf("dry-run should show the same reference warning as the real run:\n%s", stderr)
+	}
+	if strings.Contains(stderr, "--adopt") {
+		t.Fatalf("re-register hint should be suppressed when referenced:\n%s", stderr)
+	}
+
+	_, err = runCLIError(t, nil, "repos", "remove", "repo-a", "--purge", "--dry-run")
+	if err == nil || !strings.Contains(err.Error(), "refusing to purge") || !strings.Contains(err.Error(), "s1") {
+		t.Fatalf("purge dry-run should refuse like the real run, err = %v", err)
+	}
+	if !repoRegistered(t, cfgPath, "repo-a") {
+		t.Fatal("dry-run unregistered the repo")
+	}
+	if _, err := os.Stat(filepath.Join(bare, "HEAD")); err != nil {
+		t.Fatalf("dry-run touched the cache: %v", err)
+	}
+}
+
+func TestCLIReposRemoveRecipeIsShellQuoted(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "my home")
+	if err := os.MkdirAll(home, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	src := createGitRepo(t, "repo-a")
+	runCLI(t, "setup")
+	runCLI(t, "repos", "add", "repo-a", src)
+	bareDir := filepath.Join(home, "stave", "bare-repos")
+	bare := filepath.Join(bareDir, "repo-a.git")
+
+	for _, args := range [][]string{
+		{"repos", "remove", "repo-a", "--dry-run"},
+		{"repos", "remove", "repo-a"},
+	} {
+		_, stderr, err := runCLISplit(t, args...)
+		if err != nil {
+			t.Fatalf("%v error = %v\n%s", args, err, stderr)
+		}
+		want := "mv '" + bare + "' '" + bareDir + "'/<new-name>.git && stave repos add <new-name> " + shellQuote(src) + " --adopt"
+		if !strings.Contains(stderr, want) {
+			t.Fatalf("%v recipe not shell-quoted; want %q in:\n%s", args, want, stderr)
+		}
+	}
+	if _, err := runCLIError(t, nil, "repos", "add", "repo-a", src); err == nil || !strings.Contains(err.Error(), "stave repos add repo-a "+shellQuote(src)+" --adopt") {
+		t.Fatalf("collision hint err = %v", err)
+	}
+}
+
+// TestCLICredentialedURLNeverEchoed registers a URL carrying a token and
+// checks that no output or error of the commands that display or embed the
+// registered URL leaks it.
+func TestCLICredentialedURLNeverEchoed(t *testing.T) {
+	const secret = "tok3n"
+	credURL := "https://user:" + secret + "@ghe.example.com/acme/x.git"
+
+	home, _, _, _ := setupRemoveFixture(t)
+	setRegisteredURL(t, "repo-a", credURL)
+
+	stdout, stderr, err := runCLISplit(t, "repos", "remove", "repo-a")
+	if err != nil {
+		t.Fatalf("remove error = %v\n%s%s", err, stdout, stderr)
+	}
+	if strings.Contains(stdout+stderr, secret) {
+		t.Fatalf("repos remove leaked the credential:\n%s%s", stdout, stderr)
+	}
+	if !strings.Contains(stderr, "stave repos add <new-name> <url> --adopt") {
+		t.Fatalf("remove recipe should use the <url> placeholder:\n%s", stderr)
+	}
+
+	// Near match: the PR names acme/x on github.com; the registration
+	// points at the same owner/repo under another host with a token.
+	src := createGitRepo(t, "x")
+	runCLI(t, "repos", "add", "x-alias", src)
+	setRegisteredURL(t, "x-alias", credURL)
+	out, err := runCLIError(t, nil, "review", "https://github.com/acme/x/pull/1")
+	assertErrContainsAll(t, err, `"x-alias"`, "https://***@ghe.example.com/acme/x.git", "--repo")
+	if strings.Contains(out+err.Error(), secret) {
+		t.Fatalf("near-match review error leaked the credential:\n%s\n%v", out, err)
+	}
+
+	// Multi near match renders every candidate URL.
+	runCLI(t, "repos", "add", "x-other", src)
+	setRegisteredURL(t, "x-other", "ssh://git:"+secret+"@ghe2.example.com/acme/x.git")
+	out, err = runCLIError(t, nil, "review", "https://github.com/acme/x/pull/1")
+	assertErrContainsAll(t, err, "x-alias", "x-other", "ssh://***@ghe2.example.com/acme/x.git", `host "ghe2.example.com"`)
+	if strings.Contains(out+err.Error(), secret) {
+		t.Fatalf("multi near-match review error leaked the credential:\n%s\n%v", out, err)
+	}
+
+	// Collision hint on repos add embeds the URL in a pasteable command.
+	if err := os.MkdirAll(filepath.Join(home, "stave", "bare-repos", "y.git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out, err = runCLIError(t, nil, "repos", "add", "y", "https://user:"+secret+"@github.com/acme/y.git")
+	assertErrContainsAll(t, err, "bare repo path already exists", "stave repos add y <url> --adopt")
+	if strings.Contains(out+err.Error(), secret) {
+		t.Fatalf("collision hint leaked the credential:\n%s\n%v", out, err)
+	}
 }

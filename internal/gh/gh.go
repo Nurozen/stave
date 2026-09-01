@@ -89,18 +89,52 @@ func (c *Client) run(ctx context.Context, args ...string) ([]byte, error) {
 // host+"/"+owner+"/"+repo as the gh --repo selector. Non-GitHub or
 // unparseable URLs return ok=false.
 func ParseOwnerRepo(cloneURL string) (host, owner, repo string, ok bool) {
+	host, owner, repo, ok = parseOwnerRepo(cloneURL)
+	if !ok || !isGitHubHost(host) {
+		return "", "", "", false
+	}
+	return host, owner, repo, true
+}
+
+// ParseAnyOwnerRepo is the lenient form of ParseOwnerRepo: it accepts the
+// same https, scp-like ssh, and ssh URL shapes but applies no GitHub host
+// gate. The host comes back verbatim, which for scp-like clones may be an SSH
+// config alias rather than a DNS name (git@myalias:owner/repo.git yields host
+// "myalias"). Callers must not assume the host is GitHub — or even a real
+// hostname — and should use ParseOwnerRepo when they need that guarantee.
+// Owner and repo case is preserved. Local paths, bare "owner/repo" strings,
+// and other unparseable forms return ok=false.
+func ParseAnyOwnerRepo(cloneURL string) (host, owner, repo string, ok bool) {
+	return parseOwnerRepo(cloneURL)
+}
+
+// parseOwnerRepo splits cloneURL into host/owner/repo without judging the
+// host. It is the shared body of ParseOwnerRepo and ParseAnyOwnerRepo.
+func parseOwnerRepo(cloneURL string) (host, owner, repo string, ok bool) {
 	s := strings.TrimSpace(cloneURL)
 	var path string
 	switch {
 	case strings.HasPrefix(s, "https://"), strings.HasPrefix(s, "http://"):
 		rest := strings.TrimPrefix(strings.TrimPrefix(s, "https://"), "http://")
 		host, path, _ = strings.Cut(rest, "/")
+		// Drop a userinfo prefix (user@ or user:pass@) so credentialed
+		// clone URLs like https://git@github.com/o/r resolve to the bare
+		// host. host is already the pre-slash portion, so the last "@" is
+		// the userinfo delimiter.
+		if at := strings.LastIndex(host, "@"); at >= 0 {
+			host = host[at+1:]
+		}
 	case strings.HasPrefix(s, "ssh://"):
 		rest := strings.TrimPrefix(s, "ssh://")
-		if user, hostPath, found := strings.Cut(rest, "@"); found && !strings.ContainsAny(user, "/:") {
-			rest = hostPath
-		}
 		host, path, _ = strings.Cut(rest, "/")
+		// Same userinfo rule as https: host is the authority (everything
+		// before the first "/"), so the last "@" in it delimits userinfo
+		// whether that is "git@" or "user:pass@". A port lives after the
+		// host ("github.com:2222"), never inside the userinfo, so it stays
+		// glued to the host.
+		if at := strings.LastIndex(host, "@"); at >= 0 {
+			host = host[at+1:]
+		}
 	case looksSCPLike(s):
 		userHost, scpPath, _ := strings.Cut(s, ":")
 		if _, h, found := strings.Cut(userHost, "@"); found {
@@ -110,9 +144,6 @@ func ParseOwnerRepo(cloneURL string) (host, owner, repo string, ok bool) {
 		}
 		path = scpPath
 	default:
-		return "", "", "", false
-	}
-	if !isGitHubHost(host) {
 		return "", "", "", false
 	}
 	path = strings.TrimSuffix(strings.TrimSuffix(strings.Trim(path, "/"), ".git"), "/")

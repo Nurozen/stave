@@ -84,9 +84,42 @@ func (c *Client) CloneBare(ctx context.Context, url, dest string) error {
 	return err
 }
 
+// StandardFetchRefspec is the remote.origin.fetch value every stave bare
+// mirror carries: a bare clone has no fetch refspec by default, and without
+// one 'fetch --all --prune' updates nothing under refs/remotes/origin/.
+const StandardFetchRefspec = "+refs/heads/*:refs/remotes/origin/*"
+
+// ConfigureBareRemoteTracking sets remote.origin.fetch to StandardFetchRefspec.
+// Like any single-value 'git config' write it fails (exit 5) when the key
+// already holds several values, so a multi-refspec remote is never silently
+// collapsed.
 func (c *Client) ConfigureBareRemoteTracking(ctx context.Context, bareRepo string) error {
-	_, err := c.run(ctx, "--git-dir", bareRepo, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
+	return c.SetRemoteFetchRefspec(ctx, bareRepo, StandardFetchRefspec)
+}
+
+// SetRemoteFetchRefspec replaces origin's single fetch refspec with refspec.
+func (c *Client) SetRemoteFetchRefspec(ctx context.Context, bareRepo, refspec string) error {
+	_, err := c.run(ctx, "--git-dir", bareRepo, "config", "remote.origin.fetch", refspec)
 	return err
+}
+
+// RemoteFetchRefspecs returns every remote.<remote>.fetch value configured in
+// the bare repo, in config order, or nil when none is set (git exit 1).
+func (c *Client) RemoteFetchRefspecs(ctx context.Context, bareRepo, remote string) ([]string, error) {
+	out, err := c.probeOutput(ctx, "--git-dir", bareRepo, "config", "--get-all", "remote."+remote+".fetch")
+	if err != nil {
+		if IsExitCode(err, 1) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var refspecs []string
+	for _, line := range strings.Split(out, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			refspecs = append(refspecs, line)
+		}
+	}
+	return refspecs, nil
 }
 
 func (c *Client) FetchAllPrune(ctx context.Context, bareRepo string) error {
@@ -175,12 +208,36 @@ func (c *Client) RefExists(ctx context.Context, bareRepo, fullRef string) (bool,
 	return false, err
 }
 
+// RevParse resolves ref (a full ref such as refs/heads/x or
+// refs/remotes/origin/pr/7, or any rev-parse spelling) to its commit SHA in
+// the bare repo. It is a read-only probe, so it runs under DryRun. A missing
+// ref surfaces as a GitError (exit 1 under --verify --quiet) rather than an
+// empty string.
+func (c *Client) RevParse(ctx context.Context, bareRepo, ref string) (string, error) {
+	out, err := c.probeOutput(ctx, "--git-dir", bareRepo, "rev-parse", "--verify", "--quiet", ref)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// RemoteDefaultBranch returns the default branch of origin: from the local
+// origin/HEAD symbolic ref when it is set (offline), otherwise by asking the
+// remote via RemoteDefaultBranchFromRemote.
 func (c *Client) RemoteDefaultBranch(ctx context.Context, bareRepo string) (string, error) {
 	out, err := c.probeOutput(ctx, "--git-dir", bareRepo, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
 	if err == nil && strings.TrimSpace(out) != "" {
 		return strings.TrimPrefix(strings.TrimSpace(out), "origin/"), nil
 	}
-	out, err = c.probeOutput(ctx, "--git-dir", bareRepo, "remote", "show", "origin")
+	return c.RemoteDefaultBranchFromRemote(ctx, bareRepo)
+}
+
+// RemoteDefaultBranchFromRemote asks origin for its HEAD branch over the
+// network (git remote show origin), never consulting the local origin/HEAD
+// symbolic ref. Callers use it when that ref may be stale, for example after
+// remote set-head failed.
+func (c *Client) RemoteDefaultBranchFromRemote(ctx context.Context, bareRepo string) (string, error) {
+	out, err := c.probeOutput(ctx, "--git-dir", bareRepo, "remote", "show", "origin")
 	if err != nil {
 		return "", err
 	}
@@ -191,6 +248,76 @@ func (c *Client) RemoteDefaultBranch(ctx context.Context, bareRepo string) (stri
 		}
 	}
 	return "", fmt.Errorf("could not determine remote default branch")
+}
+
+// IsBareRepo reports whether path is a bare git repository. A GitError (for
+// example exit 128 when path is not a repository at all) propagates unchanged
+// so callers can distinguish not-a-repo from not-bare.
+func (c *Client) IsBareRepo(ctx context.Context, path string) (bool, error) {
+	out, err := c.probeOutput(ctx, "--git-dir", path, "rev-parse", "--is-bare-repository")
+	if err != nil {
+		return false, err
+	}
+	switch strings.TrimSpace(out) {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	}
+	return false, fmt.Errorf("unexpected rev-parse --is-bare-repository output: %q", out)
+}
+
+// RemoteURL returns the effective URL of remote in the repository at path:
+// 'git remote get-url' expands url.<base>.insteadOf rewrites, so this is the
+// URL git would actually contact. Use RemoteConfigURL to read the value as
+// configured.
+func (c *Client) RemoteURL(ctx context.Context, path, remote string) (string, error) {
+	out, err := c.probeOutput(ctx, "--git-dir", path, "remote", "get-url", remote)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// RemoteConfigURL returns remote.<remote>.url exactly as written in the bare
+// repo's config, without insteadOf expansion. Callers that compare, persist,
+// or later restore a remote's URL want this raw spelling; RemoteURL would
+// hand them the rewritten alias instead. A missing remote is a GitError with
+// exit code 1.
+func (c *Client) RemoteConfigURL(ctx context.Context, bareRepo, remote string) (string, error) {
+	out, err := c.probeOutput(ctx, "--git-dir", bareRepo, "config", "--get", "remote."+remote+".url")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// SetRemoteHead points refs/remotes/origin/HEAD at origin's default branch so
+// the symbolic-ref fast path in RemoteDefaultBranch works offline afterward.
+// It requires a prior fetch: --auto asks the remote which branch HEAD names
+// and then links the already-fetched refs/remotes/origin/<branch>.
+func (c *Client) SetRemoteHead(ctx context.Context, bareRepo string) error {
+	_, err := c.run(ctx, "--git-dir", bareRepo, "remote", "set-head", "origin", "--auto")
+	return err
+}
+
+// SetRemoteURL rewrites origin's URL in the bare repo.
+func (c *Client) SetRemoteURL(ctx context.Context, bareRepo, url string) error {
+	_, err := c.run(ctx, "--git-dir", bareRepo, "remote", "set-url", "origin", url)
+	return err
+}
+
+// HeadCommit resolves the commit a worktree's HEAD points at — the actual
+// checkout, which a detached HEAD may have moved away from the branch ref
+// the bare repo records. It is a read-only probe (runs under DryRun) and
+// follows IsDirty's Dir-based idiom rather than --git-dir, because the
+// answer belongs to the worktree, not the shared repository.
+func (c *Client) HeadCommit(ctx context.Context, worktreePath string) (string, error) {
+	out, err := c.probeOutputIn(ctx, worktreePath, "rev-parse", "--verify", "--quiet", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
 }
 
 func (c *Client) IsDirty(ctx context.Context, worktreePath string) (bool, string, error) {
