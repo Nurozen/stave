@@ -1,6 +1,7 @@
 package space
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -431,5 +432,97 @@ func TestFindMemory(t *testing.T) {
 	got, idx, ok = single.FindMemory("")
 	if !ok || idx != 0 || got.ID != "one" {
 		t.Fatalf("sole attachment = %#v %d %v", got, idx, ok)
+	}
+}
+
+// TestManifestJSONKeys pins the JSON key names on the manifest types to the
+// same lowerCamel spellings as the yaml tags: machine consumers of
+// `space status --json` / `space list --json` see the manifest exactly as it
+// is spelled in .stave.yaml.
+func TestManifestJSONKeys(t *testing.T) {
+	stamp := time.Date(2026, 7, 14, 9, 30, 0, 0, time.UTC)
+	in := Manifest{
+		Version:   2,
+		ID:        "epic-1",
+		Kind:      KindSaga,
+		CreatedAt: stamp,
+		SpecPath:  "spec",
+		Repos: []RepoManifest{
+			{Name: "api", Mode: ModeEdit, Path: "api", Base: "origin/main", Branch: "epic-1-api", BareRepoPath: "/bare/api.git"},
+			{Name: "docs", Mode: ModeReference, Path: "references/docs", Ref: "origin/main", BareRepoPath: "/bare/docs.git"},
+		},
+		Memories: []MemoryManifest{{Name: "den", Provider: "marmot", ID: "epic-1", Owned: true}},
+		Saga: &SagaManifest{Members: []SagaMember{
+			{ID: "step-1", CreatedAt: stamp, PRs: []SagaPR{{Repo: "api", Number: 7}}},
+			{ID: "step-2", After: []string{"step-1"}},
+		}},
+	}
+	data, err := json.Marshal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var generic map[string]any
+	if err := json.Unmarshal(data, &generic); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"version", "id", "kind", "createdAt", "specPath", "repos", "memories", "saga"} {
+		if _, ok := generic[key]; !ok {
+			t.Fatalf("manifest JSON missing key %q: %s", key, data)
+		}
+	}
+	repos := generic["repos"].([]any)
+	edit := repos[0].(map[string]any)
+	for _, key := range []string{"name", "mode", "path", "base", "branch", "bareRepoPath"} {
+		if _, ok := edit[key]; !ok {
+			t.Fatalf("edit repo JSON missing key %q: %s", key, data)
+		}
+	}
+	if _, ok := edit["ref"]; ok {
+		t.Fatalf("edit repo JSON should omit empty ref: %s", data)
+	}
+	ref := repos[1].(map[string]any)
+	if _, ok := ref["ref"]; !ok {
+		t.Fatalf("reference repo JSON missing key ref: %s", data)
+	}
+	mem := generic["memories"].([]any)[0].(map[string]any)
+	for _, key := range []string{"name", "provider", "id", "owned"} {
+		if _, ok := mem[key]; !ok {
+			t.Fatalf("memory JSON missing key %q: %s", key, data)
+		}
+	}
+	members := generic["saga"].(map[string]any)["members"].([]any)
+	first := members[0].(map[string]any)
+	for _, key := range []string{"id", "createdAt", "prs"} {
+		if _, ok := first[key]; !ok {
+			t.Fatalf("saga member JSON missing key %q: %s", key, data)
+		}
+	}
+	pr := first["prs"].([]any)[0].(map[string]any)
+	if pr["repo"] != "api" || pr["number"] != float64(7) {
+		t.Fatalf("saga PR JSON = %v", pr)
+	}
+	second := members[1].(map[string]any)
+	if _, ok := second["after"]; !ok {
+		t.Fatalf("saga member JSON missing key after: %s", data)
+	}
+	if _, ok := second["createdAt"]; ok {
+		t.Fatalf("saga member JSON should omit zero createdAt: %s", data)
+	}
+
+	var out Manifest
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.ID != in.ID || out.Kind != in.Kind || !out.CreatedAt.Equal(in.CreatedAt) || out.SpecPath != in.SpecPath || out.Version != in.Version {
+		t.Fatalf("manifest JSON round trip = %#v", out)
+	}
+	if len(out.Repos) != 2 || out.Repos[0] != in.Repos[0] || out.Repos[1] != in.Repos[1] {
+		t.Fatalf("repos JSON round trip = %#v", out.Repos)
+	}
+	if len(out.Memories) != 1 || out.Memories[0] != in.Memories[0] {
+		t.Fatalf("memories JSON round trip = %#v", out.Memories)
+	}
+	if out.Saga == nil || len(out.Saga.Members) != 2 || out.Saga.Members[1].After[0] != "step-1" || !out.Saga.Members[0].CreatedAt.Equal(stamp) {
+		t.Fatalf("saga JSON round trip = %#v", out.Saga)
 	}
 }

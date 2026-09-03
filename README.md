@@ -100,7 +100,7 @@ stave
 │   └── down|detach|destroy <space-id> [portal-id]
 ├── repos
 │   ├── add <name> <url>
-│   ├── list [--verbose]
+│   ├── list [--verbose] [--json]
 │   ├── sync [name]
 │   ├── remove <name>
 │   ├── describe <repo> [text]
@@ -128,9 +128,12 @@ stave
     ├── init <space-id>
     ├── create <space-id> [--memory ...] [--saga <saga-id> [--after ...]] [-c/--common] [--include-weak] [--no-learn]
     ├── add <space-id> <repo> [--no-learn]
+    ├── remove <space-id> <repo> [--force]
     ├── sync <space-id>
-    ├── status <space-id>
+    ├── status <space-id> [--json]
+    ├── list [--archived] [--json]
     ├── archive <space-id>
+    ├── restore <space-id> [--from <archive-name>]
     ├── retarget <space-id> --repo <repo> --base <ref>
     └── destroy <space-id> [--memory keep|destroy|contribute]
 ```
@@ -393,7 +396,7 @@ migrated into the managed block.
 | Command | Description |
 |---------|-------------|
 | `stave repos add <name> <url>` | Clone bare mirror, register it, and (best-effort) set `origin/HEAD` and record the default branch; `--adopt` reuses an existing cache at the derived path |
-| `stave repos list [--verbose]` | List registered repos; `--verbose` appends each repo's description and learned tether count |
+| `stave repos list [--verbose] [--json]` | List registered repos; `--verbose` appends each repo's description and learned tether count; `--json` emits `{name, url, bareRepoPath, defaultBranch, description, tetherCount}` rows |
 | `stave repos sync [name]` | Fetch + prune bare mirror(s), then (best-effort) re-point `origin/HEAD` and backfill a missing `defaultBranch` |
 | `stave repos remove <name>` | Unregister; keeps the cache unless `--purge` |
 | `stave repos describe <repo> [text]` | Set the repo's description when text is given; print it otherwise (non-zero exit if unset) |
@@ -510,15 +513,31 @@ Current built-in model defaults are `gpt-5.5` for OpenAI and `claude-opus-4-7` f
 | `stave space init <space-id>` | Empty space (manifest + `AGENTS.md`) |
 | `stave space create <space-id>` | `init` plus `--edit` / `--reference` repos |
 | `stave space add <space-id> <repo>` | Add one repo (`--edit` or `--reference`) |
+| `stave space remove <space-id> <repo>` | Remove one repo's worktree and manifest entry (the branch is kept) |
 | `stave space sync <space-id>` | Fetch, update references, report edit drift |
-| `stave space status <space-id>` | Manifest, dirty state, ahead/behind |
+| `stave space status <space-id> [--json]` | Manifest, dirty state, ahead/behind; `--json` emits `{spaceId, spacePath, manifest, repos[], memories[]}` with per-repo `exists/dirty/ahead/behind` |
+| `stave space list [--archived] [--json]` | List spaces as `id\tkind\tpath` (`--archived` lists `.archive/` entries); `--json` emits `{id, path, kind, createdAt, isSaga, memberOf, repos[{name, mode}], archived, error}` rows |
 | `stave space archive <space-id>` | Remove worktrees; move space to `.archive/` |
+| `stave space restore <space-id>` | Move an archived space back and re-create its worktrees |
 | `stave space retarget <space-id> --repo <repo> --base <ref>` | Repoint an edit repo's recorded base without touching the worktree (rewrites the manifest only) |
 | `stave space destroy <space-id>` | Remove worktrees and delete space directory |
 
 Space commands take a plain space ID. Relative-path spellings such as
 `.archive/<id>` (previously accepted by some read and lifecycle verbs) are no
 longer valid space IDs and are rejected.
+
+`stave space restore` is the inverse of `archive`: it moves the archived
+directory back and re-creates every worktree from the manifest, edit repos at
+their recorded branch (which archive left in the bare repo) and references
+detached at their recorded ref. It picks `.archive/<id>` when present,
+otherwise the single `.archive/<id>-<timestamp>` copy; with several
+timestamped copies it refuses and lists them, and `--from <name>` chooses one.
+A missing edit branch refuses before anything moves; a missing reference ref
+skips that worktree with a warning. A live space with the same id, or a
+different space's archive named via `--from`, is refused. `stave space remove`
+is the inverse of `add`: the worktree is removed and pruned, the manifest and
+`AGENTS.md` rewritten, and the edit branch is never deleted (Stave never
+deletes branches).
 
 Space flags:
 
@@ -534,13 +553,14 @@ Space flags:
 | `--common`, `-c` | `create` | Also add reference worktrees for the edited repos' **strong** learned tethers (see [Learned repo tethers](#learned-repo-tethers)) |
 | `--include-weak` | `create` | With `--common`, widen the expansion to weak tethers too (implies `-c`) |
 | `--no-learn` | `create`, `add` | Do not record co-occurrence tethers for this invocation |
-| `--edit`, `-e` / `--reference`, `-r` | `add` | Mode (exactly one required) |
+| `--edit`, `-e` / `--reference`, `-r` | `add`, `remove` | Mode: exactly one required for `add`; for `remove` one is required only when the repo is present in both modes |
 | `--base`, `-b` | `add` | Base branch/ref for edits (`space:<id>` sugar accepted), or ref for references |
 | `--branch` | `add` | Branch name for editable repos |
 | `--no-fetch` | `add` | Skip fetching the bare repo before adding |
 | `--references-only` | `sync` | Only sync reference worktrees |
-| `--force` | `archive`, `destroy` | Proceed despite dirty edit worktrees |
-| `--dry-run` | `create`, `add`, `destroy` | Print Git operations without changing state |
+| `--force` | `remove`, `archive`, `destroy` | Proceed despite dirty edit worktrees (and, for `remove`/`archive`/`destroy`, other spaces stacked on the affected branches) |
+| `--from` | `restore` | `.archive/` entry name to restore when several `<id>-<timestamp>` copies exist |
+| `--dry-run` | `create`, `add`, `remove`, `archive`, `restore`, `destroy` | Print Git operations without changing state |
 
 When `--spec` points at a file, it is copied under `spec/` with its original basename. When it points at a directory, the directory contents are copied into `spec/`. The manifest records `specPath: spec`.
 
@@ -749,7 +769,8 @@ or `stave saga destroy` to tear it down with its members) or on a registered
 member (use `stave saga remove` to drop it from the roster first). Pass
 `--force` to override the refusal and archive or destroy the space anyway —
 the roster is then left as-is and may reference a space that no longer
-exists.
+exists. `stave space restore` is non-destructive and always proceeds; it
+prints a note that saga status may be stale until `stave saga sync`.
 
 ### `stave summon`
 
@@ -857,6 +878,65 @@ a companion `~/stave/repo-tethers.yaml.lock`. The file is purely machine-generat
 co-occurrence data — safe to delete and regenerate, never committed to a repo,
 and ignored entirely by older Stave binaries. Human input (repo descriptions)
 lives on the registry instead, so wiping the sidecar loses no hand-authored data.
+
+## Machine-readable output
+
+Read commands take `--json` for GUI hosts and scripts; output is indented JSON
+with secret-looking values redacted. Manifest fields keep their `.stave.yaml`
+key names (`id`, `kind`, `createdAt`, `repos[].bareRepoPath`, `saga.members[]`).
+
+| Command | Emits |
+|---------|-------|
+| `stave space status <space-id> --json` | `{spaceId, spacePath, manifest, repos[], memories[]}` |
+| `stave space list [--archived] --json` | Space rows with kind, saga join, repo summary |
+| `stave saga list --json` / `stave saga status <saga-id> --json` | Saga rows / the frozen `SagaStatus` contract |
+| `stave repos list --json` / `stave repos tethers <repo> --json` | Registry rows / learned tethers |
+| `stave portal list|status|inspect|drivers|doctor|auth status ... --json` | Portal state |
+| `stave agent <query> --json` | Plan, questions, and results |
+| `stave memory attach <space-id> --json` | Attachment confirmation |
+
+Mutating space and saga verbs take `--json` too, so a GUI host never parses
+prose. Human output is unchanged when the flag is absent. `--summon` is
+interactive and is refused alongside `--json`.
+
+| Command | Emits on success |
+|---------|------------------|
+| `stave space create|add|remove|restore ... --json` | `{spaceId, spacePath, manifest, notes[]?}` — the manifest is reloaded from disk after the operation; `notes` carries the notices a human run prints (canonicalization, stale-branch adoption, memory link kept, saga sync hint) |
+| `stave space archive <space-id> --json` | `{spaceId, archivedPath, memory: "keep"\|"contribute", notes[]?}` |
+| `stave space destroy <space-id> --json` | `{spaceId, spacePath, destroyed: true, memory: "keep"\|"destroy"\|"contribute", notes[]?}` |
+| `stave saga create|add|remove ... --json` | `{sagaId, spacePath, manifest, notes[]?}` |
+| `stave saga archive|destroy <saga-id> --json` | `{sagaId, action: "archived"\|"destroyed", memory, members: [{id, action: "archived"\|"destroyed"\|"skipped", note?}], notes[]?}` — members in teardown order |
+| any of the above with `--dry-run --json` | `{dryRun: true, plan: [each line the human dry-run prints]}` |
+
+On failure with `--json` the command prints one envelope to **stdout** and
+exits 1 (nothing is written to stderr):
+
+```json
+{ "error": { "code": "dirty_worktrees", "message": "space \"t-1\" has dirty editable worktrees: api", "details": { "repos": ["api"] } } }
+```
+
+| Code | Meaning | `details` |
+|------|---------|-----------|
+| `dirty_worktrees` | an editable worktree has uncommitted changes (`--force` overrides) | `repos[]` |
+| `dependent_spaces` | another live space stacks on a branch this operation would retire | `spaces[]`, `repo`, `branch` |
+| `memory_in_use` | the memory den is held by a live agent session (`--force` does not help) | |
+| `space_exists` | a live space already occupies the id/path (restore, saga create, create across the saga boundary) | `path` |
+| `space_not_found` | no live space under that id | |
+| `repo_not_found` | the repo is not registered (`stave repos add`) | `repo` |
+| `repo_not_in_space` | the space's manifest lists no such repo | `repo` |
+| `repo_already_in_space` | `space add` refuses a second entry for a repo in the same mode (edit + reference of one repo stays allowed) | `repo`, `mode` |
+| `repo_mode_ambiguous` | `space remove` needs `--edit` or `--reference` because the repo is present in both modes | `repo`, `modes` |
+| `saga_space` | a single-space verb was aimed at a saga space; use `stave saga archive|destroy` | |
+| `saga_member` | a single-space verb was aimed at a saga member; `stave saga remove` it first (or a space is already a member of another saga) | `saga` |
+| `invalid_name` | a space id or repo name fails the safe-name pattern | `label`, `name` |
+| `branch_missing` | restore: an edit repo's recorded branch no longer exists in the bare repo | `repo`, `branch` |
+| `ambiguous_archive` | restore: several `<space-id>-<timestamp>` archives match; pass `--from` | `candidates[]` |
+| `archive_not_found` | restore: no `.archive/` entry for the id | |
+| `invalid_arguments` | flag/usage refusal (`--edit` with `--reference`, `--memory destroy` on archive, `--summon` with `--json`, ...) | |
+| `unknown` | any other failure; `message` is the human error text | |
+
+Argument-count and flag-spelling mistakes are still reported by the CLI
+parser (usage text, exit 1) before the verb runs.
 
 ## Development
 

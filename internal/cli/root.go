@@ -314,8 +314,20 @@ branches in the cache are left as-is.`,
 	return cmd
 }
 
+// reposListRow is the typed `repos list --json` row: the registry entry plus
+// the learned tether count the --verbose text path reports.
+type reposListRow struct {
+	Name          string `json:"name"`
+	URL           string `json:"url"`
+	BareRepoPath  string `json:"bareRepoPath"`
+	DefaultBranch string `json:"defaultBranch,omitempty"`
+	Description   string `json:"description,omitempty"`
+	TetherCount   int    `json:"tetherCount"`
+}
+
 func (a *app) reposListCommand() *cobra.Command {
 	var verbose bool
+	var jsonOut bool
 	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List registered repositories",
@@ -326,12 +338,27 @@ func (a *app) reposListCommand() *cobra.Command {
 			}
 			names := sortedRepoNames(cfg)
 			tetherCounts := map[string]int{}
-			if verbose {
+			if verbose || jsonOut {
 				if f, err := tether.Load(tether.Path(*cfg)); err == nil {
 					for _, t := range f.Tethers {
 						tetherCounts[t.From]++
 					}
 				}
+			}
+			if jsonOut {
+				rows := make([]reposListRow, 0, len(names))
+				for _, name := range names {
+					repo := cfg.Repos[name]
+					rows = append(rows, reposListRow{
+						Name:          name,
+						URL:           repo.URL,
+						BareRepoPath:  repo.BareRepoPath,
+						DefaultBranch: repo.DefaultBranch,
+						Description:   repo.Description,
+						TetherCount:   tetherCounts[name],
+					})
+				}
+				return writeJSON(cmd.OutOrStdout(), rows)
 			}
 			for _, name := range names {
 				repo := cfg.Repos[name]
@@ -345,6 +372,7 @@ func (a *app) reposListCommand() *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "include descriptions and tether counts")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON")
 	return cmd
 }
 
@@ -977,10 +1005,13 @@ func (a *app) spaceCommand() *cobra.Command {
 		a.initCommand(),
 		a.createCommand(),
 		a.addCommand(),
+		a.removeCommand(),
 		a.syncCommand(),
 		a.retargetCommand(),
 		a.statusCommand(),
+		a.listCommand(),
 		a.archiveCommand(),
+		a.restoreCommand(),
 		a.destroyCommand(),
 	)
 	return cmd
@@ -1022,71 +1053,99 @@ func (a *app) createCommand() *cobra.Command {
 	var common bool
 	var includeWeak bool
 	var noLearn bool
+	var jsonOut bool
 	cmd := &cobra.Command{
 		Use:   "create <space-id>",
 		Short: "Create a workspace and add edit/reference repos in one command",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			positionals, agentArgs, err := parsePassthroughArgs(cmd, args, 1, 1, func() bool { return summonName != "" })
-			if err != nil {
-				return err
-			}
-			if kind == space.KindSaga {
-				return fmt.Errorf("kind %q is reserved; use 'stave saga create'", space.KindSaga)
-			}
-			spaceID := positionals[0]
-			editSpecs, err := parseRepoSpecs(edits)
-			if err != nil {
-				return err
-			}
-			refSpecs, err := parseRepoSpecs(references)
-			if err != nil {
-				return err
-			}
-			svc, err := a.serviceWithDryRun(cmd, dryRun)
-			if err != nil {
-				return err
-			}
-			createOpts := space.CreateOptions{
-				ID:         spaceID,
-				Kind:       kind,
-				SpecPath:   spec,
-				Edits:      editSpecs,
-				References: refSpecs,
-				Memories:   memories,
-				NoLearn:    noLearn,
-				DryRun:     dryRun,
-				SagaID:     sagaID,
-				After:      after,
-			}
-			// -c/--common (and --include-weak) expand the edited repos' learned
-			// tethers into extra reference worktrees via the service (D1). The
-			// result feeds CommonReferences, not References (OQ-E).
-			if common || includeWeak {
-				extra, notes, err := svc.ExpandCommonRefs(svc.Config, editSpecs, refSpecs, includeWeak)
+			// Interspersed parsing is off (agent args forward after --), so flags
+			// following the positional — --json included — are only known once
+			// parsePassthroughArgs has run.
+			positionals, agentArgs, parseErr := parsePassthroughArgs(cmd, args, 1, 1, func() bool { return summonName != "" })
+			return runJSON(cmd, jsonOut, func() (any, error) {
+				if parseErr != nil {
+					return nil, parseErr
+				}
+				if kind == space.KindSaga {
+					return nil, argErrorf("kind %q is reserved; use 'stave saga create'", space.KindSaga)
+				}
+				if jsonOut && summonName != "" {
+					return nil, argErrorf("--summon is interactive and cannot be combined with --json")
+				}
+				spaceID := positionals[0]
+				editSpecs, err := parseRepoSpecs(edits)
 				if err != nil {
-					return err
+					return nil, err
 				}
-				for _, note := range notes {
-					fmt.Fprintln(cmd.OutOrStdout(), note)
+				refSpecs, err := parseRepoSpecs(references)
+				if err != nil {
+					return nil, err
 				}
-				createOpts.CommonReferences = extra
-			}
-			if err := svc.Create(cmd.Context(), createOpts); err != nil {
-				return err
-			}
-			if summonName == "" {
+				sink := newOutputSink(cmd, jsonOut)
+				svc, err := a.serviceWithOutput(cmd, dryRun, sink.Writer())
+				if err != nil {
+					return nil, err
+				}
+				createOpts := space.CreateOptions{
+					ID:         spaceID,
+					Kind:       kind,
+					SpecPath:   spec,
+					Edits:      editSpecs,
+					References: refSpecs,
+					Memories:   memories,
+					NoLearn:    noLearn,
+					DryRun:     dryRun,
+					SagaID:     sagaID,
+					After:      after,
+				}
+				// -c/--common (and --include-weak) expand the edited repos' learned
+				// tethers into extra reference worktrees via the service (D1). The
+				// result feeds CommonReferences, not References (OQ-E).
+				if common || includeWeak {
+					extra, notes, err := svc.ExpandCommonRefs(svc.Config, editSpecs, refSpecs, includeWeak)
+					if err != nil {
+						return nil, err
+					}
+					for _, note := range notes {
+						fmt.Fprintln(sink.Writer(), note)
+					}
+					createOpts.CommonReferences = extra
+				}
+				if err := svc.Create(cmd.Context(), createOpts); err != nil {
+					return nil, err
+				}
+				if jsonOut {
+					if dryRun {
+						return dryRunPayload(sink), nil
+					}
+					if err := a.requestShellChdir(svc.SpacePath(spaceID)); err != nil {
+						return nil, err
+					}
+					// Progress lines (the create line, one per repo added) are
+					// represented by the payload itself; only notices remain notes.
+					primary := []string{fmt.Sprintf("created space %s at %s", spaceID, svc.SpacePath(spaceID))}
+					for _, spec := range editSpecs {
+						primary = append(primary, fmt.Sprintf("added %s repo %s to %s", space.ModeEdit, spec.Name, spaceID))
+					}
+					for _, spec := range append(append([]space.RepoSpec{}, refSpecs...), createOpts.CommonReferences...) {
+						primary = append(primary, fmt.Sprintf("added %s repo %s to %s", space.ModeReference, spec.Name, spaceID))
+					}
+					return spaceMutationPayload(svc, spaceID, sink, primary...)
+				}
+				if summonName == "" {
+					if dryRun {
+						return nil, nil
+					}
+					return nil, a.requestShellChdir(svc.SpacePath(spaceID))
+				}
 				if dryRun {
-					return nil
+					return nil, a.printPlannedSummon(cmd, svc.Config, spaceID, summonName, spec, agentArgs)
 				}
-				return a.requestShellChdir(svc.SpacePath(spaceID))
-			}
-			if dryRun {
-				return a.printPlannedSummon(cmd, svc.Config, spaceID, summonName, spec, agentArgs)
-			}
-			if err := a.requestShellChdir(svc.SpacePath(spaceID)); err != nil {
-				return err
-			}
-			return a.runSummon(cmd, svc.Config, spaceID, summonName, "", agentArgs, false)
+				if err := a.requestShellChdir(svc.SpacePath(spaceID)); err != nil {
+					return nil, err
+				}
+				return nil, a.runSummon(cmd, svc.Config, spaceID, summonName, "", agentArgs, false)
+			})
 		},
 	}
 	cmd.Flags().StringVarP(&kind, "kind", "k", "", "space kind, such as ticket, spike, or audit")
@@ -1101,6 +1160,7 @@ func (a *app) createCommand() *cobra.Command {
 	cmd.Flags().BoolVarP(&common, "common", "c", false, "also add reference worktrees for the edited repos' strong learned tethers")
 	cmd.Flags().BoolVar(&includeWeak, "include-weak", false, "with --common, include weak tethers too")
 	cmd.Flags().BoolVar(&noLearn, "no-learn", false, "do not record co-occurrence tethers for this create")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON (result on success, {\"error\": {code, message}} on failure; exit 1)")
 	cmd.Flags().SetInterspersed(false)
 	return cmd
 }
@@ -1890,36 +1950,49 @@ func (a *app) addCommand() *cobra.Command {
 	var dryRun bool
 	var linkMemory bool
 	var noLearn bool
+	var jsonOut bool
 	cmd := &cobra.Command{
 		Use:   "add <space-id> <repo>",
 		Short: "Add an editable or reference repository worktree to a space",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if edit == reference {
-				return fmt.Errorf("choose exactly one of --edit or --reference")
-			}
-			mode := space.ModeEdit
-			ref := ""
-			if reference {
-				mode = space.ModeReference
-				ref = base
-			}
-			svc, err := a.serviceWithDryRun(cmd, dryRun)
-			if err != nil {
-				return err
-			}
-			return svc.AddRepo(cmd.Context(), space.AddOptions{
-				SpaceID:      args[0],
-				RepoName:     args[1],
-				Mode:         mode,
-				Base:         base,
-				Ref:          ref,
-				Branch:       branch,
-				NoFetch:      noFetch,
-				DryRun:       dryRun,
-				LinkMemory:   linkMemory,
-				CaptureOnAdd: true,
-				NoLearn:      noLearn,
+			return runJSON(cmd, jsonOut, func() (any, error) {
+				if edit == reference {
+					return nil, argErrorf("choose exactly one of --edit or --reference")
+				}
+				mode := space.ModeEdit
+				ref := ""
+				if reference {
+					mode = space.ModeReference
+					ref = base
+				}
+				sink := newOutputSink(cmd, jsonOut)
+				svc, err := a.serviceWithOutput(cmd, dryRun, sink.Writer())
+				if err != nil {
+					return nil, err
+				}
+				if err := svc.AddRepo(cmd.Context(), space.AddOptions{
+					SpaceID:      args[0],
+					RepoName:     args[1],
+					Mode:         mode,
+					Base:         base,
+					Ref:          ref,
+					Branch:       branch,
+					NoFetch:      noFetch,
+					DryRun:       dryRun,
+					LinkMemory:   linkMemory,
+					CaptureOnAdd: true,
+					NoLearn:      noLearn,
+				}); err != nil {
+					return nil, err
+				}
+				if !jsonOut {
+					return nil, nil
+				}
+				if dryRun {
+					return dryRunPayload(sink), nil
+				}
+				return spaceMutationPayload(svc, args[0], sink, fmt.Sprintf("added %s repo %s to %s", mode, args[1], args[0]))
 			})
 		},
 	}
@@ -1931,6 +2004,7 @@ func (a *app) addCommand() *cobra.Command {
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print operations without changing state")
 	cmd.Flags().BoolVar(&linkMemory, "link-memory", true, "resolve an added reference repo into a read-only memory link when the space has memory attached")
 	cmd.Flags().BoolVar(&noLearn, "no-learn", false, "do not record co-occurrence tethers for this add")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON (result on success, {\"error\": {code, message}} on failure; exit 1)")
 	return cmd
 }
 
@@ -1980,8 +2054,49 @@ func (a *app) retargetCommand() *cobra.Command {
 	return cmd
 }
 
+// spaceStatusJSON is the typed `space status --json` document: the manifest
+// verbatim plus one probed row per repo and per memory attachment.
+type spaceStatusJSON struct {
+	SpaceID   string                  `json:"spaceId"`
+	SpacePath string                  `json:"spacePath"`
+	Manifest  space.Manifest          `json:"manifest"`
+	Repos     []spaceRepoStatusJSON   `json:"repos"`
+	Memories  []spaceMemoryStatusJSON `json:"memories"`
+}
+
+// spaceRepoStatusJSON is one repo row of `space status --json`. Path is
+// absolute (space path joined with the manifest's relative path), matching
+// the human output. Ahead/Behind are only probed for edit repos.
+type spaceRepoStatusJSON struct {
+	Name          string         `json:"name"`
+	Mode          space.RepoMode `json:"mode"`
+	Path          string         `json:"path"`
+	Branch        string         `json:"branch,omitempty"`
+	Base          string         `json:"base,omitempty"`
+	Ref           string         `json:"ref,omitempty"`
+	Exists        bool           `json:"exists"`
+	Dirty         bool           `json:"dirty"`
+	DirtyOutput   string         `json:"dirtyOutput,omitempty"`
+	Ahead         int            `json:"ahead"`
+	Behind        int            `json:"behind"`
+	DriftError    string         `json:"driftError,omitempty"`
+	ReferenceWarn string         `json:"referenceWarn,omitempty"`
+}
+
+// spaceMemoryStatusJSON is one memory row of `space status --json`. State is
+// the provider's compact link-freshness text (e.g. "2 unpushed", "stale")
+// with the human suffix decoration stripped; empty when the probe failed.
+type spaceMemoryStatusJSON struct {
+	Name     string `json:"name"`
+	Provider string `json:"provider"`
+	ID       string `json:"id"`
+	Owned    bool   `json:"owned"`
+	State    string `json:"state,omitempty"`
+}
+
 func (a *app) statusCommand() *cobra.Command {
-	return &cobra.Command{
+	var jsonOut bool
+	cmd := &cobra.Command{
 		Use:   "status <space-id>",
 		Short: "Show workspace manifest, dirty state, and editable drift",
 		Args:  cobra.ExactArgs(1),
@@ -2001,48 +2116,123 @@ func (a *app) statusCommand() *cobra.Command {
 			for _, mem := range status.Manifest.Memories {
 				memStates[mem.Name] = svc.MemoryStateSuffix(cmd.Context(), mem)
 			}
-			printStatus(cmd.OutOrStdout(), svc.SpacePath(args[0]), status, memStates)
+			spacePath := svc.SpacePath(args[0])
+			if jsonOut {
+				return writeJSON(cmd.OutOrStdout(), buildSpaceStatusJSON(args[0], spacePath, status, memStates))
+			}
+			printStatus(cmd.OutOrStdout(), spacePath, status, memStates)
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON")
+	return cmd
+}
+
+// buildSpaceStatusJSON projects the service Status (plus the per-memory state
+// suffixes the human renderer uses) into the typed --json document.
+func buildSpaceStatusJSON(spaceID, spacePath string, status space.Status, memStates map[string]string) spaceStatusJSON {
+	doc := spaceStatusJSON{
+		SpaceID:   spaceID,
+		SpacePath: spacePath,
+		Manifest:  status.Manifest,
+		Repos:     make([]spaceRepoStatusJSON, 0, len(status.Repos)),
+		Memories:  make([]spaceMemoryStatusJSON, 0, len(status.Manifest.Memories)),
+	}
+	for _, repo := range status.Repos {
+		doc.Repos = append(doc.Repos, spaceRepoStatusJSON{
+			Name:          repo.Repo.Name,
+			Mode:          repo.Repo.Mode,
+			Path:          filepath.Join(spacePath, repo.Repo.Path),
+			Branch:        repo.Repo.Branch,
+			Base:          repo.Repo.Base,
+			Ref:           repo.Repo.Ref,
+			Exists:        repo.Exists,
+			Dirty:         repo.Dirty,
+			DirtyOutput:   repo.DirtyOutput,
+			Ahead:         repo.Ahead,
+			Behind:        repo.Behind,
+			DriftError:    repo.DriftError,
+			ReferenceWarn: repo.ReferenceWarn,
+		})
+	}
+	for _, mem := range status.Manifest.Memories {
+		doc.Memories = append(doc.Memories, spaceMemoryStatusJSON{
+			Name:     mem.Name,
+			Provider: mem.Provider,
+			ID:       mem.ID,
+			Owned:    mem.Owned,
+			State:    trimMemoryStateSuffix(memStates[mem.Name]),
+		})
+	}
+	return doc
+}
+
+// trimMemoryStateSuffix turns the human row suffix " (2 unpushed)" into the
+// bare state text "2 unpushed".
+func trimMemoryStateSuffix(suffix string) string {
+	return strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(suffix), "("), ")"))
 }
 
 func (a *app) archiveCommand() *cobra.Command {
 	var force bool
 	var dryRun bool
 	var memoryFate string
+	var jsonOut bool
 	cmd := &cobra.Command{
 		Use:   "archive <space-id>",
 		Short: "Remove worktrees and preserve space metadata/notes under .archive",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fate, err := memory.ParseMemoryFate(memoryFate)
-			if err != nil {
-				return err
-			}
-			if fate == memory.FateDestroy {
-				return fmt.Errorf("--memory destroy is not valid for archive; use 'stave space destroy --memory destroy' to destroy owned memory")
-			}
-			svc, err := a.serviceWithDryRun(cmd, dryRun)
-			if err != nil {
-				return err
-			}
-			if !force {
-				if err := sagaLifecycleGuard(svc, args[0]); err != nil {
-					return err
+			return runJSON(cmd, jsonOut, func() (any, error) {
+				fate, err := parseMemoryFateArg(memoryFate)
+				if err != nil {
+					return nil, err
 				}
-			}
-			return svc.Archive(cmd.Context(), space.ArchiveOptions{
-				SpaceID:    args[0],
-				Force:      force,
-				DryRun:     dryRun,
-				MemoryFate: fate,
+				if fate == memory.FateDestroy {
+					return nil, argErrorf("--memory destroy is not valid for archive; use 'stave space destroy --memory destroy' to destroy owned memory")
+				}
+				sink := newOutputSink(cmd, jsonOut)
+				svc, err := a.serviceWithOutput(cmd, dryRun, sink.Writer())
+				if err != nil {
+					return nil, err
+				}
+				if !force {
+					if err := sagaLifecycleGuard(svc, args[0]); err != nil {
+						return nil, err
+					}
+				}
+				var before map[string]bool
+				if jsonOut {
+					before = archiveEntries(svc, args[0])
+				}
+				if err := svc.Archive(cmd.Context(), space.ArchiveOptions{
+					SpaceID:    args[0],
+					Force:      force,
+					DryRun:     dryRun,
+					MemoryFate: fate,
+				}); err != nil {
+					return nil, err
+				}
+				if !jsonOut {
+					return nil, nil
+				}
+				if dryRun {
+					return dryRunPayload(sink), nil
+				}
+				dest := archivedPathAfter(svc, args[0], before)
+				return spaceArchiveJSON{
+					SpaceID:      args[0],
+					ArchivedPath: dest,
+					Memory:       string(fate),
+					Notes:        sink.Notes(fmt.Sprintf("archived %s to %s", args[0], dest)),
+				}, nil
 			})
 		},
 	}
 	cmd.Flags().BoolVar(&force, "force", false, "archive even when editable worktrees are dirty or other spaces stack on this space's branches")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print operations without changing state")
 	cmd.Flags().StringVar(&memoryFate, "memory", string(memory.FateKeep), "memory fate on archive: keep or contribute (contribute-then-keep; destroy is not allowed)")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON (result on success, {\"error\": {code, message}} on failure; exit 1)")
 	return cmd
 }
 
@@ -2050,35 +2240,55 @@ func (a *app) destroyCommand() *cobra.Command {
 	var force bool
 	var dryRun bool
 	var memoryFate string
+	var jsonOut bool
 	cmd := &cobra.Command{
 		Use:   "destroy <space-id>",
 		Short: "Remove a space's worktrees and delete its directory",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fate, err := memory.ParseMemoryFate(memoryFate)
-			if err != nil {
-				return err
-			}
-			svc, err := a.serviceWithDryRun(cmd, dryRun)
-			if err != nil {
-				return err
-			}
-			if !force {
-				if err := sagaLifecycleGuard(svc, args[0]); err != nil {
-					return err
+			return runJSON(cmd, jsonOut, func() (any, error) {
+				fate, err := parseMemoryFateArg(memoryFate)
+				if err != nil {
+					return nil, err
 				}
-			}
-			return svc.Destroy(cmd.Context(), space.DestroyOptions{
-				SpaceID:    args[0],
-				Force:      force,
-				DryRun:     dryRun,
-				MemoryFate: fate,
+				sink := newOutputSink(cmd, jsonOut)
+				svc, err := a.serviceWithOutput(cmd, dryRun, sink.Writer())
+				if err != nil {
+					return nil, err
+				}
+				if !force {
+					if err := sagaLifecycleGuard(svc, args[0]); err != nil {
+						return nil, err
+					}
+				}
+				if err := svc.Destroy(cmd.Context(), space.DestroyOptions{
+					SpaceID:    args[0],
+					Force:      force,
+					DryRun:     dryRun,
+					MemoryFate: fate,
+				}); err != nil {
+					return nil, err
+				}
+				if !jsonOut {
+					return nil, nil
+				}
+				if dryRun {
+					return dryRunPayload(sink), nil
+				}
+				return spaceDestroyJSON{
+					SpaceID:   args[0],
+					SpacePath: svc.SpacePath(args[0]),
+					Destroyed: true,
+					Memory:    string(fate),
+					Notes:     sink.Notes("destroyed " + args[0]),
+				}, nil
 			})
 		},
 	}
 	cmd.Flags().BoolVar(&force, "force", false, "destroy even when editable worktrees are dirty or other spaces stack on this space's branches")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print operations without changing state")
 	cmd.Flags().StringVar(&memoryFate, "memory", string(memory.FateKeep), "owned memory fate: keep, destroy, or contribute (default keep)")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON (result on success, {\"error\": {code, message}} on failure; exit 1)")
 	return cmd
 }
 
@@ -2314,6 +2524,12 @@ func (a *app) service(cmd *cobra.Command) (space.Service, error) {
 }
 
 func (a *app) serviceWithDryRun(cmd *cobra.Command, dryRun bool) (space.Service, error) {
+	return a.serviceWithOutput(cmd, dryRun, cmd.OutOrStdout())
+}
+
+// serviceWithOutput builds the service with its notices and dry-run plan
+// routed to out: the command's stdout, or a --json capture buffer.
+func (a *app) serviceWithOutput(cmd *cobra.Command, dryRun bool, out io.Writer) (space.Service, error) {
 	cfg, _, err := a.loadConfig()
 	if err != nil {
 		return space.Service{}, err
@@ -2324,9 +2540,9 @@ func (a *app) serviceWithDryRun(cmd *cobra.Command, dryRun bool) (space.Service,
 		}
 	}
 	client := git.New(git.WithDryRun(dryRun, func(format string, args ...any) {
-		fmt.Fprintf(cmd.OutOrStdout(), format+"\n", args...)
+		fmt.Fprintf(out, format+"\n", args...)
 	}))
-	svc := space.NewService(*cfg, client, cmd.OutOrStdout())
+	svc := space.NewService(*cfg, client, out)
 	// Layer-2 merge probe: live PR state through the real gh binary (nil
 	// ghRunner = gh.ExecRunner), wired ONLY at the CLI layer. Clone URLs
 	// that are not GitHub-shaped (local paths, other forges) skip the probe

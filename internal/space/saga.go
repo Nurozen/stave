@@ -180,7 +180,7 @@ func (s Service) CreateSaga(ctx context.Context, opts SagaCreateOptions) error {
 	return s.withMembershipLock(func() error {
 		return s.withSagaLock(opts.ID, func() error {
 			if _, err := os.Stat(spacePath); err == nil {
-				return fmt.Errorf("space %q already exists; saga create requires a fresh id", opts.ID)
+				return coded(CodeSpaceExists, map[string]any{"path": spacePath}, "space %q already exists; saga create requires a fresh id", opts.ID)
 			} else if !errors.Is(err, os.ErrNotExist) {
 				return err
 			}
@@ -230,7 +230,7 @@ func (s Service) sagaAddMutation(sagaID, spaceID string, after []string, clearAf
 			}
 		}
 		if memberEntry == nil {
-			return fmt.Errorf("space %q does not exist", spaceID)
+			return coded(CodeSpaceNotFound, nil, "space %q does not exist", spaceID)
 		}
 		if memberEntry.Err != nil {
 			return fmt.Errorf("space %q has an unreadable manifest: %v", spaceID, memberEntry.Err)
@@ -240,7 +240,7 @@ func (s Service) sagaAddMutation(sagaID, spaceID string, after []string, clearAf
 			return fmt.Errorf("space %q: existing manifest id %q does not match %q", spaceID, memberManifest.ID, spaceID)
 		}
 		if memberManifest.Saga != nil {
-			return fmt.Errorf("space %q is itself a saga; sagas cannot be members", spaceID)
+			return coded(CodeSagaSpace, nil, "space %q is itself a saga; sagas cannot be members", spaceID)
 		}
 		// Single-saga membership, scanned under the membership lock. An
 		// unreadable sibling could hide a membership record: fail closed.
@@ -256,7 +256,7 @@ func (s Service) sagaAddMutation(sagaID, spaceID string, after []string, clearAf
 			}
 			for _, member := range sibling.Manifest.Saga.Members {
 				if member.ID == spaceID {
-					return fmt.Errorf("space %q is already a member of saga %q", spaceID, sibling.ID)
+					return coded(CodeSagaMember, map[string]any{"saga": sibling.ID}, "space %q is already a member of saga %q", spaceID, sibling.ID)
 				}
 			}
 		}
@@ -590,24 +590,11 @@ func (s Service) sagaTeardownLocked(ctx context.Context, sagaID, sagaPath string
 	if manifest.Saga == nil {
 		return fmt.Errorf("space %q is not a saga", sagaID)
 	}
-	// Reverse topological order: dependents tear down before the members they
-	// land after, so a stacked branch never outlives its base mid-walk.
-	order := sagaTopoOrder(manifest.Saga.Members)
-	for i, j := 0, len(order)-1; i < j; i, j = i+1, j-1 {
-		order[i], order[j] = order[j], order[i]
-	}
-	type plannedMember struct {
-		member SagaMember
-		state  MemberState
-		detail string
-	}
-	plan := make([]plannedMember, 0, len(order))
-	for _, member := range order {
-		state, detail := s.resolveMemberState(member)
-		if state == MemberCorrupt {
-			return fmt.Errorf("member %s has a corrupt manifest (%s); saga %s aborted with nothing torn down", member.ID, detail, spec.verb)
+	plan := s.sagaTeardownOrder(manifest)
+	for _, p := range plan {
+		if p.State == MemberCorrupt {
+			return fmt.Errorf("member %s has a corrupt manifest (%s); saga %s aborted with nothing torn down", p.ID, p.Detail, spec.verb)
 		}
-		plan = append(plan, plannedMember{member: member, state: state, detail: detail})
 	}
 	exempt := make([]string, 0, len(manifest.Saga.Members))
 	for _, member := range manifest.Saga.Members {
@@ -631,17 +618,17 @@ func (s Service) sagaTeardownLocked(ctx context.Context, sagaID, sagaPath string
 	// and which legitimately blocks the saga space alone.
 	if !spec.force {
 		for _, p := range plan {
-			if p.state != MemberLive {
+			if p.State != MemberLive {
 				continue
 			}
-			memberManifest, err := LoadManifest(s.SpacePath(p.member.ID))
+			memberManifest, err := LoadManifest(s.SpacePath(p.ID))
 			if err != nil {
-				return fmt.Errorf("member %s: %w", p.member.ID, err)
+				return fmt.Errorf("member %s: %w", p.ID, err)
 			}
-			if err := s.guardRefusal(s.ensureNoDirtyEdits(ctx, s.SpacePath(p.member.ID), memberManifest), spec.dryRun); err != nil {
+			if err := s.guardRefusal(s.ensureNoDirtyEdits(ctx, s.SpacePath(p.ID), memberManifest), spec.dryRun); err != nil {
 				return err
 			}
-			if err := s.guardRefusal(s.ensureNoDependentSpaces(p.member.ID, memberManifest, exempt), spec.dryRun); err != nil {
+			if err := s.guardRefusal(s.ensureNoDependentSpaces(p.ID, memberManifest, exempt), spec.dryRun); err != nil {
 				return err
 			}
 		}
@@ -664,17 +651,17 @@ func (s Service) sagaTeardownLocked(ctx context.Context, sagaID, sagaPath string
 			step++
 		}
 		for _, p := range plan {
-			switch p.state {
+			switch p.State {
 			case MemberArchived:
 				if spec.destroy {
-					s.printf("dry-run: %d. report member %s: archived at %s (left in place)\n", step, p.member.ID, p.detail)
+					s.printf("dry-run: %d. report member %s: archived at %s (left in place)\n", step, p.ID, p.Detail)
 				} else {
-					s.printf("dry-run: %d. skip member %s: already archived at %s\n", step, p.member.ID, p.detail)
+					s.printf("dry-run: %d. skip member %s: already archived at %s\n", step, p.ID, p.Detail)
 				}
 			case MemberMissing:
-				s.printf("dry-run: %d. skip member %s: missing\n", step, p.member.ID)
+				s.printf("dry-run: %d. skip member %s: missing\n", step, p.ID)
 			default:
-				s.printf("dry-run: %d. %s member %s\n", step, spec.verb, p.member.ID)
+				s.printf("dry-run: %d. %s member %s\n", step, spec.verb, p.ID)
 			}
 			step++
 		}
@@ -709,25 +696,25 @@ func (s Service) sagaTeardownLocked(ctx context.Context, sagaID, sagaPath string
 	}
 	var completed []string
 	for _, p := range plan {
-		switch p.state {
+		switch p.State {
 		case MemberArchived:
 			if spec.destroy {
 				// Never silently skipped, never auto-removed: the archive is the
 				// user's to keep or delete.
-				s.printf("member %s is archived at %s; destroy leaves archives in place (remove it manually if desired)\n", p.member.ID, p.detail)
+				s.printf("member %s is archived at %s; destroy leaves archives in place (remove it manually if desired)\n", p.ID, p.Detail)
 			} else {
-				s.printf("skipping member %s: already archived at %s\n", p.member.ID, p.detail)
+				s.printf("skipping member %s: already archived at %s\n", p.ID, p.Detail)
 			}
 			continue
 		case MemberMissing:
-			s.printf("skipping member %s: missing\n", p.member.ID)
+			s.printf("skipping member %s: missing\n", p.ID)
 			continue
 		}
-		if err := teardown(p.member.ID, "", ""); err != nil {
-			s.reportSagaTeardownFailure(sagaID, spec, "member "+p.member.ID, completed)
-			return fmt.Errorf("saga %s: member %s: %w", spec.verb, p.member.ID, err)
+		if err := teardown(p.ID, "", ""); err != nil {
+			s.reportSagaTeardownFailure(sagaID, spec, "member "+p.ID, completed)
+			return fmt.Errorf("saga %s: member %s: %w", spec.verb, p.ID, err)
 		}
-		completed = append(completed, p.member.ID)
+		completed = append(completed, p.ID)
 	}
 	// The saga space itself, last: references only, memory fate applies to
 	// the saga den (the window-guard is CLI-layer, so no interference here).
@@ -744,6 +731,49 @@ func (s Service) sagaTeardownLocked(ctx context.Context, sagaID, sagaPath string
 		return fmt.Errorf("saga %s: %w", spec.verb, err)
 	}
 	return nil
+}
+
+// SagaMemberState is one saga member's resolved lifecycle state (live,
+// archived, missing, corrupt) with its detail (archive path, corrupt reason).
+type SagaMemberState struct {
+	ID     string
+	State  MemberState
+	Detail string
+}
+
+// sagaTeardownOrder resolves every member of manifest in reverse topological
+// order — dependents before the members they land after — the exact walk
+// SagaArchive and SagaDestroy take, so a stacked branch never outlives its
+// base mid-walk.
+func (s Service) sagaTeardownOrder(manifest Manifest) []SagaMemberState {
+	order := sagaTopoOrder(manifest.Saga.Members)
+	for i, j := 0, len(order)-1; i < j; i, j = i+1, j-1 {
+		order[i], order[j] = order[j], order[i]
+	}
+	plan := make([]SagaMemberState, 0, len(order))
+	for _, member := range order {
+		state, detail := s.resolveMemberState(member)
+		plan = append(plan, SagaMemberState{ID: member.ID, State: state, Detail: detail})
+	}
+	return plan
+}
+
+// SagaMemberStates reports sagaID's members in teardown order with their
+// current states; machine-readable saga archive/destroy build their per-member
+// report from it. Missing saga → SpaceNotFoundError; non-saga → error.
+func (s Service) SagaMemberStates(sagaID string) ([]SagaMemberState, error) {
+	sagaPath, err := s.resolveSpacePath(sagaID)
+	if err != nil {
+		return nil, err
+	}
+	manifest, err := loadLiveManifest(sagaID, sagaPath)
+	if err != nil {
+		return nil, err
+	}
+	if manifest.Saga == nil {
+		return nil, fmt.Errorf("space %q is not a saga", sagaID)
+	}
+	return s.sagaTeardownOrder(manifest), nil
 }
 
 // reportSagaTeardownFailure prints the partial-failure handoff: which members

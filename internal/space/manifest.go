@@ -40,58 +40,58 @@ const (
 // owned:true means stave created the store and it follows space fate flags;
 // owned:false means an existing store was attached and is never destroyed by stave.
 type MemoryManifest struct {
-	Name     string `yaml:"name"`
-	Provider string `yaml:"provider"`
-	ID       string `yaml:"id"`
-	Owned    bool   `yaml:"owned"`
+	Name     string `yaml:"name" json:"name"`
+	Provider string `yaml:"provider" json:"provider"`
+	ID       string `yaml:"id" json:"id"`
+	Owned    bool   `yaml:"owned" json:"owned"`
 }
 
 type Manifest struct {
 	// Version is a write-ceiling schema marker. 0 (or omitted) means pre-version.
-	Version   int              `yaml:"version,omitempty"`
-	ID        string           `yaml:"id"`
-	Kind      string           `yaml:"kind,omitempty"`
-	CreatedAt time.Time        `yaml:"createdAt"`
-	SpecPath  string           `yaml:"specPath,omitempty"`
-	Repos     []RepoManifest   `yaml:"repos"`
-	Memories  []MemoryManifest `yaml:"memories,omitempty"`
+	Version   int              `yaml:"version,omitempty" json:"version,omitempty"`
+	ID        string           `yaml:"id" json:"id"`
+	Kind      string           `yaml:"kind,omitempty" json:"kind,omitempty"`
+	CreatedAt time.Time        `yaml:"createdAt" json:"createdAt"`
+	SpecPath  string           `yaml:"specPath,omitempty" json:"specPath,omitempty"`
+	Repos     []RepoManifest   `yaml:"repos" json:"repos"`
+	Memories  []MemoryManifest `yaml:"memories,omitempty" json:"memories,omitempty"`
 	// Saga is set only on saga spaces; nil on every ordinary space.
-	Saga *SagaManifest `yaml:"saga,omitempty"`
+	Saga *SagaManifest `yaml:"saga,omitempty" json:"saga,omitempty"`
 }
 
 // SagaManifest is the member roster of a saga space.
 type SagaManifest struct {
-	Members []SagaMember `yaml:"members"`
+	Members []SagaMember `yaml:"members" json:"members"`
 }
 
 // SagaMember is one member space enrolled in a saga. After lists the ids of
 // members this one lands behind; the resulting graph must stay acyclic.
 type SagaMember struct {
-	ID    string   `yaml:"id"`
-	After []string `yaml:"after,omitempty"`
+	ID    string   `yaml:"id" json:"id"`
+	After []string `yaml:"after,omitempty" json:"after,omitempty"`
 	// CreatedAt is the member manifest's creation stamp captured when the
 	// member was added. It is compared with time.Time.Equal to detect a
 	// space that was destroyed and recreated under the same id, so a zero
 	// value reads as a mismatch.
-	CreatedAt time.Time `yaml:"createdAt,omitempty"`
-	PRs       []SagaPR  `yaml:"prs,omitempty"`
+	CreatedAt time.Time `yaml:"createdAt,omitempty" json:"createdAt,omitzero"`
+	PRs       []SagaPR  `yaml:"prs,omitempty" json:"prs,omitempty"`
 }
 
 // SagaPR identifies a pull request opened for a member. Only identity is
 // recorded: merge state is always re-read from the forge, never persisted.
 type SagaPR struct {
-	Repo   string `yaml:"repo"`
-	Number int    `yaml:"number"`
+	Repo   string `yaml:"repo" json:"repo"`
+	Number int    `yaml:"number" json:"number"`
 }
 
 type RepoManifest struct {
-	Name         string   `yaml:"name"`
-	Mode         RepoMode `yaml:"mode"`
-	Path         string   `yaml:"path"`
-	Base         string   `yaml:"base,omitempty"`
-	Ref          string   `yaml:"ref,omitempty"`
-	Branch       string   `yaml:"branch,omitempty"`
-	BareRepoPath string   `yaml:"bareRepoPath"`
+	Name         string   `yaml:"name" json:"name"`
+	Mode         RepoMode `yaml:"mode" json:"mode"`
+	Path         string   `yaml:"path" json:"path"`
+	Base         string   `yaml:"base,omitempty" json:"base,omitempty"`
+	Ref          string   `yaml:"ref,omitempty" json:"ref,omitempty"`
+	Branch       string   `yaml:"branch,omitempty" json:"branch,omitempty"`
+	BareRepoPath string   `yaml:"bareRepoPath" json:"bareRepoPath"`
 }
 
 // ErrManifestVersionTooNew is returned by SaveManifest when the on-disk

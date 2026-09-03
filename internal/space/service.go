@@ -351,9 +351,9 @@ func (s Service) InitSpace(ctx context.Context, opts InitOptions) error {
 		// same-ID creation race resolves to one winner and one clean error.
 		if (manifest.Saga != nil) != (opts.Saga != nil) {
 			if manifest.Saga != nil {
-				return fmt.Errorf("space %q already exists as a saga", opts.ID)
+				return coded(CodeSpaceExists, map[string]any{"path": spacePath}, "space %q already exists as a saga", opts.ID)
 			}
-			return fmt.Errorf("space %q already exists and is not a saga", opts.ID)
+			return coded(CodeSpaceExists, map[string]any{"path": spacePath}, "space %q already exists and is not a saga", opts.ID)
 		}
 		if err := ensureClaudeLink(spacePath); err != nil {
 			return err
@@ -485,7 +485,7 @@ func (s Service) createDryRun(ctx context.Context, opts CreateOptions) error {
 	for _, spec := range opts.Edits {
 		repoCfg, ok := s.Config.Repos[spec.Name]
 		if !ok {
-			return fmt.Errorf("repo %q is not registered", spec.Name)
+			return &RepoNotFoundError{Repo: spec.Name}
 		}
 		resolvedBase, _, err := ResolveBaseRef(spec.Ref, spec.Name)
 		if err != nil {
@@ -498,7 +498,7 @@ func (s Service) createDryRun(ctx context.Context, opts CreateOptions) error {
 	for _, spec := range opts.References {
 		repoCfg, ok := s.Config.Repos[spec.Name]
 		if !ok {
-			return fmt.Errorf("repo %q is not registered", spec.Name)
+			return &RepoNotFoundError{Repo: spec.Name}
 		}
 		ref := normalizeRemoteRef(firstNonEmpty(spec.Ref, repoCfg.DefaultBranch, s.Config.DefaultBase))
 		s.printf("dry-run: fetch %s\n", repoCfg.BareRepoPath)
@@ -507,7 +507,7 @@ func (s Service) createDryRun(ctx context.Context, opts CreateOptions) error {
 	for _, spec := range opts.CommonReferences {
 		repoCfg, ok := s.Config.Repos[spec.Name]
 		if !ok {
-			return fmt.Errorf("repo %q is not registered", spec.Name)
+			return &RepoNotFoundError{Repo: spec.Name}
 		}
 		ref := normalizeRemoteRef(firstNonEmpty(spec.Ref, repoCfg.DefaultBranch, s.Config.DefaultBase))
 		s.printf("dry-run: fetch %s\n", repoCfg.BareRepoPath)
@@ -836,12 +836,20 @@ func (s Service) AddRepo(ctx context.Context, opts AddOptions) error {
 	}
 	repoCfg, ok := s.Config.Repos[opts.RepoName]
 	if !ok {
-		return fmt.Errorf("repo %q is not registered", opts.RepoName)
+		return &RepoNotFoundError{Repo: opts.RepoName}
 	}
 	spacePath := s.SpacePath(opts.SpaceID)
-	manifest, err := LoadManifest(spacePath)
+	manifest, err := loadLiveManifest(opts.SpaceID, spacePath)
 	if err != nil {
 		return err
+	}
+	// The same repo may be present once as an edit AND once as a reference
+	// (compare a branch against its base); only a second entry in the SAME
+	// mode is refused, since it would make remove and AGENTS.md ambiguous.
+	for _, existing := range manifest.Repos {
+		if existing.Name == opts.RepoName && existing.Mode == opts.Mode {
+			return &RepoAlreadyInSpaceError{SpaceID: opts.SpaceID, Repo: opts.RepoName, Mode: existing.Mode}
+		}
 	}
 	// Snapshot the repo slice BEFORE the new entry is appended: captureDeltaOnAdd
 	// records only pairs involving the added repo, against this prior set (D13).
@@ -1163,7 +1171,7 @@ func (s Service) Archive(ctx context.Context, opts ArchiveOptions) error {
 	if err != nil {
 		return err
 	}
-	manifest, err := LoadManifest(spacePath)
+	manifest, err := loadLiveManifest(opts.SpaceID, spacePath)
 	if err != nil {
 		return err
 	}
@@ -1284,7 +1292,7 @@ func (s Service) Destroy(ctx context.Context, opts DestroyOptions) error {
 	if err != nil {
 		return err
 	}
-	manifest, err := LoadManifest(spacePath)
+	manifest, err := loadLiveManifest(opts.SpaceID, spacePath)
 	if err != nil {
 		return err
 	}
@@ -1925,7 +1933,7 @@ func (s Service) ensureNoDependentSpaces(spaceID string, manifest Manifest, exem
 		}
 		for _, repo := range sibling.Manifest.Repos {
 			if branch, ok := spellings[canonicalRepoPath(repo.BareRepoPath)][repo.Base]; ok {
-				return fmt.Errorf("space %q repo %q stacks on branch %q of space %q (use --force to override)", sibling.ID, repo.Name, branch, spaceID)
+				return &DependentSpaceError{SpaceID: spaceID, Dependent: sibling.ID, Repo: repo.Name, Branch: branch}
 			}
 		}
 	}
@@ -2178,4 +2186,48 @@ func copyFile(src, dest string) error {
 		return err
 	}
 	return os.WriteFile(dest, data, 0o644)
+}
+
+// ArchivedSpaceEntry is one archived space under <AgentWorkDir>/.archive/.
+// ID is the archive directory name: usually the space id, or
+// <id>-<timestamp> when Archive had to disambiguate a collision (see
+// archiveNameMatches). Manifest is nil and Err set when the archived manifest
+// cannot be read or parsed.
+type ArchivedSpaceEntry struct {
+	ID       string
+	Path     string
+	Manifest *Manifest
+	Err      error
+}
+
+// ListArchivedSpaces enumerates archived spaces under <AgentWorkDir>/.archive/
+// with the same rules as ListSpaces: directories without a .stave.yaml are
+// skipped, unreadable manifests yield an entry with Err set. A missing
+// .archive/ directory is not an error: it simply holds no archives.
+func (s Service) ListArchivedSpaces() ([]ArchivedSpaceEntry, error) {
+	archiveRoot := filepath.Join(s.Config.AgentWorkDir, ".archive")
+	entries, err := os.ReadDir(archiveRoot)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var spaces []ArchivedSpaceEntry
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		path := filepath.Join(archiveRoot, entry.Name())
+		manifest, err := LoadManifest(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue // no .stave.yaml — not an archived space
+			}
+			spaces = append(spaces, ArchivedSpaceEntry{ID: entry.Name(), Path: path, Err: err})
+			continue
+		}
+		spaces = append(spaces, ArchivedSpaceEntry{ID: entry.Name(), Path: path, Manifest: &manifest})
+	}
+	return spaces, nil
 }

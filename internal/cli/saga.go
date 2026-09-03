@@ -40,7 +40,7 @@ func rejectSagaEditFlags(args []string) error {
 		}
 		if token == "--edit" || strings.HasPrefix(token, "--edit=") ||
 			(strings.HasPrefix(token, "-e") && !strings.HasPrefix(token, "--")) {
-			return fmt.Errorf("sagas hold no edit worktrees; create a member instead: stave space create <member-id> --saga <saga-id> -e <repo> (arguments after a literal \"--\" forward to the agent)")
+			return argErrorf("sagas hold no edit worktrees; create a member instead: stave space create <member-id> --saga <saga-id> -e <repo> (arguments after a literal \"--\" forward to the agent)")
 		}
 	}
 	return nil
@@ -53,62 +53,83 @@ func (a *app) sagaCreateCommand() *cobra.Command {
 	var dryRun bool
 	var summonName string
 	var noLearn bool
+	var jsonOut bool
 	cmd := &cobra.Command{
 		Use:   "create <saga-id>",
 		Short: "Create a saga space that coordinates member spaces",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := rejectSagaEditFlags(args); err != nil {
-				return err
+			// Interspersed parsing is off (agent args forward after --), so flags
+			// following the positional — --json included — are only known once
+			// parsePassthroughArgs has run; the -e refusal must still come first.
+			rejectErr := rejectSagaEditFlags(args)
+			var positionals, agentArgs []string
+			var parseErr error
+			if rejectErr == nil {
+				positionals, agentArgs, parseErr = parsePassthroughArgs(cmd, args, 1, 1, func() bool { return summonName != "" })
 			}
-			positionals, agentArgs, err := parsePassthroughArgs(cmd, args, 1, 1, func() bool { return summonName != "" })
-			if err != nil {
-				return err
-			}
-			sagaID := positionals[0]
-			refSpecs, err := parseRepoSpecs(references)
-			if err != nil {
-				return err
-			}
-			svc, err := a.serviceWithDryRun(cmd, dryRun)
-			if err != nil {
-				return err
-			}
-			if err := svc.CreateSaga(cmd.Context(), space.SagaCreateOptions{
-				ID:         sagaID,
-				SpecPath:   spec,
-				References: refSpecs,
-				Memories:   memories,
-				NoLearn:    noLearn,
-				DryRun:     dryRun,
-			}); err != nil {
-				return err
-			}
-			if dryRun {
-				if summonName == "" {
-					return nil
+			return runJSON(cmd, jsonOut, func() (any, error) {
+				if rejectErr != nil {
+					return nil, rejectErr
 				}
-				plannedMemories, err := plannedSagaMemories(svc.Config, sagaID, memories)
+				if parseErr != nil {
+					return nil, parseErr
+				}
+				if jsonOut && summonName != "" {
+					return nil, argErrorf("--summon is interactive and cannot be combined with --json")
+				}
+				sagaID := positionals[0]
+				refSpecs, err := parseRepoSpecs(references)
 				if err != nil {
-					return err
+					return nil, err
 				}
-				plannedSpec := ""
-				if spec != "" {
-					plannedSpec = "spec"
+				sink := newOutputSink(cmd, jsonOut)
+				svc, err := a.serviceWithOutput(cmd, dryRun, sink.Writer())
+				if err != nil {
+					return nil, err
 				}
-				spacePath := svc.SpacePath(sagaID)
-				prompt := summon.SagaPromptForPlan(spacePath, plannedSpec, summon.ResolveName(svc.Config, summonName), plannedMemories)
-				return a.printPlannedSummonWithPrompt(cmd, svc.Config, sagaID, summonName, spec, agentArgs, prompt)
-			}
-			if err := summon.InstallSagaSkill(svc.SpacePath(sagaID)); err != nil {
-				return err
-			}
-			if err := a.requestShellChdir(svc.SpacePath(sagaID)); err != nil {
-				return err
-			}
-			if summonName == "" {
-				return nil
-			}
-			return a.runSummon(cmd, svc.Config, sagaID, summonName, "", agentArgs, false)
+				if err := svc.CreateSaga(cmd.Context(), space.SagaCreateOptions{
+					ID:         sagaID,
+					SpecPath:   spec,
+					References: refSpecs,
+					Memories:   memories,
+					NoLearn:    noLearn,
+					DryRun:     dryRun,
+				}); err != nil {
+					return nil, err
+				}
+				if dryRun {
+					if jsonOut {
+						return dryRunPayload(sink), nil
+					}
+					if summonName == "" {
+						return nil, nil
+					}
+					plannedMemories, err := plannedSagaMemories(svc.Config, sagaID, memories)
+					if err != nil {
+						return nil, err
+					}
+					plannedSpec := ""
+					if spec != "" {
+						plannedSpec = "spec"
+					}
+					spacePath := svc.SpacePath(sagaID)
+					prompt := summon.SagaPromptForPlan(spacePath, plannedSpec, summon.ResolveName(svc.Config, summonName), plannedMemories)
+					return nil, a.printPlannedSummonWithPrompt(cmd, svc.Config, sagaID, summonName, spec, agentArgs, prompt)
+				}
+				if err := summon.InstallSagaSkill(svc.SpacePath(sagaID)); err != nil {
+					return nil, err
+				}
+				if err := a.requestShellChdir(svc.SpacePath(sagaID)); err != nil {
+					return nil, err
+				}
+				if jsonOut {
+					return sagaMutationPayload(svc, sagaID, sink, fmt.Sprintf("created space %s at %s", sagaID, svc.SpacePath(sagaID)))
+				}
+				if summonName == "" {
+					return nil, nil
+				}
+				return nil, a.runSummon(cmd, svc.Config, sagaID, summonName, "", agentArgs, false)
+			})
 		},
 	}
 	cmd.Flags().StringVarP(&spec, "spec", "s", "", "path to a spec file or directory to copy into the saga space")
@@ -117,6 +138,7 @@ func (a *app) sagaCreateCommand() *cobra.Command {
 	cmd.Flags().StringVar(&summonName, "summon", "", "launch a summoner after creation (codex, claude, or cursor)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print operations without changing state")
 	cmd.Flags().BoolVar(&noLearn, "no-learn", false, "do not record repo tethers for this command (saga roots have no editable anchor, so this is a no-op for the saga root itself; members learn unless they pass --no-learn)")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON (result on success, {\"error\": {code, message}} on failure; exit 1)")
 	cmd.Flags().SetInterspersed(false)
 	return cmd
 }
@@ -308,47 +330,75 @@ func (a *app) sagaAddCommand() *cobra.Command {
 	var after []string
 	var clearAfter bool
 	var dryRun bool
+	var jsonOut bool
 	cmd := &cobra.Command{
 		Use:   "add <saga-id> <space-id>",
 		Short: "Register an existing space as a saga member",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			svc, err := a.serviceWithDryRun(cmd, dryRun)
-			if err != nil {
-				return err
-			}
-			if dryRun {
-				fmt.Fprintf(cmd.OutOrStdout(), "dry-run: add %s to saga %s\n", args[1], args[0])
-				return nil
-			}
-			return svc.SagaAdd(cmd.Context(), args[0], args[1], after, clearAfter)
+			return runJSON(cmd, jsonOut, func() (any, error) {
+				sink := newOutputSink(cmd, jsonOut)
+				svc, err := a.serviceWithOutput(cmd, dryRun, sink.Writer())
+				if err != nil {
+					return nil, err
+				}
+				if dryRun {
+					fmt.Fprintf(sink.Writer(), "dry-run: add %s to saga %s\n", args[1], args[0])
+					if jsonOut {
+						return dryRunPayload(sink), nil
+					}
+					return nil, nil
+				}
+				if err := svc.SagaAdd(cmd.Context(), args[0], args[1], after, clearAfter); err != nil {
+					return nil, err
+				}
+				if !jsonOut {
+					return nil, nil
+				}
+				return sagaMutationPayload(svc, args[0], sink, fmt.Sprintf("added %s to saga %s", args[1], args[0]))
+			})
 		},
 	}
 	cmd.Flags().StringArrayVar(&after, "after", nil, "member id this space lands behind (repeatable)")
 	cmd.Flags().BoolVar(&clearAfter, "clear-after", false, "reset the member's after edges before applying --after")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print operations without changing state")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON (result on success, {\"error\": {code, message}} on failure; exit 1)")
 	return cmd
 }
 
 func (a *app) sagaRemoveCommand() *cobra.Command {
 	var dryRun bool
+	var jsonOut bool
 	cmd := &cobra.Command{
 		Use:   "remove <saga-id> <space-id>",
 		Short: "Remove a member from a saga's roster",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			svc, err := a.serviceWithDryRun(cmd, dryRun)
-			if err != nil {
-				return err
-			}
-			if dryRun {
-				fmt.Fprintf(cmd.OutOrStdout(), "dry-run: remove %s from saga %s\n", args[1], args[0])
-				return nil
-			}
-			return svc.SagaRemove(cmd.Context(), args[0], args[1])
+			return runJSON(cmd, jsonOut, func() (any, error) {
+				sink := newOutputSink(cmd, jsonOut)
+				svc, err := a.serviceWithOutput(cmd, dryRun, sink.Writer())
+				if err != nil {
+					return nil, err
+				}
+				if dryRun {
+					fmt.Fprintf(sink.Writer(), "dry-run: remove %s from saga %s\n", args[1], args[0])
+					if jsonOut {
+						return dryRunPayload(sink), nil
+					}
+					return nil, nil
+				}
+				if err := svc.SagaRemove(cmd.Context(), args[0], args[1]); err != nil {
+					return nil, err
+				}
+				if !jsonOut {
+					return nil, nil
+				}
+				return sagaMutationPayload(svc, args[0], sink, fmt.Sprintf("removed %s from saga %s", args[1], args[0]))
+			})
 		},
 	}
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print operations without changing state")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON (result on success, {\"error\": {code, message}} on failure; exit 1)")
 	return cmd
 }
 
@@ -356,32 +406,34 @@ func (a *app) sagaArchiveCommand() *cobra.Command {
 	var force bool
 	var dryRun bool
 	var memoryFate string
+	var jsonOut bool
 	cmd := &cobra.Command{
 		Use:   "archive <saga-id>",
 		Short: "Archive every member in reverse topological order, then the saga space",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fate, err := memory.ParseMemoryFate(memoryFate)
-			if err != nil {
-				return err
-			}
-			if fate == memory.FateDestroy {
-				return fmt.Errorf("--memory destroy is not valid for archive; use 'stave saga destroy --memory destroy' to destroy owned memory")
-			}
-			svc, err := a.serviceWithDryRun(cmd, dryRun)
-			if err != nil {
-				return err
-			}
-			return svc.SagaArchive(cmd.Context(), args[0], space.SagaArchiveOptions{
-				Force:      force,
-				DryRun:     dryRun,
-				MemoryFate: fate,
+			return runJSON(cmd, jsonOut, func() (any, error) {
+				fate, err := parseMemoryFateArg(memoryFate)
+				if err != nil {
+					return nil, err
+				}
+				if fate == memory.FateDestroy {
+					return nil, argErrorf("--memory destroy is not valid for archive; use 'stave saga destroy --memory destroy' to destroy owned memory")
+				}
+				return a.runSagaTeardown(cmd, args[0], jsonOut, dryRun, fate, false, func(svc space.Service) error {
+					return svc.SagaArchive(cmd.Context(), args[0], space.SagaArchiveOptions{
+						Force:      force,
+						DryRun:     dryRun,
+						MemoryFate: fate,
+					})
+				})
 			})
 		},
 	}
 	cmd.Flags().BoolVar(&force, "force", false, "archive even when member worktrees are dirty or other spaces stack on member branches")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print the ordered teardown plan without changing state")
 	cmd.Flags().StringVar(&memoryFate, "memory", string(memory.FateKeep), "saga den fate on archive: keep or contribute (contribute-then-keep; destroy is not allowed)")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON (result on success, {\"error\": {code, message}} on failure; exit 1)")
 	return cmd
 }
 
@@ -389,30 +441,79 @@ func (a *app) sagaDestroyCommand() *cobra.Command {
 	var force bool
 	var dryRun bool
 	var memoryFate string
+	var jsonOut bool
 	cmd := &cobra.Command{
 		Use:   "destroy <saga-id>",
 		Short: "Destroy every member in reverse topological order, then the saga space",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fate, err := memory.ParseMemoryFate(memoryFate)
-			if err != nil {
-				return err
-			}
-			svc, err := a.serviceWithDryRun(cmd, dryRun)
-			if err != nil {
-				return err
-			}
-			return svc.SagaDestroy(cmd.Context(), args[0], space.SagaDestroyOptions{
-				Force:      force,
-				DryRun:     dryRun,
-				MemoryFate: fate,
+			return runJSON(cmd, jsonOut, func() (any, error) {
+				fate, err := parseMemoryFateArg(memoryFate)
+				if err != nil {
+					return nil, err
+				}
+				return a.runSagaTeardown(cmd, args[0], jsonOut, dryRun, fate, true, func(svc space.Service) error {
+					return svc.SagaDestroy(cmd.Context(), args[0], space.SagaDestroyOptions{
+						Force:      force,
+						DryRun:     dryRun,
+						MemoryFate: fate,
+					})
+				})
 			})
 		},
 	}
 	cmd.Flags().BoolVar(&force, "force", false, "destroy even when member worktrees are dirty or other spaces stack on member branches or share the saga den")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print the ordered teardown plan without changing state")
 	cmd.Flags().StringVar(&memoryFate, "memory", string(memory.FateKeep), "saga den fate: keep, destroy, or contribute (default keep)")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON (result on success, {\"error\": {code, message}} on failure; exit 1)")
 	return cmd
+}
+
+// runSagaTeardown runs a saga archive/destroy walk. In --json mode it snapshots
+// the members' states first (the walk's own per-member report is prose) and
+// returns the sagaTeardownJSON payload, or the dry-run plan.
+func (a *app) runSagaTeardown(cmd *cobra.Command, sagaID string, jsonOut, dryRun bool, fate memory.MemoryFate, destroy bool, run func(space.Service) error) (any, error) {
+	sink := newOutputSink(cmd, jsonOut)
+	svc, err := a.serviceWithOutput(cmd, dryRun, sink.Writer())
+	if err != nil {
+		return nil, err
+	}
+	var states []space.SagaMemberState
+	if jsonOut && !dryRun {
+		if states, err = svc.SagaMemberStates(sagaID); err != nil {
+			return nil, err
+		}
+	}
+	if err := run(svc); err != nil {
+		return nil, err
+	}
+	if !jsonOut {
+		return nil, nil
+	}
+	if dryRun {
+		return dryRunPayload(sink), nil
+	}
+	action := "archived"
+	if destroy {
+		action = "destroyed"
+	}
+	return sagaTeardownJSON{
+		SagaID:  sagaID,
+		Action:  action,
+		Memory:  string(fate),
+		Members: sagaTeardownMembers(states, destroy),
+		Notes:   sink.Lines(),
+	}, nil
+}
+
+// parseMemoryFateArg types a bad --memory value as invalid_arguments without
+// changing its message.
+func parseMemoryFateArg(raw string) (memory.MemoryFate, error) {
+	fate, err := memory.ParseMemoryFate(raw)
+	if err != nil {
+		return "", &invalidArgumentsError{msg: err.Error()}
+	}
+	return fate, nil
 }
 
 // sagaLifecycleGuard redirects single-space archive/destroy away from saga
@@ -422,7 +523,7 @@ func (a *app) sagaDestroyCommand() *cobra.Command {
 // through to the service's own errors.
 func sagaLifecycleGuard(svc space.Service, spaceID string) error {
 	if manifest, err := space.LoadManifest(svc.SpacePath(spaceID)); err == nil && manifest.Saga != nil {
-		return fmt.Errorf("space %q is a saga; use 'stave saga archive %s' or 'stave saga destroy %s' to tear it down with its members, or --force to override", spaceID, spaceID, spaceID)
+		return &space.SagaSpaceError{SpaceID: spaceID}
 	}
 	entries, err := svc.ListSpaces()
 	if err != nil {
@@ -434,7 +535,7 @@ func sagaLifecycleGuard(svc space.Service, spaceID string) error {
 		}
 		for _, member := range entry.Manifest.Saga.Members {
 			if member.ID == spaceID {
-				return fmt.Errorf("space %q is a member of saga %q; use 'stave saga remove %s %s' to drop it from the roster first, or --force to override", spaceID, entry.ID, entry.ID, spaceID)
+				return &space.SagaMemberError{SpaceID: spaceID, SagaID: entry.ID}
 			}
 		}
 	}

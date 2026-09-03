@@ -405,9 +405,28 @@ func ExpandPath(path string) (string, error) {
 
 func ValidateName(label, name string) error {
 	if !safeNamePattern.MatchString(name) {
-		return fmt.Errorf("%s %q must start with an alphanumeric character and contain only letters, numbers, dot, underscore, or dash", label, name)
+		return &InvalidNameError{Label: label, Name: name}
 	}
 	return nil
+}
+
+// InvalidNameError: a space id or repo name fails the safe-name pattern. It
+// carries the stable code "invalid_name" for --json consumers.
+type InvalidNameError struct {
+	Label string
+	Name  string
+}
+
+func (e *InvalidNameError) Error() string {
+	return fmt.Sprintf("%s %q must start with an alphanumeric character and contain only letters, numbers, dot, underscore, or dash", e.Label, e.Name)
+}
+
+// Code returns the stable machine-readable code.
+func (e *InvalidNameError) Code() string { return "invalid_name" }
+
+// Details names the offending value.
+func (e *InvalidNameError) Details() map[string]any {
+	return map[string]any{"label": e.Label, "name": e.Name}
 }
 
 // ValidateSpaceID is the seam for any future multi-segment space addressing;
