@@ -1681,7 +1681,7 @@ func (a *app) portalAuthLoginCommand() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&provider, "provider", "codex", "provider: codex, claude, or cursor")
-	cmd.Flags().StringVar(&method, "method", "native", "login method")
+	cmd.Flags().StringVar(&method, "method", "", "login method: native or device (remote Codex defaults to device)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview the commands without running them")
 	return cmd
 }
@@ -1767,7 +1767,7 @@ func (a *app) portalSyncCommand() *cobra.Command {
 	cmd.Flags().StringArrayVar(&includes, "include", nil, "include pattern")
 	cmd.Flags().StringArrayVar(&excludes, "exclude", nil, "exclude pattern")
 	cmd.Flags().BoolVar(&deleteFiles, "delete", false, "delete files missing from source")
-	cmd.Flags().IntVar(&maxDelete, "max-delete", 0, "maximum deletes after dry-run parsing")
+	cmd.Flags().IntVar(&maxDelete, "max-delete", 0, "maximum deletions before rsync stops")
 	cmd.Flags().BoolVar(&allowDirty, "allow-dirty", false, "allow destructive pull with dirty edits")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview the commands without running them")
 	cmd.Flags().BoolVar(&printCommand, "print-command", false, "preview the commands without running them")

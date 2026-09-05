@@ -1319,7 +1319,7 @@ func repoRefArraySchema(description string) map[string]any {
 func portalTargetSchema() map[string]any {
 	return objectSchema(map[string]any{
 		"space_id":  stringSchema("Existing Stave space id."),
-		"portal_id": stringSchema("Optional portal id. Defaults to default."),
+		"portal_id": stringSchema("Optional portal id. Uses default when present, otherwise the sole registered portal."),
 	}, []string{"space_id"})
 }
 

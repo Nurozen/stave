@@ -100,6 +100,22 @@ func TestValidatePlanAcceptsSamePlanPortalChain(t *testing.T) {
 	}
 }
 
+func TestValidatePlanFallsBackToSolePortal(t *testing.T) {
+	cfg := testConfig(t)
+	saveTestPortal(t, cfg, "ex-1", "work", portal.DriverSSH)
+	plan := Plan{Operations: []Operation{
+		{Type: OpPortalAuthLogin, SpaceID: "ex-1", Provider: "codex", Method: "device"},
+		{Type: OpPortalSummon, SpaceID: "ex-1", Summoner: "codex", Mode: "headless"},
+	}}
+	if err := ValidatePlan(cfg, plan); err != nil {
+		t.Fatalf("ValidatePlan() with omitted sole portal error = %v", err)
+	}
+	saveTestPortal(t, cfg, "ex-1", "other", portal.DriverSSH)
+	if err := ValidatePlan(cfg, Plan{Operations: []Operation{{Type: OpPortalStatus, SpaceID: "ex-1"}}}); err == nil {
+		t.Fatal("ValidatePlan() accepted an omitted ambiguous portal id")
+	}
+}
+
 func TestValidatePlanRejectsBadPortalPlans(t *testing.T) {
 	cfg := testConfig(t)
 	saveTestPortal(t, cfg, "ex-1", "ssh-dev", portal.DriverSSH)

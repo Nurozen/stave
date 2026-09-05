@@ -95,6 +95,17 @@ func TestCLIHelpCommands(t *testing.T) {
 	}
 }
 
+func TestPortalAuthLoginLeavesMethodForDriverDefault(t *testing.T) {
+	cmd, _, err := NewRootCommand().Find([]string{"portal", "auth", "login"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	method := cmd.Flags().Lookup("method")
+	if method == nil || method.DefValue != "" {
+		t.Fatalf("auth login method default = %#v, want empty for driver-specific selection", method)
+	}
+}
+
 func TestCLISetupReposAddAndCreate(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

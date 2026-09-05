@@ -12,7 +12,9 @@ Use a portal when you want to:
 - inspect or destroy Stave-owned runtime resources without disturbing the space
 
 Portal metadata is written to `.stave-portal.yaml` in the space root. If you do
-not pass a `portal-id`, Stave uses `default`.
+not pass a `portal-id`, Stave uses `default` when it exists, otherwise the sole
+registered portal. Stave asks for an explicit id when multiple non-default
+portals exist.
 
 A portal covers exactly one space directory. On a saga that means the saga
 space alone — its members are sibling spaces with their own roots, so each
@@ -256,6 +258,10 @@ stave portal auth status example
 stave portal auth status example --provider codex --json
 ```
 
+Auth status is the posture recorded in the portal manifest; the command does
+not run a provider-specific live credential probe. Runtime reachability is
+checked separately by `portal status` and `portal doctor`.
+
 Run provider-native login inside the portal:
 
 ```sh
@@ -263,6 +269,12 @@ stave portal auth login example --provider codex
 stave portal auth login example --provider claude
 stave portal auth login example --provider cursor
 ```
+
+Login runs the provider command in the target but does not rewrite a previously
+configured inheritance mode or mark auth successful on command planning alone.
+For remote Codex targets, an omitted method defaults to the device flow; pass
+`--method native` to override it. A browser callback bound to the remote host's
+`localhost` is not reachable from your local browser without forwarding.
 
 Preview login without running it:
 
@@ -317,8 +329,10 @@ stave portal summon example --with codex --permission workspace-write
 ```
 
 `--permission` currently affects only headless Codex runs, where it maps to
-`codex exec --sandbox <permission>`. It is ignored by foreground Codex, Claude
-Code, and Cursor Agent.
+`codex exec --sandbox <permission>`. Headless Codex also receives
+`--skip-git-repo-check`, because a Stave space root can contain several repo
+worktrees without itself being a Git repository. The permission is ignored by
+foreground Codex, Claude Code, and Cursor Agent.
 
 ## Inspecting Portals
 
@@ -359,7 +373,9 @@ stave portal logs example --follow
 
 ## Syncing
 
-Portal sync reconciles files between the local space and the portal target.
+Portal sync transfers files between the local space and the portal target.
+`--direction both` performs a push followed by a pull; it is not a merge or
+conflict-resolution protocol.
 
 Push local files to the portal:
 
@@ -389,12 +405,24 @@ Useful sync flags:
 |------|---------|
 | `--direction to|from|both` | Choose sync direction |
 | `--mode auto|mount|rsync|reconstruct` | Choose sync mechanism |
-| `--references-only` | Sync only references |
+| `--references-only` | Explicitly sync only reference worktrees |
 | `--include <pattern>` | Include matching paths; repeatable |
 | `--exclude <pattern>` | Exclude matching paths; repeatable |
 | `--delete` | Delete target files missing from source |
+| `--max-delete <n>` | Stop rsync if it would delete more than `n` entries |
 | `--allow-dirty` | Allow destructive pull with dirty local edits |
 | `--yes` | Confirm sync behavior |
+
+Ordinary rsync excludes the root `references/` tree, even when a broad include
+pattern is supplied. Reference worktrees are reproducible from the shared Git
+mirror and can be ahead of the sender, so copying them wholesale can overwrite
+valid checkouts. `--references-only` is the deliberate opt-in for transferring
+that tree.
+
+`reconstruct` is currently a metadata preview: it transfers Stave manifests,
+agent instructions, and an optional `spec/` tree. It does not yet recreate Git
+worktrees or transfer non-Git deltas. Use `rsync` when a complete remote space
+copy is required.
 
 ## Shell And Exec
 
@@ -433,6 +461,12 @@ stave portal exec example \
 ```
 
 The command working directory defaults to the portal's space root.
+
+SSH and EC2 execution, summon, and tmux-log commands run through the target
+user's login shell so agent CLIs installed in user-managed paths can be found.
+Put those PATH additions in login-shell startup files (for example
+`.zprofile` or `.bash_profile`), not only interactive-shell files such as
+`.zshrc`.
 
 ### Non-interactive use
 
@@ -551,8 +585,10 @@ Keep these invariants in mind:
 - `.stave-portal.yaml` stores portal attachment metadata, not secrets.
 - Local auth is never copied into a portal unless you explicitly request
   `auth inherit`.
+- Ordinary rsync protects root reference worktrees; syncing them requires
+  explicit `--references-only` intent.
 - `portal status`, `portal doctor`, and `portal inspect` report live state
-  instead of trusting stale manifest fields.
+  for the runtime. Auth posture remains manifest-recorded state.
 - `portal destroy` affects Stave-owned runtime resources, not arbitrary user
   paths.
 - EC2 portals attach to existing instances; Stave does not provision or

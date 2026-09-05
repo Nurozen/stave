@@ -118,7 +118,11 @@ func ValidatePlan(cfg config.Config, plan Plan) error {
 			plannedPortals[portalPlanKey(op.SpaceID, op.PortalID)] = op.Driver
 		}
 		if op.Type == OpPortalAuthLogin || op.Type == OpPortalAuthInherit {
-			plannedAuth[portalAuthPlanKey(op.SpaceID, op.PortalID, op.Provider)] = true
+			portalIDValue, err := resolveExistingPortalID(cfg, op.SpaceID, op.PortalID, plannedPortals)
+			if err != nil {
+				return fmt.Errorf("operation %d (%s): %w", i+1, op.Type, err)
+			}
+			plannedAuth[portalAuthPlanKey(op.SpaceID, portalIDValue, op.Provider)] = true
 		}
 	}
 	return nil
@@ -412,7 +416,7 @@ func validateOperation(cfg config.Config, op Operation, plannedSpaces map[string
 			return fmt.Errorf("portal sync delete requires a positive max_delete")
 		}
 		if op.Type == OpPortalSummon {
-			if err := validatePortalSummonAuth(cfg, op, plannedAuth); err != nil {
+			if err := validatePortalSummonAuth(cfg, op, plannedPortals, plannedAuth); err != nil {
 				return err
 			}
 		}
@@ -548,19 +552,53 @@ func portalExists(cfg config.Config, spaceID, portalIDValue string) bool {
 }
 
 func portalDriverForPlan(cfg config.Config, op Operation, plannedPortals map[string]string) (string, error) {
-	key := portalPlanKey(op.SpaceID, op.PortalID)
+	portalIDValue, err := resolveExistingPortalID(cfg, op.SpaceID, op.PortalID, plannedPortals)
+	if err != nil {
+		return "", err
+	}
+	key := portalPlanKey(op.SpaceID, portalIDValue)
 	if driver := plannedPortals[key]; driver != "" {
 		return driver, nil
 	}
 	manifest, err := portal.LoadManifest(filepath.Join(cfg.AgentWorkDir, op.SpaceID))
 	if err != nil {
-		return "", fmt.Errorf("portal %q does not exist in space %q", portalID(op.PortalID), op.SpaceID)
+		return "", fmt.Errorf("portal %q does not exist in space %q", portalIDValue, op.SpaceID)
 	}
-	item, ok := manifest.Portals[portalID(op.PortalID)]
+	item, ok := manifest.Portals[portalIDValue]
 	if !ok {
-		return "", fmt.Errorf("portal %q does not exist in space %q", portalID(op.PortalID), op.SpaceID)
+		return "", fmt.Errorf("portal %q does not exist in space %q", portalIDValue, op.SpaceID)
 	}
 	return string(item.Driver), nil
+}
+
+func resolveExistingPortalID(cfg config.Config, spaceID, requested string, plannedPortals map[string]string) (string, error) {
+	if id := strings.TrimSpace(requested); id != "" {
+		return id, nil
+	}
+	ids := map[string]bool{}
+	if manifest, err := portal.LoadManifest(filepath.Join(cfg.AgentWorkDir, spaceID)); err == nil {
+		for id := range manifest.Portals {
+			ids[id] = true
+		}
+	}
+	prefix := spaceID + "\x00"
+	for key := range plannedPortals {
+		if strings.HasPrefix(key, prefix) {
+			ids[strings.TrimPrefix(key, prefix)] = true
+		}
+	}
+	if ids[portal.DefaultPortalID] {
+		return portal.DefaultPortalID, nil
+	}
+	if len(ids) == 1 {
+		for id := range ids {
+			return id, nil
+		}
+	}
+	if len(ids) > 1 {
+		return "", fmt.Errorf("portal id is required for space %q because multiple non-default portals exist", spaceID)
+	}
+	return portal.DefaultPortalID, nil
 }
 
 func validatePortalExists(cfg config.Config, op Operation, plannedPortals map[string]string) error {
@@ -568,21 +606,25 @@ func validatePortalExists(cfg config.Config, op Operation, plannedPortals map[st
 	return err
 }
 
-func validatePortalSummonAuth(cfg config.Config, op Operation, plannedAuth map[string]bool) error {
+func validatePortalSummonAuth(cfg config.Config, op Operation, plannedPortals map[string]string, plannedAuth map[string]bool) error {
 	provider := op.Summoner
 	if provider == "" {
 		provider = summon.Codex
 	}
-	if plannedAuth[portalAuthPlanKey(op.SpaceID, op.PortalID, provider)] {
+	portalIDValue, err := resolveExistingPortalID(cfg, op.SpaceID, op.PortalID, plannedPortals)
+	if err != nil {
+		return err
+	}
+	if plannedAuth[portalAuthPlanKey(op.SpaceID, portalIDValue, provider)] {
 		return nil
 	}
 	manifest, err := portal.LoadManifest(filepath.Join(cfg.AgentWorkDir, op.SpaceID))
 	if err != nil {
 		return fmt.Errorf("portal summon requires confirmed %s auth or a preceding portal auth login/inherit operation", provider)
 	}
-	item, ok := manifest.Portals[portalID(op.PortalID)]
+	item, ok := manifest.Portals[portalIDValue]
 	if !ok {
-		return fmt.Errorf("portal %q does not exist in space %q", portalID(op.PortalID), op.SpaceID)
+		return fmt.Errorf("portal %q does not exist in space %q", portalIDValue, op.SpaceID)
 	}
 	for _, auth := range item.Auth.Providers {
 		if auth.Provider == provider && auth.Status == portal.AuthOK {
