@@ -74,7 +74,10 @@ func (s Service) configureLocked(opts ConfigureOptions) (Plan, error) {
 	if err != nil {
 		return Plan{}, err
 	}
-	portalID := normalizePortalID(opts.PortalID)
+	portalID, err := resolvePortalID(manifest, opts.PortalID)
+	if err != nil {
+		return Plan{}, err
+	}
 	portal, ok := manifest.Portals[portalID]
 	if !ok {
 		return Plan{}, fmt.Errorf("portal %q is not registered for space %q", portalID, opts.SpaceID)
@@ -127,6 +130,15 @@ func (s Service) configureLocked(opts ConfigureOptions) (Plan, error) {
 func (s Service) PlanAuthLogin(ctx context.Context, opts AuthCommandOptions) (Plan, error) {
 	if err := validateAuthLoginMethod(opts.Provider, opts.Method); err != nil {
 		return Plan{}, err
+	}
+	if opts.Provider == "codex" && opts.Method == "" {
+		portal, _, err := s.LoadPortal(SelectOptions{SpaceID: opts.SpaceID, PortalID: opts.PortalID})
+		if err != nil {
+			return Plan{}, err
+		}
+		if isRemoteDriver(portal.Driver) {
+			opts.Method = "device"
+		}
 	}
 	return s.planAuthCommand(ctx, "auth-login", opts, authLoginArgv(opts.Provider, string(opts.Method)))
 }
@@ -225,7 +237,8 @@ func (s Service) PlanLogs(ctx context.Context, opts LogsOptions) (Plan, error) {
 		// read container stdout, not the tmux pane (D17). The session name is
 		// summoner-independent and matches PlanSummon's tmux mode.
 		session := tmuxSessionName(opts.SpaceID, portal.ID)
-		plan.Commands = append(plan.Commands, sshCommand(portal, "tmux capture-pane -pt "+quoteRemote(session)+" -S -"+fmt.Sprintf("%d", opts.Tail)))
+		body := "tmux capture-pane -pt " + quoteRemote(session) + " -S -" + fmt.Sprintf("%d", opts.Tail)
+		plan.Commands = append(plan.Commands, sshCommand(portal, remoteLoginCommand(body)))
 	}
 	return plan, nil
 }
@@ -265,7 +278,10 @@ func (s Service) detachLocked(opts DetachOptions) (Plan, error) {
 	if err != nil {
 		return Plan{}, err
 	}
-	portalID := normalizePortalID(opts.PortalID)
+	portalID, err := resolvePortalID(manifest, opts.PortalID)
+	if err != nil {
+		return Plan{}, err
+	}
 	portal, ok := manifest.Portals[portalID]
 	if !ok {
 		return Plan{}, fmt.Errorf("portal %q is not registered for space %q", portalID, opts.SpaceID)

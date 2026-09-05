@@ -249,18 +249,24 @@ func (s Service) PlanSummon(ctx context.Context, opts SummonOptions) (Plan, erro
 // the nested summoner (agentCommand[0]) either way (D16).
 func (s Service) tmuxCreateCommand(portal Portal, session string, agentCommand []string, cwd string) Command {
 	envProgram := agentCommand[0]
-	newSession := append([]string{"tmux", "new-session", "-d", "-s", session}, agentCommand...)
+	newSession := []string{"tmux", "new-session", "-d", "-s", session}
 	switch portal.Driver {
 	case DriverSSH, DriverEC2Attach:
-		guard := "tmux has-session -t " + quoteRemote(session) + " 2>/dev/null || exec " + joinRemote(newSession)
+		// The outer login shell finds tmux itself. The explicit login shell passed
+		// to new-session also gives a newly created pane the target user's PATH,
+		// even when it is hosted by a pre-existing tmux server with a stale
+		// environment.
+		paneBody := "cd " + quoteRemotePath(cwd) + " && exec " + joinRemote(agentCommand)
+		paneCommand := `"${SHELL:-/bin/sh}" -lc ` + quoteRemote(paneBody)
+		guard := "tmux has-session -t " + quoteRemote(session) + " 2>/dev/null || exec " + joinRemote(newSession) + " " + paneCommand
 		// Group the guard so a failed `cd` gates BOTH branches (otherwise
 		// `cd && A || B` runs B in the wrong directory on cd failure).
-		remote := "cd " + quoteRemotePath(cwd) + " && { " + guard + " ; }"
+		remote := remoteLoginCommand("cd " + quoteRemotePath(cwd) + " && { " + guard + " ; }")
 		cmd := sshCommandWithEnv(portal, inheritedEnvNames(portal, envProgram), remote)
 		cmd.Interactive = false
 		return cmd
 	default:
-		guard := "tmux has-session -t " + quoteShell(session) + " 2>/dev/null || " + joinRemote(newSession)
+		guard := "tmux has-session -t " + quoteShell(session) + " 2>/dev/null || " + joinRemote(append(newSession, agentCommand...))
 		return s.portalExecCommandFor(portal, []string{"sh", "-c", guard}, cwd, "", TTYAuto, false, envProgram)
 	}
 }
@@ -288,6 +294,9 @@ func (s Service) PlanSync(ctx context.Context, opts SyncOptions) (Plan, error) {
 	if direction != SyncTo && direction != SyncFrom && direction != SyncBoth {
 		return Plan{}, fmt.Errorf("sync direction must be to, from, or both")
 	}
+	if opts.MaxDelete < 0 {
+		return Plan{}, fmt.Errorf("max-delete must be zero or greater")
+	}
 	if opts.Delete && !opts.DryRun && !opts.Yes {
 		return Plan{}, fmt.Errorf("sync delete requires dry-run preview or explicit yes")
 	}
@@ -310,7 +319,7 @@ func (s Service) PlanSync(ctx context.Context, opts SyncOptions) (Plan, error) {
 		}
 		plan.Commands = append(plan.Commands, commands...)
 	case SyncReconstruct:
-		plan.Diagnostics = append(plan.Diagnostics, Diagnostic{Component: "sync", Severity: SeverityInfo, Code: "sync.reconstruct_preview", Message: "reconstruct mode copies manifests/specs and recreates worktrees before syncing deltas"})
+		plan.Diagnostics = append(plan.Diagnostics, Diagnostic{Component: "sync", Severity: SeverityWarn, Code: "sync.reconstruct_preview", Message: "reconstruct mode currently copies coordination metadata only; worktree reconstruction and non-git delta sync are not yet implemented"})
 		commands, err := reconstructCommands(portal, opts)
 		if err != nil {
 			return Plan{}, err
@@ -320,7 +329,7 @@ func (s Service) PlanSync(ctx context.Context, opts SyncOptions) (Plan, error) {
 		return Plan{}, fmt.Errorf("sync mode %q is not supported", mode)
 	}
 	if opts.MaxDelete > 0 {
-		plan.Diagnostics = append(plan.Diagnostics, Diagnostic{Component: "sync", Severity: SeverityInfo, Code: "sync.max_delete", Message: "max-delete is recorded for CLI enforcement after dry-run parsing", Evidence: fmt.Sprintf("%d", opts.MaxDelete)})
+		plan.Diagnostics = append(plan.Diagnostics, Diagnostic{Component: "sync", Severity: SeverityInfo, Code: "sync.max_delete", Message: "rsync will stop when deletions exceed max-delete", Evidence: fmt.Sprintf("%d", opts.MaxDelete)})
 	}
 	return plan, nil
 }
@@ -376,7 +385,7 @@ func (s Service) portalExecCommandFor(portal Portal, argv []string, cwd, user st
 		cmd.Interactive = interactive
 		return cmd
 	case DriverSSH, DriverEC2Attach:
-		remote := "cd " + quoteRemotePath(cwd) + " && exec " + joinRemote(argv)
+		remote := remoteLoginCommand("cd " + quoteRemotePath(cwd) + " && exec " + joinRemote(argv))
 		var extra []string
 		if wantTTY {
 			extra = []string{"-t"}
@@ -511,6 +520,12 @@ func rsyncCommand(portal Portal, opts SyncOptions, source, dest string) Command 
 	}
 	if opts.ReferencesOnly {
 		args = append(args, "--include=references/***", "--exclude=*")
+	} else {
+		// Reference worktrees are reproducible from the shared mirror and may be
+		// ahead of the sender. Protect the root reference subtree from ordinary
+		// whole-space copies (and receiver-side deletion). An explicit
+		// --references-only sync remains the opt-in escape hatch.
+		args = append(args, "--exclude=/references/")
 	}
 	for _, include := range opts.Include {
 		args = append(args, "--include="+include)
@@ -529,6 +544,9 @@ func baseRsyncArgs(opts SyncOptions) []string {
 	}
 	if opts.Delete {
 		args = append(args, "--delete-delay")
+	}
+	if opts.MaxDelete > 0 {
+		args = append(args, fmt.Sprintf("--max-delete=%d", opts.MaxDelete))
 	}
 	return args
 }
@@ -611,7 +629,7 @@ func summonCommand(summoner string, portal Portal, opts SummonOptions) ([]string
 	switch summoner {
 	case "codex":
 		if opts.Mode == "headless" {
-			return []string{"codex", "exec", "--cd", cwd, "--sandbox", permission, "--json", prompt}, nil
+			return []string{"codex", "exec", "--cd", cwd, "--sandbox", permission, "--skip-git-repo-check", "--json", prompt}, nil
 		}
 		return []string{"codex", "--cd", cwd, prompt}, nil
 	case "claude":
@@ -779,4 +797,12 @@ func joinRemote(argv []string) string {
 		parts = append(parts, quoteRemote(arg))
 	}
 	return strings.Join(parts, " ")
+}
+
+// remoteLoginCommand runs a remote command through the target account's login
+// shell. SSH servers normally execute supplied commands in a non-login shell,
+// whose PATH often omits user-installed agent CLIs. Keep shell selection on the
+// target and quote the complete body as one -c argument.
+func remoteLoginCommand(body string) string {
+	return `exec "${SHELL:-/bin/sh}" -lc ` + quoteRemote(body)
 }

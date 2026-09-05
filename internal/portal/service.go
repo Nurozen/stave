@@ -378,7 +378,10 @@ func (s Service) LoadPortal(opts SelectOptions) (Portal, string, error) {
 	if manifest.SpaceID != opts.SpaceID {
 		return Portal{}, "", fmt.Errorf("portal manifest space id %q does not match %q", manifest.SpaceID, opts.SpaceID)
 	}
-	portalID := normalizePortalID(opts.PortalID)
+	portalID, err := resolvePortalID(manifest, opts.PortalID)
+	if err != nil {
+		return Portal{}, "", err
+	}
 	portal, ok := manifest.Portals[portalID]
 	if !ok {
 		return Portal{}, "", fmt.Errorf("portal %q is not registered for space %q", portalID, opts.SpaceID)
@@ -763,6 +766,32 @@ func normalizePortalID(id string) string {
 		return DefaultPortalID
 	}
 	return strings.TrimSpace(id)
+}
+
+// resolvePortalID keeps "default" as the conventional implicit portal while
+// making single-portal spaces ergonomic when their only portal has another ID.
+// Explicit IDs always win; ambiguous spaces require the caller to choose.
+func resolvePortalID(manifest Manifest, requested string) (string, error) {
+	if id := strings.TrimSpace(requested); id != "" {
+		return id, nil
+	}
+	if _, ok := manifest.Portals[DefaultPortalID]; ok {
+		return DefaultPortalID, nil
+	}
+	if len(manifest.Portals) == 1 {
+		for id := range manifest.Portals {
+			return id, nil
+		}
+	}
+	if len(manifest.Portals) > 1 {
+		ids := make([]string, 0, len(manifest.Portals))
+		for id := range manifest.Portals {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		return "", fmt.Errorf("portal id is required for space %q; specify one of: %s", manifest.SpaceID, strings.Join(ids, ", "))
+	}
+	return DefaultPortalID, nil
 }
 
 func firstSyncMode(value, fallback SyncMode) SyncMode {

@@ -142,8 +142,11 @@ func TestSummonTmuxSSHSendEnvAndPromptQuoting(t *testing.T) {
 	if strings.Contains(remote, "new-session -A") {
 		t.Fatalf("new-session -A must not be used on ssh (not detach-safe on reuse): %s", remote)
 	}
-	if !strings.Contains(remote, `'look at "spec" it'"'"'s here'`) {
-		t.Fatalf("prompt did not round-trip through ssh serialization: %s", remote)
+	if !strings.Contains(remote, `look at "spec"`) || !strings.Contains(remote, `s here`) {
+		t.Fatalf("prompt was lost while serializing nested login shells: %s", remote)
+	}
+	if strings.Count(remote, `${SHELL:-/bin/sh}`) < 2 {
+		t.Fatalf("ssh tmux summon must initialize both client and pane login shells: %s", remote)
 	}
 }
 
