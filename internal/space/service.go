@@ -53,6 +53,10 @@ type Service struct {
 	// skips PR-based detection entirely (merge awareness degrades to commit
 	// ancestry). The CLI wires it to internal/gh.
 	PRLookup func(ctx context.Context, cloneURL, headBranch string) ([]gh.PR, error)
+	// onSyncReport, when set, observes every completed SyncWithReport on this
+	// Service value; SagaSyncWithReport uses it to collect per-member rows
+	// without changing SagaSync.
+	onSyncReport func(SyncReport)
 }
 
 type InitOptions struct {
@@ -1021,18 +1025,63 @@ func (s Service) linkMemoryOnAdd(ctx context.Context, spacePath string, manifest
 	}
 }
 
+// SyncRepoResult is one per-repo row of a space sync: what happened to the
+// worktree and, for edit repos, the drift versus the recorded base.
+type SyncRepoResult struct {
+	Name string   `json:"name"`
+	Mode RepoMode `json:"mode"`
+	// Action is one of: "fetched" (bare repo fetched, nothing else reported —
+	// an edit repo whose drift probe failed), "updated" (reference checked out
+	// to its ref), "skipped" (dirty reference left alone), "drift-reported"
+	// (edit repo with Ahead/Behind populated).
+	Action string `json:"action"`
+	Ahead  int    `json:"ahead"`
+	Behind int    `json:"behind"`
+	Note   string `json:"note,omitempty"`
+}
+
+// Sync row actions.
+const (
+	SyncActionFetched       = "fetched"
+	SyncActionUpdated       = "updated"
+	SyncActionSkipped       = "skipped"
+	SyncActionDriftReported = "drift-reported"
+)
+
+// SyncReport is the structured result of SyncWithReport. Lines holds the
+// exact human lines the rows account for, so a --json caller can subtract
+// them from captured output and keep only the remaining notices.
+type SyncReport struct {
+	SpaceID   string           `json:"spaceId"`
+	SpacePath string           `json:"spacePath"`
+	Manifest  Manifest         `json:"manifest"`
+	Repos     []SyncRepoResult `json:"repos"`
+	Lines     []string         `json:"-"`
+}
+
+// Sync fetches a space's repos, refreshes reference checkouts, and reports
+// edit drift. It is SyncWithReport minus the structured result.
 func (s Service) Sync(ctx context.Context, opts SyncOptions) error {
+	_, err := s.SyncWithReport(ctx, opts)
+	return err
+}
+
+// SyncWithReport is Sync returning one row per processed repo. Human output
+// is unchanged; repos filtered out by ReferencesOnly are not reported, just
+// as they print nothing.
+func (s Service) SyncWithReport(ctx context.Context, opts SyncOptions) (SyncReport, error) {
 	spacePath, err := s.resolveSpacePath(opts.SpaceID)
 	if err != nil {
-		return err
+		return SyncReport{}, err
 	}
-	manifest, err := LoadManifest(spacePath)
+	manifest, err := loadLiveManifest(opts.SpaceID, spacePath)
 	if err != nil {
-		return err
+		return SyncReport{}, err
 	}
+	report := SyncReport{SpaceID: opts.SpaceID, SpacePath: spacePath, Manifest: manifest, Repos: []SyncRepoResult{}}
 	if !opts.DryRun {
 		if err := ensureClaudeLink(spacePath); err != nil {
-			return err
+			return SyncReport{}, err
 		}
 	}
 	for _, repo := range manifest.Repos {
@@ -1041,37 +1090,55 @@ func (s Service) Sync(ctx context.Context, opts SyncOptions) error {
 		}
 		if !opts.SkipFetch {
 			if err := s.Git.FetchAllPrune(ctx, repo.BareRepoPath); err != nil {
-				return err
+				return SyncReport{}, err
 			}
 		}
 		worktreePath := filepath.Join(spacePath, repo.Path)
+		row := SyncRepoResult{Name: repo.Name, Mode: repo.Mode}
+		var line string
 		switch repo.Mode {
 		case ModeReference:
 			dirty, _, err := s.Git.IsDirty(ctx, worktreePath)
 			if err != nil {
-				return err
+				return SyncReport{}, err
 			}
 			if dirty {
-				s.printf("reference %s is dirty; skipped checkout\n", repo.Name)
-				continue
+				row.Action = SyncActionSkipped
+				row.Note = "reference worktree is dirty; checkout skipped"
+				line = fmt.Sprintf("reference %s is dirty; skipped checkout", repo.Name)
+				break
 			}
 			if err := s.Git.CheckoutDetached(ctx, worktreePath, repo.Ref); err != nil {
-				return err
+				return SyncReport{}, err
 			}
-			s.printf("updated reference %s to %s\n", repo.Name, repo.Ref)
+			row.Action = SyncActionUpdated
+			line = fmt.Sprintf("updated reference %s to %s", repo.Name, repo.Ref)
 		case ModeEdit:
 			ahead, behind, err := s.Git.AheadBehind(ctx, worktreePath, repo.Base)
 			if err != nil {
-				s.printf("edit %s drift unknown: %v\n", repo.Name, err)
-				continue
+				row.Action = SyncActionFetched
+				row.Note = fmt.Sprintf("drift unknown: %v", err)
+				line = fmt.Sprintf("edit %s drift unknown: %v", repo.Name, err)
+				break
 			}
-			s.printf("edit %s: ahead %d, behind %d versus %s\n", repo.Name, ahead, behind, repo.Base)
+			row.Action, row.Ahead, row.Behind = SyncActionDriftReported, ahead, behind
+			line = fmt.Sprintf("edit %s: ahead %d, behind %d versus %s", repo.Name, ahead, behind, repo.Base)
+		}
+		if line != "" {
+			s.printf("%s\n", line)
+			report.Lines = append(report.Lines, line)
+		}
+		report.Repos = append(report.Repos, row)
+	}
+	if !opts.DryRun {
+		if err := s.writeAgents(spacePath, manifest); err != nil {
+			return SyncReport{}, err
 		}
 	}
-	if opts.DryRun {
-		return nil
+	if s.onSyncReport != nil {
+		s.onSyncReport(report)
 	}
-	return s.writeAgents(spacePath, manifest)
+	return report, nil
 }
 
 func (s Service) Status(ctx context.Context, spaceID string) (Status, error) {

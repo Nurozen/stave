@@ -192,35 +192,52 @@ func sagaMutationPayload(svc space.Service, sagaID string, sink *outputSink, pri
 }
 
 // sagaTeardownJSON is the success shape of saga archive/destroy: one row per
-// member in teardown order mirroring what the human walk reported.
+// member in teardown order mirroring what the human walk reported, plus the
+// saga space's own live root and (archive) destination.
 type sagaTeardownJSON struct {
 	SagaID  string                 `json:"sagaId"`
 	Action  string                 `json:"action"`
 	Memory  string                 `json:"memory"`
 	Members []sagaMemberResultJSON `json:"members"`
 	Notes   []string               `json:"notes,omitempty"`
+	// SagaPath is the saga space's live root before teardown.
+	SagaPath string `json:"sagaPath"`
+	// SagaArchivedPath is the saga space's .archive/ destination (archive only).
+	SagaArchivedPath string `json:"sagaArchivedPath,omitempty"`
 }
 
+// sagaMemberResultJSON is one member's outcome. Path is the member's live
+// root (where it lived before teardown, or would live for a skipped member);
+// ArchivedPath is set for members archived this run and for skipped members
+// that were already archived.
 type sagaMemberResultJSON struct {
-	ID     string `json:"id"`
-	Action string `json:"action"`
-	Note   string `json:"note,omitempty"`
+	ID           string `json:"id"`
+	Action       string `json:"action"`
+	Note         string `json:"note,omitempty"`
+	Path         string `json:"path"`
+	ArchivedPath string `json:"archivedPath,omitempty"`
 }
 
 // sagaTeardownMembers translates the pre-operation member states into the
-// per-member outcome of a completed walk: live members took the verb,
-// archived and missing members were skipped with the human walk's reason.
-func sagaTeardownMembers(states []space.SagaMemberState, destroy bool) []sagaMemberResultJSON {
+// per-member outcome of a completed walk: live members took the verb (their
+// paths come from the walk's report), archived and missing members were
+// skipped with the human walk's reason.
+func sagaTeardownMembers(svc space.Service, states []space.SagaMemberState, report space.SagaTeardownReport, destroy bool) []sagaMemberResultJSON {
 	done := "archived"
 	if destroy {
 		done = "destroyed"
 	}
+	steps := make(map[string]space.SagaTeardownStep, len(report.Completed))
+	for _, step := range report.Completed {
+		steps[step.ID] = step
+	}
 	members := make([]sagaMemberResultJSON, 0, len(states))
 	for _, state := range states {
-		row := sagaMemberResultJSON{ID: state.ID, Action: done}
+		row := sagaMemberResultJSON{ID: state.ID, Action: done, Path: svc.SpacePath(state.ID)}
 		switch state.State {
 		case space.MemberArchived:
 			row.Action = "skipped"
+			row.ArchivedPath = state.Detail
 			if destroy {
 				row.Note = fmt.Sprintf("archived at %s; destroy leaves archives in place", state.Detail)
 			} else {
@@ -229,6 +246,11 @@ func sagaTeardownMembers(states []space.SagaMemberState, destroy bool) []sagaMem
 		case space.MemberMissing:
 			row.Action = "skipped"
 			row.Note = "missing"
+		default:
+			if step, ok := steps[state.ID]; ok {
+				row.Path = step.Path
+				row.ArchivedPath = step.ArchivedPath
+			}
 		}
 		members = append(members, row)
 	}

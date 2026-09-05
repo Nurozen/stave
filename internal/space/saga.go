@@ -525,8 +525,18 @@ type SagaDestroyOptions struct {
 // so retries converge; a corrupt member aborts up front; dirty edit worktrees
 // across ALL live members refuse before any teardown (--force overrides).
 func (s Service) SagaArchive(ctx context.Context, sagaID string, opts SagaArchiveOptions) error {
+	_, err := s.SagaArchiveWithReport(ctx, sagaID, opts)
+	return err
+}
+
+// SagaArchiveWithReport is SagaArchive returning the walk's
+// SagaTeardownReport: on success the report lists every member archived this
+// run with its live and archived paths plus the saga space's own destination;
+// on a teardown-step failure the error is a *SagaTeardownError carrying the
+// partial report (guard refusals and preflight errors return unwrapped).
+func (s Service) SagaArchiveWithReport(ctx context.Context, sagaID string, opts SagaArchiveOptions) (SagaTeardownReport, error) {
 	if opts.MemoryFate == memory.FateDestroy {
-		return fmt.Errorf("archive does not destroy memory; use 'stave saga destroy --memory destroy' instead")
+		return SagaTeardownReport{}, fmt.Errorf("archive does not destroy memory; use 'stave saga destroy --memory destroy' instead")
 	}
 	return s.sagaTeardown(ctx, sagaID, sagaTeardownSpec{
 		verb:   "archive",
@@ -543,6 +553,14 @@ func (s Service) SagaArchive(ctx context.Context, sagaID string, opts SagaArchiv
 // paths and never auto-removed. A den-destroying fate refuses while any
 // non-member space still shares the saga den (--force overrides).
 func (s Service) SagaDestroy(ctx context.Context, sagaID string, opts SagaDestroyOptions) error {
+	_, err := s.SagaDestroyWithReport(ctx, sagaID, opts)
+	return err
+}
+
+// SagaDestroyWithReport is SagaDestroy returning the walk's
+// SagaTeardownReport (see SagaArchiveWithReport for the success/failure
+// contract; destroy steps carry no archived path).
+func (s Service) SagaDestroyWithReport(ctx context.Context, sagaID string, opts SagaDestroyOptions) (SagaTeardownReport, error) {
 	return s.sagaTeardown(ctx, sagaID, sagaTeardownSpec{
 		verb:    "destroy",
 		past:    "destroyed",
@@ -566,23 +584,38 @@ type sagaTeardownSpec struct {
 // sagaTeardown acquires the membership + per-saga locks for the WHOLE
 // operation — lifecycle mutates cross-saga-visible state (members leave
 // ListSpaces, stacked-base ownership changes) — and runs the walk inside.
-func (s Service) sagaTeardown(ctx context.Context, sagaID string, spec sagaTeardownSpec) error {
+func (s Service) sagaTeardown(ctx context.Context, sagaID string, spec sagaTeardownSpec) (SagaTeardownReport, error) {
 	sagaPath, err := s.resolveSpacePath(sagaID)
 	if err != nil {
-		return err
+		return SagaTeardownReport{}, err
 	}
-	return s.withMembershipLock(func() error {
+	report := SagaTeardownReport{SagaID: sagaID, SagaPath: sagaPath, Verb: spec.verb}
+	err = s.withMembershipLock(func() error {
 		return s.withSagaLock(sagaID, func() error {
-			return s.sagaTeardownLocked(ctx, sagaID, sagaPath, spec)
+			return s.sagaTeardownLocked(ctx, sagaID, sagaPath, spec, &report)
 		})
 	})
+	return report, err
+}
+
+// failTeardownStep records where the walk stopped and wraps cause with the
+// partial report so machine consumers can reconcile completed steps.
+func failTeardownStep(report *SagaTeardownReport, failedAt, failedMember string, cause error) error {
+	report.FailedAt = failedAt
+	report.FailedMember = failedMember
+	return &SagaTeardownError{Report: *report, Cause: cause}
 }
 
 // sagaTeardownLocked is the walk body, entered with both locks held: resolve
 // all member states, fail fast on guards, then tear members down in reverse
 // topological order with the saga space last. Same-operation members are
 // exempted from the dependent-base guard; external dependents still refuse.
-func (s Service) sagaTeardownLocked(ctx context.Context, sagaID, sagaPath string, spec sagaTeardownSpec) error {
+//
+// report is filled in as steps complete: each live member torn down appends a
+// SagaTeardownStep, and the saga space's own step sets SagaTornDown (and
+// SagaArchivedPath for archive). A failing step returns a *SagaTeardownError
+// wrapping the cause with the report so far.
+func (s Service) sagaTeardownLocked(ctx context.Context, sagaID, sagaPath string, spec sagaTeardownSpec, report *SagaTeardownReport) error {
 	manifest, err := LoadManifest(sagaPath)
 	if err != nil {
 		return err
@@ -681,7 +714,7 @@ func (s Service) sagaTeardownLocked(ctx context.Context, sagaID, sagaPath string
 	if denFirst {
 		if err := s.detachMemoryLocked(ctx, sagaPath, sagaID, den.Name, spec.fate, spec.force, spec.dryRun); err != nil {
 			s.reportSagaTeardownFailure(sagaID, spec, "the saga den", nil)
-			return fmt.Errorf("saga %s: %w", spec.verb, err)
+			return failTeardownStep(report, "den", "", fmt.Errorf("saga %s: %w", spec.verb, err))
 		}
 	}
 	teardown := func(id string, fate memory.MemoryFate, skipStoreID string) error {
@@ -710,11 +743,20 @@ func (s Service) sagaTeardownLocked(ctx context.Context, sagaID, sagaPath string
 			s.printf("skipping member %s: missing\n", p.ID)
 			continue
 		}
+		memberPath := s.SpacePath(p.ID)
+		archivesBefore := s.archiveEntriesFor(p.ID)
 		if err := teardown(p.ID, "", ""); err != nil {
 			s.reportSagaTeardownFailure(sagaID, spec, "member "+p.ID, completed)
-			return fmt.Errorf("saga %s: member %s: %w", spec.verb, p.ID, err)
+			return failTeardownStep(report, "member", p.ID, fmt.Errorf("saga %s: member %s: %w", spec.verb, p.ID, err))
 		}
 		completed = append(completed, p.ID)
+		if !spec.dryRun {
+			step := SagaTeardownStep{ID: p.ID, Action: spec.past, Path: memberPath}
+			if !spec.destroy {
+				step.ArchivedPath = s.newArchiveEntry(p.ID, archivesBefore)
+			}
+			report.Completed = append(report.Completed, step)
+		}
 	}
 	// The saga space itself, last: references only, memory fate applies to
 	// the saga den (the window-guard is CLI-layer, so no interference here).
@@ -726,9 +768,16 @@ func (s Service) sagaTeardownLocked(ctx context.Context, sagaID, sagaPath string
 	if denFirst {
 		denSkip = den.ID
 	}
+	sagaArchivesBefore := s.archiveEntriesFor(sagaID)
 	if err := teardown(sagaID, spec.fate, denSkip); err != nil {
 		s.reportSagaTeardownFailure(sagaID, spec, "the saga space", completed)
-		return fmt.Errorf("saga %s: %w", spec.verb, err)
+		return failTeardownStep(report, "saga", sagaID, fmt.Errorf("saga %s: %w", spec.verb, err))
+	}
+	if !spec.dryRun {
+		report.SagaTornDown = true
+		if !spec.destroy {
+			report.SagaArchivedPath = s.newArchiveEntry(sagaID, sagaArchivesBefore)
+		}
 	}
 	return nil
 }
@@ -830,10 +879,14 @@ func (s Service) ensureSagaDenUnshared(sagaID string, manifest Manifest) error {
 // its kind and saga-membership join.
 type SagaListEntry struct {
 	ID string
-	// Path is the space directory. The CLI does not currently render it;
-	// reserved for machine consumers and future output modes.
+	// Path is the space directory. The human CLI does not render it; --json
+	// rows carry it for machine consumers.
 	Path string
-	Kind string
+	// LogicalID is the manifest's id (empty when Err is set). ID is the
+	// directory name; the two agree for live spaces but LogicalID is what a
+	// host should key identity on (with the manifest's createdAt).
+	LogicalID string
+	Kind      string
 	// IsSaga mirrors the single saga predicate (manifest.Saga != nil).
 	IsSaga bool
 	// Members is the roster in manifest order (saga rows only).
@@ -868,6 +921,7 @@ func (s Service) SagaList() ([]SagaListEntry, error) {
 	for _, entry := range spaces {
 		row := SagaListEntry{ID: entry.ID, Path: entry.Path, MemberOf: memberOf[entry.ID], Err: entry.Err}
 		if entry.Err == nil {
+			row.LogicalID = entry.Manifest.ID
 			row.Kind = entry.Manifest.Kind
 			if entry.Manifest.Saga != nil {
 				row.IsSaga = true

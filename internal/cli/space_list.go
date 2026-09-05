@@ -10,6 +10,12 @@ import (
 
 // spaceListRow is the typed `space list --json` row: one space (live or, with
 // --archived, one archive entry) with its manifest summary and saga join.
+//
+// Identity for hosts is (logicalId, manifestCreatedAt): `id` is the DIRECTORY
+// name (for archived rows the archive basename, e.g. "t1-20260903120000"),
+// `createdAt` is the legacy whole-second stamp, while `logicalId` is the
+// manifest's own id and `manifestCreatedAt` keeps the manifest's full
+// fractional precision so it compares equal to the stamp in .stave.yaml.
 type spaceListRow struct {
 	ID        string              `json:"id"`
 	Path      string              `json:"path"`
@@ -20,6 +26,17 @@ type spaceListRow struct {
 	Repos     []spaceListRepoJSON `json:"repos"`
 	Archived  bool                `json:"archived,omitempty"`
 	Error     string              `json:"error,omitempty"`
+	// LogicalID is the manifest id; null on error rows (no manifest to read).
+	LogicalID *string `json:"logicalId"`
+	// ArchiveBasename is the .archive/ directory name (archived rows only).
+	ArchiveBasename string `json:"archiveBasename,omitempty"`
+	// ManifestCreatedAt is the manifest stamp in RFC3339Nano (UTC); omitted
+	// when the manifest carries no stamp or could not be read.
+	ManifestCreatedAt string `json:"manifestCreatedAt,omitempty"`
+	// ManifestVersion is the .stave.yaml schema version (0 = pre-version or
+	// unreadable).
+	ManifestVersion int                   `json:"manifestVersion"`
+	Memories        []spaceListMemoryJSON `json:"memories"`
 }
 
 // spaceListRepoJSON is the per-repo summary carried by a `space list --json`
@@ -27,6 +44,15 @@ type spaceListRow struct {
 type spaceListRepoJSON struct {
 	Name string         `json:"name"`
 	Mode space.RepoMode `json:"mode"`
+}
+
+// spaceListMemoryJSON is one manifest memory attachment as `space list --json`
+// carries it (the same fields the manifest records).
+type spaceListMemoryJSON struct {
+	Name     string `json:"name"`
+	Provider string `json:"provider"`
+	ID       string `json:"id"`
+	Owned    bool   `json:"owned"`
 }
 
 func (a *app) listCommand() *cobra.Command {
@@ -105,24 +131,32 @@ func archivedSpaceListRows(svc space.Service) ([]spaceListRow, error) {
 	for _, entry := range archives {
 		row := spaceListRowFrom(entry.ID, entry.Path, entry.Manifest, entry.Err)
 		row.Archived = true
+		row.ArchiveBasename = entry.ID
 		rows = append(rows, row)
 	}
 	return rows, nil
 }
 
 func spaceListRowFrom(id, path string, manifest *space.Manifest, err error) spaceListRow {
-	row := spaceListRow{ID: id, Path: path, Repos: []spaceListRepoJSON{}}
+	row := spaceListRow{ID: id, Path: path, Repos: []spaceListRepoJSON{}, Memories: []spaceListMemoryJSON{}}
 	if err != nil {
 		row.Error = err.Error()
 		return row
 	}
+	logicalID := manifest.ID
+	row.LogicalID = &logicalID
+	row.ManifestVersion = manifest.Version
 	row.Kind = manifest.Kind
 	if !manifest.CreatedAt.IsZero() {
 		row.CreatedAt = manifest.CreatedAt.UTC().Format(time.RFC3339)
+		row.ManifestCreatedAt = manifest.CreatedAt.UTC().Format(time.RFC3339Nano)
 	}
 	row.IsSaga = manifest.Saga != nil
 	for _, repo := range manifest.Repos {
 		row.Repos = append(row.Repos, spaceListRepoJSON{Name: repo.Name, Mode: repo.Mode})
+	}
+	for _, mem := range manifest.Memories {
+		row.Memories = append(row.Memories, spaceListMemoryJSON{Name: mem.Name, Provider: mem.Provider, ID: mem.ID, Owned: mem.Owned})
 	}
 	return row
 }

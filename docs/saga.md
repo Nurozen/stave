@@ -17,7 +17,12 @@ awareness, and their operational caveats. For command-by-command usage see the
 
 `stave saga status <saga-id> --json` emits one `SagaStatus` object (defined in
 `internal/space/saga_status.go`). The shape is **frozen**: fields are additive
-only; existing fields never change name, type, or meaning.
+only; existing fields never change name, type, or meaning. The freeze applies
+to `saga status` alone — the other `--json` surfaces (`saga list`, `saga
+archive|destroy`, `space list`) are additive-compatible but evolve; their
+current shapes are documented in the README's
+[Machine-readable output](../README.md#machine-readable-output) and, for the
+lifecycle verbs, [below](#machine-readable-lifecycle-output).
 
 Top level (`SagaStatus`):
 
@@ -285,6 +290,50 @@ saga space — without changing state, followed by the provider's real dry-run
 command lines for the den. One caveat: a destroying-fate dry-run **cannot
 predict a live-serve refusal** — marmot's dry-run returns before lock
 acquisition, while the real run fails fast before any member teardown.
+
+### Machine-readable lifecycle output
+
+`saga archive|destroy <saga-id> --json` emits, on success:
+
+```json
+{ "sagaId": "epic-js", "action": "archived", "memory": "keep",
+  "sagaPath": "/…/agent-work/epic-js",
+  "sagaArchivedPath": "/…/agent-work/.archive/epic-js",
+  "members": [
+    { "id": "js-2", "action": "archived", "path": "/…/agent-work/js-2", "archivedPath": "/…/agent-work/.archive/js-2" },
+    { "id": "js-1", "action": "archived", "path": "/…/agent-work/js-1", "archivedPath": "/…/agent-work/.archive/js-1" },
+    { "id": "js-0", "action": "skipped", "note": "already archived at /…/.archive/js-0", "path": "/…/agent-work/js-0", "archivedPath": "/…/agent-work/.archive/js-0" }
+  ],
+  "notes": ["archived js-2 to …", "…"] }
+```
+
+Members appear in teardown order. `path` is the member's live root before the
+step (for a skipped member, where it would live); `archivedPath` is the
+`.archive/` destination for members archived this run and the existing archive
+for skipped already-archived members; `sagaArchivedPath` is the saga space's
+own destination. Destroy rows and the destroy payload omit the archived paths.
+`saga list --json` rows carry `path` and `logicalId` for the same reason.
+
+On a **mid-walk failure** the error envelope's `details` merge the cause's own
+details with the walk's progress:
+
+```json
+{ "error": { "code": "unknown", "message": "saga archive: member js-1: …",
+  "details": {
+    "completed": [{ "id": "js-2", "action": "archived", "path": "/…/agent-work/js-2", "archivedPath": "/…/agent-work/.archive/js-2" }],
+    "failedAt": "member",
+    "failedMember": "js-1" } } }
+```
+
+`completed` is always present (an empty array when the failure hit before any
+member was torn down) and lists steps in walk order; `failedAt` is `member`,
+`saga` (the saga space's own final step, `failedMember` = the saga id) or
+`den` (den-first destroy refused; no `failedMember`). Preflight guard refusals
+are not wrapped: they carry only their usual `code`/`details` because nothing
+was torn down. In Go the same information is `space.SagaTeardownReport`,
+returned by `SagaArchiveWithReport`/`SagaDestroyWithReport` and carried by the
+`*space.SagaTeardownError` those return on a step failure (`errors.As` still
+reaches the underlying coded error through `Unwrap`).
 
 ## The agent planner and sagas
 

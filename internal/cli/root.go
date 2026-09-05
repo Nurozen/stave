@@ -79,6 +79,7 @@ func newRootCommand(a *app) *cobra.Command {
 		a.reposCommand(),
 		a.spaceCommand(),
 		a.memoryCommand(),
+		a.configCommand(),
 		a.portalCommand(),
 		a.agentCommand(),
 		a.summonCommand(),
@@ -157,24 +158,81 @@ func fromBuildInfo(bi *debug.BuildInfo) (v, c, d string) {
 }
 
 func (a *app) setupCommand() *cobra.Command {
-	return &cobra.Command{
+	var force bool
+	var jsonOut bool
+	cmd := &cobra.Command{
 		Use:   "setup",
 		Short: "Create the Stave root directories and config file",
+		Long: `Create the Stave root directories and write the config file.
+
+An existing config file is never rewritten unless --force is given, so a
+host that re-runs setup cannot discard edited settings by accident.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, path, err := config.Load(a.configPath)
-			if err != nil {
-				return err
-			}
-			if err := cfg.EnsureRootDirs(); err != nil {
-				return err
-			}
-			if err := cfg.Save(path); err != nil {
-				return err
-			}
-			fmt.Fprintf(cmd.OutOrStdout(), "initialized stave root at %s\nconfig: %s\n", cfg.Root, path)
-			return nil
+			return runJSON(cmd, jsonOut, func() (any, error) {
+				cfg, path, err := config.Load(a.configPath)
+				if err != nil {
+					return nil, err
+				}
+				configExisted, err := pathExists(path)
+				if err != nil {
+					return nil, err
+				}
+				if configExisted && !force {
+					return nil, &space.ConfigExistsError{Path: path}
+				}
+				created, existed := []string{}, []string{}
+				for _, candidate := range []string{cfg.Root, cfg.BareReposDir, cfg.AgentWorkDir} {
+					exists, err := pathExists(candidate)
+					if err != nil {
+						return nil, err
+					}
+					if exists {
+						existed = append(existed, candidate)
+					} else {
+						created = append(created, candidate)
+					}
+				}
+				if configExisted {
+					existed = append(existed, path)
+				} else {
+					created = append(created, path)
+				}
+				if err := cfg.EnsureRootDirs(); err != nil {
+					return nil, err
+				}
+				if err := cfg.Save(path); err != nil {
+					return nil, err
+				}
+				if jsonOut {
+					return setupJSON{
+						ConfigPath:   path,
+						Root:         cfg.Root,
+						BareReposDir: cfg.BareReposDir,
+						AgentWorkDir: cfg.AgentWorkDir,
+						Created:      created,
+						Existed:      existed,
+					}, nil
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "initialized stave root at %s\nconfig: %s\n", cfg.Root, path)
+				return nil, nil
+			})
 		},
 	}
+	cmd.Flags().BoolVar(&force, "force", false, "rewrite an existing config file (it is refused otherwise)")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON (result on success, {\"error\": {code, message}} on failure; exit 1)")
+	return cmd
+}
+
+// pathExists reports whether path exists; errors other than not-exist
+// propagate.
+func pathExists(path string) (bool, error) {
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // groupCommand builds a subcommand container that rejects unknown
@@ -211,6 +269,7 @@ func (a *app) reposCommand() *cobra.Command {
 func (a *app) reposAddCommand() *cobra.Command {
 	var dryRun bool
 	var adopt bool
+	var jsonOut bool
 	cmd := &cobra.Command{
 		Use:   "add <name> <url>",
 		Short: "Clone and register a bare repository (or adopt an existing cache)",
@@ -229,88 +288,120 @@ remote-tracking refs, origin/HEAD, default branch); pre-existing local
 branches in the cache are left as-is.`,
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, path, err := a.loadConfig()
-			if err != nil {
-				return err
-			}
-			name, url := args[0], args[1]
-			if _, exists := cfg.Repos[name]; exists {
-				return fmt.Errorf("repo %q is already registered", name)
-			}
-			if dryRun {
-				fmt.Fprintf(cmd.OutOrStdout(), "dry-run: create %s\n", cfg.Root)
-				fmt.Fprintf(cmd.OutOrStdout(), "dry-run: create %s\n", cfg.BareReposDir)
-				fmt.Fprintf(cmd.OutOrStdout(), "dry-run: create %s\n", cfg.AgentWorkDir)
-			} else {
-				if err := cfg.EnsureRootDirs(); err != nil {
-					return err
+			return runJSON(cmd, jsonOut, func() (any, error) {
+				// The clone/adopt helpers print their notes to the command's
+				// stdout/stderr; --json routes both into the sink for the
+				// duration of the run so they become notes (or the dry-run
+				// plan) instead of prose beside the payload.
+				sink := newOutputSink(cmd, jsonOut)
+				if jsonOut {
+					stdout, stderr := cmd.OutOrStdout(), cmd.ErrOrStderr()
+					cmd.SetOut(sink.Writer())
+					cmd.SetErr(sink.Writer())
+					defer func() {
+						cmd.SetOut(stdout)
+						cmd.SetErr(stderr)
+					}()
 				}
-			}
-			repo, err := cfg.RegisterRepository(name, url, "")
-			if err != nil {
-				return err
-			}
-			// A plain dry-run skips the collision stat so the plan prints even
-			// over a stale cache; --adopt needs the answer to say whether it
-			// would adopt or clone.
-			existing := false
-			if adopt || !dryRun {
-				if _, err := os.Stat(repo.BareRepoPath); err == nil {
-					existing = true
-				} else if !os.IsNotExist(err) {
-					return err
-				}
-			}
-			if existing && !adopt {
-				return fmt.Errorf("bare repo path already exists: %s; run '%s' to reuse it, or delete it to re-clone", repo.BareRepoPath, adoptRetryHint(name, url))
-			}
-			client := git.New(git.WithDryRun(dryRun, func(format string, args ...any) {
-				fmt.Fprintf(cmd.OutOrStdout(), format+"\n", args...)
-			}))
-			ctx := cmd.Context()
-			var adopted adoption
-			if existing {
-				adopted, err = adoptBareRepo(ctx, cmd, client, repo.BareRepoPath, name, url, dryRun)
+				out := cmd.OutOrStdout()
+				cfg, path, err := a.loadConfig()
 				if err != nil {
+					return nil, err
+				}
+				name, url := args[0], args[1]
+				if _, exists := cfg.Repos[name]; exists {
+					return nil, &space.RepoExistsError{Repo: name}
+				}
+				if dryRun {
+					fmt.Fprintf(out, "dry-run: create %s\n", cfg.Root)
+					fmt.Fprintf(out, "dry-run: create %s\n", cfg.BareReposDir)
+					fmt.Fprintf(out, "dry-run: create %s\n", cfg.AgentWorkDir)
+				} else {
+					if err := cfg.EnsureRootDirs(); err != nil {
+						return nil, err
+					}
+				}
+				repo, err := cfg.RegisterRepository(name, url, "")
+				if err != nil {
+					return nil, err
+				}
+				// A plain dry-run skips the collision stat so the plan prints even
+				// over a stale cache; --adopt needs the answer to say whether it
+				// would adopt or clone.
+				existing := false
+				if adopt || !dryRun {
+					if _, err := os.Stat(repo.BareRepoPath); err == nil {
+						existing = true
+					} else if !os.IsNotExist(err) {
+						return nil, err
+					}
+				}
+				if existing && !adopt {
+					return nil, &space.CacheExistsError{Repo: name, Path: repo.BareRepoPath, RetryHint: adoptRetryHint(name, url)}
+				}
+				client := git.New(git.WithDryRun(dryRun, func(format string, args ...any) {
+					fmt.Fprintf(out, format+"\n", args...)
+				}))
+				ctx := cmd.Context()
+				var adopted adoption
+				if existing {
+					adopted, err = adoptBareRepo(ctx, cmd, client, repo.BareRepoPath, name, url, dryRun)
+					if err != nil {
+						return nil, err
+					}
+				} else if err := cloneBareFresh(ctx, client, url, repo.BareRepoPath, dryRun); err != nil {
+					return nil, &space.CloneFailedError{Repo: name, Err: err}
+				}
+				// Past this point the cache on disk is real. A failure must not
+				// leave an adopted cache pointing at a URL (or carrying a fetch
+				// refspec) for a registration that never happened, and must tell
+				// the user a fresh clone survived. The rollback runs under a
+				// context that ignores cancellation: an interrupt is a likely
+				// cause of the failure and must not also skip the cleanup.
+				failAfterCache := func(err error) error {
+					switch {
+					case existing && !dryRun:
+						return restoreAdoption(context.WithoutCancel(ctx), client, repo.BareRepoPath, adopted, err)
+					case !existing && !dryRun:
+						return fmt.Errorf("%w; the clone was kept at %s — retry with '%s'", err, shellQuote(repo.BareRepoPath), adoptRetryHint(name, url))
+					}
 					return err
 				}
-			} else if err := cloneBareFresh(ctx, client, url, repo.BareRepoPath, dryRun); err != nil {
-				return fmt.Errorf("clone %q: %w", name, err)
-			}
-			// Past this point the cache on disk is real. A failure must not
-			// leave an adopted cache pointing at a URL (or carrying a fetch
-			// refspec) for a registration that never happened, and must tell
-			// the user a fresh clone survived. The rollback runs under a
-			// context that ignores cancellation: an interrupt is a likely
-			// cause of the failure and must not also skip the cleanup.
-			failAfterCache := func(err error) error {
-				switch {
-				case existing && !dryRun:
-					return restoreAdoption(context.WithoutCancel(ctx), client, repo.BareRepoPath, adopted, err)
-				case !existing && !dryRun:
-					return fmt.Errorf("%w; the clone was kept at %s — retry with '%s'", err, shellQuote(repo.BareRepoPath), adoptRetryHint(name, url))
+				branch, err := finalizeBareMirror(ctx, cmd, client, name, repo.BareRepoPath, "", cfg.DefaultBase, true, dryRun)
+				if err != nil {
+					return nil, failAfterCache(err)
 				}
-				return err
-			}
-			branch, err := finalizeBareMirror(ctx, cmd, client, name, repo.BareRepoPath, "", cfg.DefaultBase, true, dryRun)
-			if err != nil {
-				return failAfterCache(err)
-			}
-			if branch != "" {
-				repo.DefaultBranch = branch
-				cfg.Repos[name] = repo
-			}
-			if !dryRun {
-				if err := cfg.Save(path); err != nil {
-					return failAfterCache(err)
+				if branch != "" {
+					repo.DefaultBranch = branch
+					cfg.Repos[name] = repo
 				}
-			}
-			fmt.Fprintf(cmd.OutOrStdout(), "registered %s at %s\n", name, repo.BareRepoPath)
-			return nil
+				if !dryRun {
+					if err := cfg.Save(path); err != nil {
+						return nil, failAfterCache(err)
+					}
+				}
+				registered := fmt.Sprintf("registered %s at %s", name, repo.BareRepoPath)
+				fmt.Fprintln(out, registered)
+				if !jsonOut {
+					return nil, nil
+				}
+				if dryRun {
+					return dryRunPayload(sink), nil
+				}
+				return reposAddJSON{
+					Name:          name,
+					URL:           url,
+					BareRepoPath:  repo.BareRepoPath,
+					DefaultBranch: repo.DefaultBranch,
+					Adopted:       existing,
+					Notes:         sink.Notes(registered),
+				}, nil
+			})
 		},
 	}
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print operations without changing state")
 	cmd.Flags().BoolVar(&adopt, "adopt", false, "reuse an existing bare repo cache at the derived path if it is a clone of the same repository; it reaches the same state stave relies on (origin URL, tracking refspec, remote-tracking refs, origin/HEAD, default branch) and pre-existing local branches are left as-is")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON (result on success, {\"error\": {code, message}} on failure; exit 1)")
 	return cmd
 }
 
@@ -1020,23 +1111,34 @@ func (a *app) spaceCommand() *cobra.Command {
 func (a *app) initCommand() *cobra.Command {
 	var kind string
 	var spec string
+	var jsonOut bool
 	cmd := &cobra.Command{
 		Use:   "init <space-id>",
 		Short: "Create an empty agent workspace",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if kind == space.KindSaga {
-				return fmt.Errorf("kind %q is reserved; use 'stave saga create'", space.KindSaga)
-			}
-			svc, err := a.service(cmd)
-			if err != nil {
-				return err
-			}
-			return svc.InitSpace(cmd.Context(), space.InitOptions{ID: args[0], Kind: kind, SpecPath: spec})
+			return runJSON(cmd, jsonOut, func() (any, error) {
+				if kind == space.KindSaga {
+					return nil, argErrorf("kind %q is reserved; use 'stave saga create'", space.KindSaga)
+				}
+				sink := newOutputSink(cmd, jsonOut)
+				svc, err := a.serviceWithOutput(cmd, false, sink.Writer())
+				if err != nil {
+					return nil, err
+				}
+				if err := svc.InitSpace(cmd.Context(), space.InitOptions{ID: args[0], Kind: kind, SpecPath: spec}); err != nil {
+					return nil, err
+				}
+				if !jsonOut {
+					return nil, nil
+				}
+				return spaceMutationPayload(svc, args[0], sink, fmt.Sprintf("created space %s at %s", args[0], svc.SpacePath(args[0])))
+			})
 		},
 	}
 	cmd.Flags().StringVarP(&kind, "kind", "k", "", "space kind, such as ticket, spike, or audit")
 	cmd.Flags().StringVarP(&spec, "spec", "s", "", "path to a spec file or directory to copy into the space")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON (result on success, {\"error\": {code, message}} on failure; exit 1)")
 	return cmd
 }
 
@@ -2010,19 +2112,31 @@ func (a *app) addCommand() *cobra.Command {
 
 func (a *app) syncCommand() *cobra.Command {
 	var referencesOnly bool
+	var jsonOut bool
 	cmd := &cobra.Command{
 		Use:   "sync <space-id>",
 		Short: "Fetch a space's repos, update references, and report editable drift",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			svc, err := a.service(cmd)
-			if err != nil {
-				return err
-			}
-			return svc.Sync(cmd.Context(), space.SyncOptions{SpaceID: args[0], ReferencesOnly: referencesOnly})
+			return runJSON(cmd, jsonOut, func() (any, error) {
+				sink := newOutputSink(cmd, jsonOut)
+				svc, err := a.serviceWithOutput(cmd, false, sink.Writer())
+				if err != nil {
+					return nil, err
+				}
+				report, err := svc.SyncWithReport(cmd.Context(), space.SyncOptions{SpaceID: args[0], ReferencesOnly: referencesOnly})
+				if err != nil {
+					return nil, err
+				}
+				if !jsonOut {
+					return nil, nil
+				}
+				return spaceSyncPayload(report, sink), nil
+			})
 		},
 	}
 	cmd.Flags().BoolVar(&referencesOnly, "references-only", false, "only sync reference worktrees")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON (result on success, {\"error\": {code, message}} on failure; exit 1)")
 	return cmd
 }
 
@@ -2030,27 +2144,41 @@ func (a *app) retargetCommand() *cobra.Command {
 	var repoName string
 	var base string
 	var dryRun bool
+	var jsonOut bool
 	cmd := &cobra.Command{
 		Use:   "retarget <space-id>",
 		Short: "Update the base ref an edit repo reports drift against",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if repoName == "" {
-				return fmt.Errorf("--repo is required")
-			}
-			if base == "" {
-				return fmt.Errorf("--base is required")
-			}
-			svc, err := a.serviceWithDryRun(cmd, dryRun)
-			if err != nil {
-				return err
-			}
-			return svc.Retarget(cmd.Context(), args[0], repoName, base, dryRun)
+			return runJSON(cmd, jsonOut, func() (any, error) {
+				if repoName == "" {
+					return nil, argErrorf("--repo is required")
+				}
+				if base == "" {
+					return nil, argErrorf("--base is required")
+				}
+				sink := newOutputSink(cmd, jsonOut)
+				svc, err := a.serviceWithOutput(cmd, dryRun, sink.Writer())
+				if err != nil {
+					return nil, err
+				}
+				if err := svc.Retarget(cmd.Context(), args[0], repoName, base, dryRun); err != nil {
+					return nil, err
+				}
+				if !jsonOut {
+					return nil, nil
+				}
+				if dryRun {
+					return dryRunPayload(sink), nil
+				}
+				return spaceRetargetPayload(svc, args[0], repoName, sink)
+			})
 		},
 	}
 	cmd.Flags().StringVar(&repoName, "repo", "", "edit repo whose recorded base to update")
 	cmd.Flags().StringVarP(&base, "base", "b", "", "new base ref; base may be space:<id> to stack on that space's branch")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print operations without changing state")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON (result on success, {\"error\": {code, message}} on failure; exit 1)")
 	return cmd
 }
 
@@ -2307,41 +2435,49 @@ func (a *app) memoryCommand() *cobra.Command {
 }
 
 func (a *app) memoryProvidersCommand() *cobra.Command {
-	return &cobra.Command{
+	var jsonOut bool
+	cmd := &cobra.Command{
 		Use:   "providers",
 		Short: "List registered memory providers and capability-probe results",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, _, err := a.loadConfig()
-			if err != nil {
-				return err
-			}
-			mc := cfg.Memory
-			mc.ApplyDefaults()
-			for _, name := range memory.Names() {
-				prov, err := memory.Lookup(name, mc)
+			return runJSON(cmd, jsonOut, func() (any, error) {
+				cfg, _, err := a.loadConfig()
 				if err != nil {
-					fmt.Fprintf(cmd.OutOrStdout(), "%s\terror: %v\n", name, err)
-					continue
+					return nil, err
 				}
-				probe, probeErr := prov.Probe(cmd.Context())
-				status := "ok"
-				if probeErr != nil {
-					status = probeErr.Error()
-				} else if !probe.Capable {
-					status = probe.Message
-				} else if probe.Message != "" {
-					status = probe.Message
+				mc := cfg.Memory
+				mc.ApplyDefaults()
+				if jsonOut {
+					return memoryProvidersPayload(cmd.Context(), mc), nil
 				}
-				marker := ""
-				if name == mc.Provider {
-					marker = " (default)"
+				for _, name := range memory.Names() {
+					prov, err := memory.Lookup(name, mc)
+					if err != nil {
+						fmt.Fprintf(cmd.OutOrStdout(), "%s\terror: %v\n", name, err)
+						continue
+					}
+					probe, probeErr := prov.Probe(cmd.Context())
+					status := "ok"
+					if probeErr != nil {
+						status = probeErr.Error()
+					} else if !probe.Capable {
+						status = probe.Message
+					} else if probe.Message != "" {
+						status = probe.Message
+					}
+					marker := ""
+					if name == mc.Provider {
+						marker = " (default)"
+					}
+					fmt.Fprintf(cmd.OutOrStdout(), "%s%s\t%s\n", name, marker, status)
 				}
-				fmt.Fprintf(cmd.OutOrStdout(), "%s%s\t%s\n", name, marker, status)
-			}
-			return nil
+				return nil, nil
+			})
 		},
 	}
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON ([{name, binary, default, available, version, capabilities[], error}])")
+	return cmd
 }
 
 func (a *app) memoryAttachCommand() *cobra.Command {
@@ -2352,43 +2488,54 @@ func (a *app) memoryAttachCommand() *cobra.Command {
 	var linkRefs []string
 	var opts []string
 	var dryRun bool
-	var asJSON bool
+	var jsonOut bool
 	cmd := &cobra.Command{
 		Use:   "attach <space-id>",
 		Short: "Attach a memory store to a space (create task store or --use existing)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			svc, err := a.serviceWithDryRun(cmd, dryRun)
-			if err != nil {
-				return err
-			}
-			optMap := map[string]string{}
-			for _, raw := range opts {
-				k, v, ok := strings.Cut(raw, "=")
-				if !ok || k == "" {
-					return fmt.Errorf("invalid --opt %q (want k=v)", raw)
+			return runJSON(cmd, jsonOut, func() (any, error) {
+				optMap := map[string]string{}
+				for _, raw := range opts {
+					k, v, ok := strings.Cut(raw, "=")
+					if !ok || k == "" {
+						return nil, argErrorf("invalid --opt %q (want k=v)", raw)
+					}
+					optMap[k] = v
 				}
-				optMap[k] = v
-			}
-			err = svc.AttachMemory(cmd.Context(), space.AttachMemoryOptions{
-				SpaceID:  args[0],
-				Provider: provider,
-				UseID:    useID,
-				Name:     name,
-				EditRefs: editRefs,
-				LinkRefs: linkRefs,
-				Opts:     optMap,
-				DryRun:   dryRun,
-				Strict:   true,
+				sink := newOutputSink(cmd, jsonOut)
+				rec := &memory.Recording{}
+				svc, err := a.memoryJSONService(cmd, dryRun, sink, rec)
+				if err != nil {
+					return nil, err
+				}
+				var before []space.MemoryManifest
+				if jsonOut && !dryRun {
+					if manifest, err := space.LoadManifest(svc.SpacePath(args[0])); err == nil {
+						before = manifest.Memories
+					}
+				}
+				if err := svc.AttachMemory(cmd.Context(), space.AttachMemoryOptions{
+					SpaceID:  args[0],
+					Provider: provider,
+					UseID:    useID,
+					Name:     name,
+					EditRefs: editRefs,
+					LinkRefs: linkRefs,
+					Opts:     optMap,
+					DryRun:   dryRun,
+					Strict:   true,
+				}); err != nil {
+					return nil, err
+				}
+				if !jsonOut {
+					return nil, nil
+				}
+				if dryRun {
+					return dryRunPayload(sink), nil
+				}
+				return memoryAttachPayload(svc, args[0], before, rec, sink)
 			})
-			if err != nil {
-				return err
-			}
-			if asJSON && !dryRun {
-				// Minimal confirmation object for scripting.
-				fmt.Fprintf(cmd.OutOrStdout(), "{\"space_id\":%q,\"attached\":true}\n", args[0])
-			}
-			return nil
 		},
 	}
 	cmd.Flags().StringVar(&provider, "provider", "", "memory provider (default from config memory.provider)")
@@ -2398,90 +2545,164 @@ func (a *app) memoryAttachCommand() *cobra.Command {
 	cmd.Flags().StringArrayVar(&linkRefs, "link", nil, "provider link ref (repeatable, passed through)")
 	cmd.Flags().StringArrayVar(&opts, "opt", nil, "provider-specific k=v option (repeatable)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print exact provider commands without invoking them")
-	cmd.Flags().BoolVar(&asJSON, "json", false, "emit a JSON confirmation on success")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON (result on success, {\"error\": {code, message}} on failure; exit 1)")
 	return cmd
 }
 
 func (a *app) memoryStatusCommand() *cobra.Command {
-	return &cobra.Command{
+	var jsonOut bool
+	cmd := &cobra.Command{
 		Use:   "status <space-id> [alias]",
 		Short: "Show memory attachment status (provider, id, freshness)",
 		Args:  cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			svc, err := a.service(cmd)
-			if err != nil {
-				return err
-			}
-			alias := ""
-			if len(args) > 1 {
-				alias = args[1]
-			}
-			return svc.MemoryStatus(cmd.Context(), args[0], alias)
+			return runJSON(cmd, jsonOut, func() (any, error) {
+				alias := ""
+				if len(args) > 1 {
+					alias = args[1]
+				}
+				sink := newOutputSink(cmd, jsonOut)
+				rec := &memory.Recording{}
+				svc, err := a.memoryJSONService(cmd, false, sink, rec)
+				if err != nil {
+					return nil, err
+				}
+				if err := svc.MemoryStatus(cmd.Context(), args[0], alias); err != nil {
+					return nil, err
+				}
+				if !jsonOut {
+					return nil, nil
+				}
+				manifest, err := space.LoadManifest(svc.SpacePath(args[0]))
+				if err != nil {
+					return nil, err
+				}
+				mc := svc.Config.Memory
+				mc.ApplyDefaults()
+				lookup := func(provider string) error {
+					_, err := memory.Lookup(provider, mc)
+					return err
+				}
+				return memoryStatusPayload(args[0], memoryStatusTargets(manifest, alias), rec, lookup), nil
+			})
 		},
 	}
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON ({spaceId, attachments[{name, provider, id, owned, state?, links[]}]})")
+	return cmd
 }
 
 func (a *app) memoryListCommand() *cobra.Command {
-	return &cobra.Command{
+	var jsonOut bool
+	cmd := &cobra.Command{
 		Use:   "list [space-id]",
 		Short: "List memory attachments for a space or all spaces",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			svc, err := a.service(cmd)
-			if err != nil {
-				return err
-			}
-			spaceID := ""
-			if len(args) == 1 {
-				spaceID = args[0]
-			}
-			return svc.ListMemories(spaceID)
+			return runJSON(cmd, jsonOut, func() (any, error) {
+				svc, err := a.service(cmd)
+				if err != nil {
+					return nil, err
+				}
+				spaceID := ""
+				if len(args) == 1 {
+					spaceID = args[0]
+				}
+				if jsonOut {
+					return memoryListPayload(svc, spaceID)
+				}
+				return nil, svc.ListMemories(spaceID)
+			})
 		},
 	}
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON ([{spaceId, spacePath, attachments[]}])")
+	return cmd
 }
 
 func (a *app) memorySyncCommand() *cobra.Command {
 	var dryRun bool
+	var jsonOut bool
 	cmd := &cobra.Command{
 		Use:   "sync <space-id> [alias]",
 		Short: "Sync memory provider state (e.g. warren sync + skew re-report)",
 		Args:  cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			svc, err := a.serviceWithDryRun(cmd, dryRun)
-			if err != nil {
-				return err
-			}
-			alias := ""
-			if len(args) > 1 {
-				alias = args[1]
-			}
-			return svc.SyncMemory(cmd.Context(), args[0], alias, dryRun)
+			return runJSON(cmd, jsonOut, func() (any, error) {
+				alias := ""
+				if len(args) > 1 {
+					alias = args[1]
+				}
+				sink := newOutputSink(cmd, jsonOut)
+				rec := &memory.Recording{}
+				svc, err := a.memoryJSONService(cmd, dryRun, sink, rec)
+				if err != nil {
+					return nil, err
+				}
+				if err := svc.SyncMemory(cmd.Context(), args[0], alias, dryRun); err != nil {
+					return nil, err
+				}
+				if !jsonOut {
+					return nil, nil
+				}
+				if dryRun {
+					return dryRunPayload(sink), nil
+				}
+				return memorySyncPayload(args[0], memoryAliasFor(svc, args[0], alias), rec, sink), nil
+			})
 		},
 	}
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print operations without invoking the provider")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON ({spaceId, results[{alias, warren?, outcome, detail?}]})")
 	return cmd
 }
 
 func (a *app) memoryProposeCommand() *cobra.Command {
 	var dryRun bool
+	var jsonOut bool
 	cmd := &cobra.Command{
 		Use:   "propose <space-id> [alias]",
 		Short: "Flow task learnings back (den contribute + warren propose; never auto-pushes)",
 		Args:  cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			svc, err := a.serviceWithDryRun(cmd, dryRun)
-			if err != nil {
-				return err
-			}
-			alias := ""
-			if len(args) > 1 {
-				alias = args[1]
-			}
-			return svc.ProposeMemory(cmd.Context(), args[0], alias, dryRun)
+			return runJSON(cmd, jsonOut, func() (any, error) {
+				alias := ""
+				if len(args) > 1 {
+					alias = args[1]
+				}
+				sink := newOutputSink(cmd, jsonOut)
+				rec := &memory.Recording{}
+				svc, err := a.memoryJSONService(cmd, dryRun, sink, rec)
+				if err != nil {
+					return nil, err
+				}
+				if err := svc.ProposeMemory(cmd.Context(), args[0], alias, dryRun); err != nil {
+					return nil, err
+				}
+				if !jsonOut {
+					return nil, nil
+				}
+				if dryRun {
+					return dryRunPayload(sink), nil
+				}
+				return memoryProposePayload(args[0], memoryAliasFor(svc, args[0], alias), rec, sink), nil
+			})
 		},
 	}
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print contribute/propose commands without invoking them")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON ({spaceId, results[{alias, outcome, detail?, pushCommand?}]})")
 	return cmd
+}
+
+// memoryAliasFor resolves the attachment alias a sync/propose ran against:
+// the alias given, or the single attachment's name when none was.
+func memoryAliasFor(svc space.Service, spaceID, alias string) string {
+	manifest, err := space.LoadManifest(svc.SpacePath(spaceID))
+	if err != nil {
+		return alias
+	}
+	if mem, _, ok := manifest.FindMemory(alias); ok {
+		return mem.Name
+	}
+	return alias
 }
 
 func (a *app) memoryDetachCommand() *cobra.Command {
@@ -2489,33 +2710,53 @@ func (a *app) memoryDetachCommand() *cobra.Command {
 	var destroy bool
 	var force bool
 	var dryRun bool
+	var jsonOut bool
 	cmd := &cobra.Command{
 		Use:   "detach <space-id> [alias]",
 		Short: "Detach a memory attachment (--keep default, or --destroy)",
 		Args:  cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if keep && destroy {
-				return fmt.Errorf("specify only one of --keep or --destroy")
-			}
-			fate := memory.FateKeep
-			if destroy {
-				fate = memory.FateDestroy
-			}
-			svc, err := a.serviceWithDryRun(cmd, dryRun)
-			if err != nil {
-				return err
-			}
-			alias := ""
-			if len(args) > 1 {
-				alias = args[1]
-			}
-			return svc.DetachMemory(cmd.Context(), args[0], alias, fate, force, dryRun)
+			return runJSON(cmd, jsonOut, func() (any, error) {
+				if keep && destroy {
+					return nil, argErrorf("specify only one of --keep or --destroy")
+				}
+				fate := memory.FateKeep
+				if destroy {
+					fate = memory.FateDestroy
+				}
+				alias := ""
+				if len(args) > 1 {
+					alias = args[1]
+				}
+				sink := newOutputSink(cmd, jsonOut)
+				svc, err := a.memoryJSONService(cmd, dryRun, sink, nil)
+				if err != nil {
+					return nil, err
+				}
+				var target space.MemoryManifest
+				if jsonOut && !dryRun {
+					if manifest, err := space.LoadManifest(svc.SpacePath(args[0])); err == nil {
+						target, _, _ = manifest.FindMemory(alias)
+					}
+				}
+				if err := svc.DetachMemory(cmd.Context(), args[0], alias, fate, force, dryRun); err != nil {
+					return nil, err
+				}
+				if !jsonOut {
+					return nil, nil
+				}
+				if dryRun {
+					return dryRunPayload(sink), nil
+				}
+				return memoryDetachPayload(svc, args[0], target, fate, sink)
+			})
 		},
 	}
 	cmd.Flags().BoolVar(&keep, "keep", false, "leave the store intact (default)")
 	cmd.Flags().BoolVar(&destroy, "destroy", false, "destroy an owned store on detach")
 	cmd.Flags().BoolVar(&force, "force", false, "forward force to provider destroy (unpushed edits)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print operations without changing state")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON (result on success, {\"error\": {code, message}} on failure; exit 1)")
 	return cmd
 }
 

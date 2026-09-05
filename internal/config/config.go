@@ -146,8 +146,10 @@ func Load(path string) (*Config, string, error) {
 		return nil, path, err
 	}
 	v.SetDefault("root", defaults.Root)
-	v.SetDefault("bareReposDir", defaults.BareReposDir)
-	v.SetDefault("agentWorkDir", defaults.AgentWorkDir)
+	// bareReposDir/agentWorkDir deliberately have no viper default: when the
+	// file omits them, ApplyDefaults derives them from the configured root
+	// (a default here would pin them under the DEFAULT root even when the
+	// file sets a custom root).
 	v.SetDefault("defaultBase", defaults.DefaultBase)
 	v.SetDefault("repos", map[string]Repository{})
 	v.SetDefault("agent", defaults.Agent)

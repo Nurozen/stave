@@ -26,16 +26,33 @@ memory:
 ## CLI
 
 ```text
-stave memory providers
+stave memory providers [--json]
 stave memory attach <space-id> [--provider marmot] [--use <existing-den>]
                     [--edit <warren>/<project>]... [--link <target>]...
-                    [--opt k=v]... [--json]
-stave memory status <space-id> [alias]   # per-link freshness/skew rows
-stave memory list [space-id]
-stave memory sync <space-id>             # marmot warren sync --json (per-warren results)
-stave memory propose <space-id>   # den contribute + warren propose (no auto-push)
-stave memory detach <space-id> [--keep | --destroy] [--force]
+                    [--opt k=v]... [--dry-run] [--json]
+stave memory status <space-id> [alias] [--json]   # per-link freshness/skew rows
+stave memory list [space-id] [--json]
+stave memory sync <space-id> [alias] [--dry-run] [--json]     # marmot warren sync --json (per-warren results)
+stave memory propose <space-id> [alias] [--dry-run] [--json]  # den contribute + warren propose (no auto-push)
+stave memory detach <space-id> [alias] [--keep | --destroy] [--force] [--dry-run] [--json]
 ```
+
+### JSON output
+
+Every verb takes `--json` and then prints exactly one JSON document on stdout
+and no prose: `attach` and `detach` return `{spaceId, spacePath, manifest,
+attachments|detached[], notes[]?}` with the manifest reloaded from disk and the
+human notices (not-owned downgrade, portal notice, pointer cleanup) collected
+under `notes`; `list` returns `[{spaceId, spacePath, attachments[]}]`; `status`
+returns per-attachment `{state?, lifetime?, links[{alias, kind, ahead, behind,
+pending, stale, reachable}]}` mirroring what the human rows parse from
+`den status --json`; `sync` / `propose` return `{spaceId, results[{alias,
+warren?, outcome, detail?, pushCommand?}]}`; `providers` returns the probed
+`{available, version?, capabilities[], error?}` per provider. With `--dry-run
+--json` the payload is `{dryRun: true, plan[]}`; on failure the command prints
+`{"error": {code, message, details?}}` and exits 1 — `memory_in_use` when the
+den is held by a live process. See the README's "Machine-readable output" for
+the full field lists.
 
 `space create` / `space destroy` accept memory flags (`--memory`, `--memory keep|destroy|…`)
 when configured; see `stave space create --help` / `destroy --help`.

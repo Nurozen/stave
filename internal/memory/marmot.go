@@ -108,6 +108,28 @@ func (m *Marmot) Probe(ctx context.Context) (ProbeResult, error) {
 	}, nil
 }
 
+// BinaryName reports the executable marmot shells out to (BinaryReporter).
+func (m *Marmot) BinaryName() string { return m.binary() }
+
+// Capabilities names the probed feature set (CapabilityReporter): "dens" when
+// the binary has the den verbs, "refs" + "links" with the P4 pass-through
+// surface (den create --ref / den link), "warrens" with cache-backed warren
+// sync. Empty when the binary is missing or lacks den support.
+func (m *Marmot) Capabilities(ctx context.Context) []string {
+	probe, err := m.Probe(ctx)
+	if err != nil || !probe.Capable {
+		return nil
+	}
+	caps := []string{"dens"}
+	if m.SupportsRefPassthrough(ctx) {
+		caps = append(caps, "refs", "links")
+	}
+	if m.SupportsWarrenSync(ctx) {
+		caps = append(caps, "warrens")
+	}
+	return caps
+}
+
 // capabilityOutput runs the binary with args and returns combined
 // stdout+stderr regardless of exit code (marmot prints usage on stderr, and
 // e.g. `warren --help` exits nonzero on old builds). Empty when the binary
@@ -314,7 +336,7 @@ func (m *Marmot) LinkReference(ctx context.Context, opts LinkReferenceOptions) (
 	}
 	reportWarnings(opts.Out, &res.Warnings, linkEnv.Warnings)
 	res.Linked = true
-	res.Link = AttachLink{Ref: target, Mode: mode, ResolvedVia: resolvedVia}
+	res.Link = AttachLink{Ref: target, Reference: label, Mode: mode, ResolvedVia: resolvedVia}
 	if resolvedVia == "explicit" {
 		printf(opts.Out, "reference %s → %s (config marmotVault)\n", label, target)
 	} else {
@@ -504,11 +526,11 @@ func (m *Marmot) Attach(ctx context.Context, opts AttachOptions) (AttachResult, 
 			if l.Mode != nil {
 				mode = *l.Mode
 			}
-			result.Links = append(result.Links, AttachLink{Ref: l.Ref, Mode: mode, ResolvedVia: l.ResolvedVia})
 			label := l.Ref
 			if i < len(passed) {
 				label = firstNonEmpty(passed[i].Name, passed[i].URL, l.Ref)
 			}
+			result.Links = append(result.Links, AttachLink{Ref: l.Ref, Reference: label, Mode: mode, ResolvedVia: l.ResolvedVia})
 			if mode == "" {
 				printf(opts.Out, "reference %s → no memory found\n", label)
 			} else {
@@ -526,7 +548,7 @@ func (m *Marmot) Attach(ctx context.Context, opts AttachOptions) (AttachResult, 
 			if linkEnv.Link != nil && linkEnv.Link.Mode != nil && *linkEnv.Link.Mode != "" {
 				mode = *linkEnv.Link.Mode
 			}
-			result.Links = append(result.Links, AttachLink{Ref: lk.target, Mode: mode, ResolvedVia: "explicit"})
+			result.Links = append(result.Links, AttachLink{Ref: lk.target, Reference: lk.target, Mode: mode, ResolvedVia: "explicit"})
 			reportWarnings(opts.Out, &result.Warnings, linkEnv.Warnings)
 			if lk.label != "" {
 				printf(opts.Out, "reference %s → %s (config marmotVault)\n", lk.label, lk.target)

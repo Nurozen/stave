@@ -21,6 +21,8 @@ type Fake struct {
 	DetachFn        func(context.Context, DetachOptions) (DetachResult, error)
 	LinkReferenceFn func(context.Context, LinkReferenceOptions) (LinkReferenceResult, error)
 
+	CapabilitiesFn func(context.Context) []string
+
 	WriteMCPConfigFn  func(ctx context.Context, spacePath, storeID string) error
 	RemoveMCPConfigFn func(ctx context.Context, spacePath string) error
 
@@ -44,6 +46,15 @@ func (f *Fake) Probe(ctx context.Context) (ProbeResult, error) {
 		return f.ProbeFn(ctx)
 	}
 	return ProbeResult{Available: true, Capable: true, Message: "fake ok"}, nil
+}
+
+// Capabilities makes Fake a CapabilityReporter (memory providers --json).
+func (f *Fake) Capabilities(ctx context.Context) []string {
+	f.record("capabilities")
+	if f.CapabilitiesFn != nil {
+		return f.CapabilitiesFn(ctx)
+	}
+	return []string{"dens", "refs", "links"}
 }
 
 func (f *Fake) Attach(ctx context.Context, opts AttachOptions) (AttachResult, error) {

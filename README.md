@@ -108,13 +108,16 @@ stave
 │   ├── tether <from> <to> [--strong|--weak|--edit|--reference]
 │   └── forget <from> [to] [--all]
 ├── memory
-│   ├── providers
-│   ├── attach <space-id>
-│   ├── status <space-id> [alias]
-│   ├── list [space-id]
-│   ├── sync <space-id>
-│   ├── propose <space-id>
-│   └── detach <space-id> [--keep|--destroy]
+│   ├── providers [--json]
+│   ├── attach <space-id> [--json]
+│   ├── status <space-id> [alias] [--json]
+│   ├── list [space-id] [--json]
+│   ├── sync <space-id> [alias] [--json]
+│   ├── propose <space-id> [alias] [--json]
+│   └── detach <space-id> [alias] [--keep|--destroy] [--json]
+├── config
+│   ├── show [--json]
+│   └── path
 ├── saga
 │   ├── create <saga-id> [--memory ...] [--summon ...] [--no-learn]
 │   ├── list [--json]
@@ -290,7 +293,11 @@ stave memory status ticket-482
 stave memory list
 stave memory detach ticket-482 --keep     # keep den as durable residue; strip MCP
 stave memory detach ticket-482 --destroy  # destroy den + strip MCP + routes
+stave memory status ticket-482 --json     # typed freshness rows for GUI hosts
 ```
+
+Every `memory` verb takes `--json`; see [Machine-readable output](#machine-readable-output)
+for the payload shapes and the `{"error": {code, message}}` failure envelope.
 
 ### Contracts (S2)
 
@@ -312,8 +319,8 @@ Default paths (overridable in config):
 
 | Path | Purpose |
 |------|---------|
-| `~/stave/bare-repos/<name>.git` | Bare mirrors of registered remotes |
-| `~/stave/agent-work/<space-id>/` | Agent workspace root |
+| `~/stave/bare-repos/<name>.git` | Bare mirrors of registered remotes (`bareReposDir`; defaults to `<root>/bare-repos`) |
+| `~/stave/agent-work/<space-id>/` | Agent workspace root (`agentWorkDir`; defaults to `<root>/agent-work`) |
 | `~/.config/stave/config.yaml` | Stave configuration |
 
 A typical space:
@@ -358,7 +365,12 @@ Global flag on all commands: `--config <path>` (default `~/.config/stave/config.
 
 | Command | Description |
 |---------|-------------|
-| `stave setup` | Create root directories and write config |
+| `stave setup [--force] [--json]` | Create root directories and write config; an existing config file is refused unless `--force`; `--json` emits `{configPath, root, bareReposDir, agentWorkDir, created[], existed[]}` |
+
+Re-running `stave setup` over an existing `config.yaml` is refused (exit 1,
+`config_exists` with `--json`) so edited settings are never discarded by
+accident; pass `--force` to rewrite the file. Directories are always created
+if missing.
 
 ### `stave version`
 
@@ -395,7 +407,7 @@ migrated into the managed block.
 
 | Command | Description |
 |---------|-------------|
-| `stave repos add <name> <url>` | Clone bare mirror, register it, and (best-effort) set `origin/HEAD` and record the default branch; `--adopt` reuses an existing cache at the derived path |
+| `stave repos add <name> <url> [--adopt] [--dry-run] [--json]` | Clone bare mirror, register it, and (best-effort) set `origin/HEAD` and record the default branch; `--adopt` reuses an existing cache at the derived path; `--json` emits `{name, url, bareRepoPath, defaultBranch?, adopted, notes[]?}` |
 | `stave repos list [--verbose] [--json]` | List registered repos; `--verbose` appends each repo's description and learned tether count; `--json` emits `{name, url, bareRepoPath, defaultBranch, description, tetherCount}` rows |
 | `stave repos sync [name]` | Fetch + prune bare mirror(s), then (best-effort) re-point `origin/HEAD` and backfill a missing `defaultBranch` |
 | `stave repos remove <name>` | Unregister; keeps the cache unless `--purge` |
@@ -510,16 +522,16 @@ Current built-in model defaults are `gpt-5.5` for OpenAI and `claude-opus-4-7` f
 
 | Command | Description |
 |---------|-------------|
-| `stave space init <space-id>` | Empty space (manifest + `AGENTS.md`) |
+| `stave space init <space-id> [--json]` | Empty space (manifest + `AGENTS.md`) |
 | `stave space create <space-id>` | `init` plus `--edit` / `--reference` repos |
 | `stave space add <space-id> <repo>` | Add one repo (`--edit` or `--reference`) |
 | `stave space remove <space-id> <repo>` | Remove one repo's worktree and manifest entry (the branch is kept) |
-| `stave space sync <space-id>` | Fetch, update references, report edit drift |
+| `stave space sync <space-id> [--references-only] [--json]` | Fetch, update references, report edit drift; `--json` emits `{spaceId, spacePath, manifest, repos[{name, mode, action, ahead, behind, note?}], notes[]?}` |
 | `stave space status <space-id> [--json]` | Manifest, dirty state, ahead/behind; `--json` emits `{spaceId, spacePath, manifest, repos[], memories[]}` with per-repo `exists/dirty/ahead/behind` |
-| `stave space list [--archived] [--json]` | List spaces as `id\tkind\tpath` (`--archived` lists `.archive/` entries); `--json` emits `{id, path, kind, createdAt, isSaga, memberOf, repos[{name, mode}], archived, error}` rows |
+| `stave space list [--archived] [--json]` | List spaces as `id\tkind\tpath` (`--archived` lists `.archive/` entries); `--json` emits `{id, path, kind, createdAt, isSaga, memberOf, repos[{name, mode}], archived, error, logicalId, archiveBasename, manifestCreatedAt, manifestVersion, memories[{name, provider, id, owned}]}` rows — identity is `(logicalId, manifestCreatedAt)`, see [Machine-readable output](#machine-readable-output) |
 | `stave space archive <space-id>` | Remove worktrees; move space to `.archive/` |
 | `stave space restore <space-id>` | Move an archived space back and re-create its worktrees |
-| `stave space retarget <space-id> --repo <repo> --base <ref>` | Repoint an edit repo's recorded base without touching the worktree (rewrites the manifest only) |
+| `stave space retarget <space-id> --repo <repo> --base <ref> [--dry-run] [--json]` | Repoint an edit repo's recorded base without touching the worktree (rewrites the manifest only) |
 | `stave space destroy <space-id>` | Remove worktrees and delete space directory |
 
 Space commands take a plain space ID. Relative-path spellings such as
@@ -651,7 +663,7 @@ records how they relate. The durable reference for the frozen `saga status
 | `stave saga create <saga-id>` | Create a saga space with an empty member roster |
 | `stave saga list` | List every space with its kind and saga membership |
 | `stave saga status <saga-id>` | Members in dependency order with state, drift, and topology notes |
-| `stave saga sync <saga-id>` | Fetch each shared bare repo once, then sync every live member |
+| `stave saga sync <saga-id> [--dry-run] [--json]` | Fetch each shared bare repo once, then sync every live member |
 | `stave saga add <saga-id> <space-id>` | Register an existing space as a member |
 | `stave saga remove <saga-id> <space-id>` | Drop a member from the roster |
 | `stave saga archive <saga-id>` | Archive every member in reverse topological order, then the saga space |
@@ -668,7 +680,7 @@ Saga flags:
 | `--no-learn` | `create` | Suppress tether learning for this invocation only — kept for surface symmetry with space `create`. The saga root is a reference-only space with no editable anchor, so the flag is effectively a no-op for the root and is not persisted to members; each member still learns unless it passes `--no-learn` on its own create |
 | `--after` | `add` | Member id this space lands behind (repeatable) |
 | `--clear-after` | `add` | Reset the member's `after` edges before applying `--after` |
-| `--json` | `list`, `status` | Emit machine-readable JSON (for `status`, the frozen `SagaStatus` contract) |
+| `--json` | `list`, `status`, `create`, `add`, `remove`, `archive`, `destroy` | Emit machine-readable JSON (for `status`, the frozen `SagaStatus` contract; for `list`, rows with `path` and `logicalId`) |
 | `--force` | `archive`, `destroy` | Proceed despite dirty member worktrees, external spaces stacked on member branches, or (destroy) other spaces sharing the saga den |
 | `--memory` | `archive`, `destroy` | Saga den fate: `keep` (default) or `contribute` on archive; `keep`, `destroy`, or `contribute` on destroy |
 | `--dry-run` | `create`, `sync`, `add`, `remove`, `archive`, `destroy` | Print operations (for `archive`/`destroy`, the ordered teardown plan) without changing state |
@@ -888,12 +900,34 @@ key names (`id`, `kind`, `createdAt`, `repos[].bareRepoPath`, `saga.members[]`).
 | Command | Emits |
 |---------|-------|
 | `stave space status <space-id> --json` | `{spaceId, spacePath, manifest, repos[], memories[]}` |
-| `stave space list [--archived] --json` | Space rows with kind, saga join, repo summary |
-| `stave saga list --json` / `stave saga status <saga-id> --json` | Saga rows / the frozen `SagaStatus` contract |
+| `stave space list [--archived] --json` | Space rows with kind, saga join, repo and memory summary, and host identity (below) |
+| `stave saga list --json` / `stave saga status <saga-id> --json` | Saga rows (`{id, kind, isSaga, members[], memberOf, error, path, logicalId}`) / the frozen `SagaStatus` contract |
 | `stave repos list --json` / `stave repos tethers <repo> --json` | Registry rows / learned tethers |
 | `stave portal list|status|inspect|drivers|doctor|auth status ... --json` | Portal state |
 | `stave agent <query> --json` | Plan, questions, and results |
-| `stave memory attach <space-id> --json` | Attachment confirmation |
+| `stave memory list [space-id] --json` | `[{spaceId, spacePath, attachments: [{name, provider, id, owned}]}]` — every live space with attachments, or the one space (empty `attachments` allowed) |
+| `stave memory status <space-id> [alias] --json` | `{spaceId, attachments: [{name, provider, id, owned, state?, lifetime?, links: [{alias, kind, ahead?, behind?, pending?, stale?, reachable?, state?}], error?}]}` — the fields the human rows parse from `den status --json` |
+| `stave memory providers --json` | `[{name, binary?, default, available, version?, capabilities: ["dens", "refs", "links", "warrens", ...], error?}]` — capabilities as probed from the binary |
+| `stave config show --json` | `{configPath, exists, root, bareReposDir, agentWorkDir, defaultBase, repos: {name: {name, url, bareRepoPath, defaultBranch?, description?}}, memory: {provider, binary, default}, tethers: {enabled, strongThreshold}, summon: {default, commands}}` — the resolved config exactly as every verb loads it (defaults overlaid, `~` expanded); the `agent` section is omitted; `exists: false` when the file is absent |
+
+### Space identity for hosts
+
+A `space list --json` row's `id` is the **directory name**: for live rows the
+space id, for `--archived` rows the `.archive/` basename, which is
+`<id>-<timestamp>` when an archive had to disambiguate a collision. The
+identity a host should reconcile on is the pair **`logicalId` +
+`manifestCreatedAt`**:
+
+| Field | Meaning |
+|-------|---------|
+| `logicalId` | the manifest's `id`; `null` on error rows (the manifest could not be read) |
+| `manifestCreatedAt` | the manifest's `createdAt` in RFC3339Nano (UTC) — full fractional precision, so it compares equal to the stamp in `.stave.yaml` and to `saga.members[].createdAt`; omitted when the manifest carries no stamp. The legacy `createdAt` is truncated to whole seconds and kept for compatibility |
+| `archiveBasename` | archived rows only: the `.archive/` directory name (equals `id`) |
+| `manifestVersion` | the `.stave.yaml` schema version (`0` = pre-version or unreadable) |
+| `memories[]` | the manifest's attachments, `{name, provider, id, owned}` |
+
+`saga list --json` rows carry the same `path` and `logicalId` (`null` on error
+rows). Every v0.3 field keeps its name, type, and meaning.
 
 Mutating space and saga verbs take `--json` too, so a GUI host never parses
 prose. Human output is unchanged when the flag is absent. `--summon` is
@@ -901,11 +935,19 @@ interactive and is refused alongside `--json`.
 
 | Command | Emits on success |
 |---------|------------------|
-| `stave space create|add|remove|restore ... --json` | `{spaceId, spacePath, manifest, notes[]?}` — the manifest is reloaded from disk after the operation; `notes` carries the notices a human run prints (canonicalization, stale-branch adoption, memory link kept, saga sync hint) |
+| `stave space init|create|add|remove|restore|retarget ... --json` | `{spaceId, spacePath, manifest, notes[]?}` — the manifest is reloaded from disk after the operation; `notes` carries the notices a human run prints (canonicalization, stale-branch adoption, memory link kept, saga sync hint) |
+| `stave space sync <space-id> [--references-only] --json` | `{spaceId, spacePath, manifest, repos: [{name, mode, action, ahead, behind, note?}], notes[]?}` — one row per processed repo (`--references-only` drops edit rows, as the human output does); `action` is `updated` (reference checked out), `skipped` (dirty reference left alone; `note` says why), `drift-reported` (edit repo; `ahead`/`behind` versus its base) or `fetched` (edit repo whose drift probe failed; `note` carries the error) |
 | `stave space archive <space-id> --json` | `{spaceId, archivedPath, memory: "keep"\|"contribute", notes[]?}` |
 | `stave space destroy <space-id> --json` | `{spaceId, spacePath, destroyed: true, memory: "keep"\|"destroy"\|"contribute", notes[]?}` |
 | `stave saga create|add|remove ... --json` | `{sagaId, spacePath, manifest, notes[]?}` |
-| `stave saga archive|destroy <saga-id> --json` | `{sagaId, action: "archived"\|"destroyed", memory, members: [{id, action: "archived"\|"destroyed"\|"skipped", note?}], notes[]?}` — members in teardown order |
+| `stave saga archive|destroy <saga-id> --json` | `{sagaId, action: "archived"\|"destroyed", memory, sagaPath, sagaArchivedPath?, members: [{id, action: "archived"\|"destroyed"\|"skipped", note?, path, archivedPath?}], notes[]?}` — members in teardown order; `path` is the member's live root before teardown, `archivedPath` its `.archive/` destination (archive) or, for a skipped already-archived member, the existing archive; `sagaArchivedPath` is the saga space's own destination (archive only) |
+| `stave saga sync <saga-id> --json` | `{sagaId, spacePath, members: [{id, state: "live"\|"archived"\|"missing", repos: [space-sync rows], note?}], repos[]?, notes[]?}` — members in walk order; skipped members carry the reason in `note` and an empty `repos`; top-level `repos` are the saga space's own reference rows; `notes` carries the merge findings and degrade notices the human walk prints |
+| `stave repos add <name> <url> [--adopt] --json` | `{name, url, bareRepoPath, defaultBranch?, adopted, notes[]?}` — `adopted` is true when an existing cache was reused; `notes` carries the `note:` lines a human run prints to stderr (adoption, origin/HEAD, default-branch discovery) |
+| `stave setup [--force] --json` | `{configPath, root, bareReposDir, agentWorkDir, created: [paths], existed: [paths]}` — every root directory and the config file sorted by whether this run created it |
+| `stave memory attach <space-id> ... --json` | `{spaceId, spacePath, manifest, attachments: [{name, provider, id, owned, linked?: [{reference, target?, kind, resolvedVia?}]}], notes[]?}` — `linked` lists the reference links the provider resolved on create |
+| `stave memory detach <space-id> [alias] --json` | `{spaceId, spacePath, manifest, detached: [{name, provider, id, fate: "keep"\|"destroy"}], notes[]?}` — `fate` is the one that applied (an unowned store is always kept) |
+| `stave memory sync <space-id> [alias] --json` | `{spaceId, results: [{alias, warren?, outcome: "synced"\|"up-to-date"\|"failed", detail?}], notes[]?}` — one row per cached warren |
+| `stave memory propose <space-id> [alias] --json` | `{spaceId, results: [{alias, outcome: "proposed"\|"up-to-date", detail?, branch?, commit?, pushCommand?, contributed?}], notes[]?}` — stave never pushes; `pushCommand` is the operator's handoff |
 | any of the above with `--dry-run --json` | `{dryRun: true, plan: [each line the human dry-run prints]}` |
 
 On failure with `--json` the command prints one envelope to **stdout** and
@@ -919,7 +961,7 @@ exits 1 (nothing is written to stderr):
 |------|---------|-----------|
 | `dirty_worktrees` | an editable worktree has uncommitted changes (`--force` overrides) | `repos[]` |
 | `dependent_spaces` | another live space stacks on a branch this operation would retire | `spaces[]`, `repo`, `branch` |
-| `memory_in_use` | the memory den is held by a live agent session (`--force` does not help) | |
+| `memory_in_use` | the memory den is held by a live agent session (`--force` does not help; also raised by `memory detach`) | |
 | `space_exists` | a live space already occupies the id/path (restore, saga create, create across the saga boundary) | `path` |
 | `space_not_found` | no live space under that id | |
 | `repo_not_found` | the repo is not registered (`stave repos add`) | `repo` |
@@ -932,8 +974,34 @@ exits 1 (nothing is written to stderr):
 | `branch_missing` | restore: an edit repo's recorded branch no longer exists in the bare repo | `repo`, `branch` |
 | `ambiguous_archive` | restore: several `<space-id>-<timestamp>` archives match; pass `--from` | `candidates[]` |
 | `archive_not_found` | restore: no `.archive/` entry for the id | |
-| `invalid_arguments` | flag/usage refusal (`--edit` with `--reference`, `--memory destroy` on archive, `--summon` with `--json`, ...) | |
+| `repo_exists` | `repos add`: the name is already registered | `repo` |
+| `cache_exists` | `repos add`: a bare repo already sits at the derived cache path; pass `--adopt` to reuse it | `repo`, `path` |
+| `clone_failed` | `repos add`: the fresh bare clone failed; `message` carries the git error | `repo` |
+| `config_exists` | `setup`: the config file exists and `--force` was not given | `path` |
+| `invalid_arguments` | flag/usage refusal (`--edit` with `--reference`, `--memory destroy` on archive, `--summon` with `--json`, `--repo`/`--base` missing on retarget, ...) | |
 | `unknown` | any other failure; `message` is the human error text | |
+
+When `saga archive|destroy` fails **mid-walk** (a member's or the saga space's
+own teardown step errors after earlier members were already torn down), the
+envelope keeps the cause's `code` and `details` and adds what got done, so a
+host can reconcile without rescanning the work directory:
+
+```json
+{ "error": { "code": "unknown", "message": "saga archive: member jf-1: ...",
+  "details": {
+    "completed": [{ "id": "jf-2", "action": "archived", "path": "/…/agent-work/jf-2", "archivedPath": "/…/agent-work/.archive/jf-2" }],
+    "failedAt": "member",
+    "failedMember": "jf-1" } } }
+```
+
+`completed` lists the steps that finished this run in walk order (always
+present, `[]` when nothing was torn down; `archivedPath` only for archive);
+`failedAt` is `member`, `saga` (the saga space's own step; `failedMember` is
+then the saga id) or `den` (a den-first destroy refused before any member
+teardown; no `failedMember`). Guard refusals raised before the walk starts
+(`dirty_worktrees`, `dependent_spaces`, ...) carry their usual details only —
+nothing was torn down. Re-running the same command converges (see
+[docs/saga.md](docs/saga.md#saga-aware-lifecycle-saga-archive-and-saga-destroy)).
 
 Argument-count and flag-spelling mistakes are still reported by the CLI
 parser (usage text, exit 1) before the verb runs.

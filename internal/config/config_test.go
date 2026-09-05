@@ -421,3 +421,22 @@ func TestLoadAndSaveErrorBranches(t *testing.T) {
 		t.Fatalf("EnsureRootDirs(blocked) error = %v", err)
 	}
 }
+
+func TestLoadDerivesDirsFromCustomRootWhenOmitted(t *testing.T) {
+	dir := t.TempDir()
+	custom := filepath.Join(dir, "custom-root")
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte("root: "+custom+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.BareReposDir != filepath.Join(custom, "bare-repos") {
+		t.Fatalf("bareReposDir = %q, want derived from custom root", cfg.BareReposDir)
+	}
+	if cfg.AgentWorkDir != filepath.Join(custom, "agent-work") {
+		t.Fatalf("agentWorkDir = %q, want derived from custom root", cfg.AgentWorkDir)
+	}
+}

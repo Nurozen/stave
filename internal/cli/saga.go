@@ -163,13 +163,17 @@ func plannedSagaMemories(cfg config.Config, sagaID string, rawSpecs []string) ([
 }
 
 // sagaListRow is the typed --json row: every space with its kind and saga join.
+// Path is the space directory; LogicalID the manifest id (null on error rows),
+// the same identity `space list --json` carries.
 type sagaListRow struct {
-	ID       string   `json:"id"`
-	Kind     string   `json:"kind,omitempty"`
-	IsSaga   bool     `json:"isSaga"`
-	Members  []string `json:"members,omitempty"`
-	MemberOf string   `json:"memberOf,omitempty"`
-	Error    string   `json:"error,omitempty"`
+	ID        string   `json:"id"`
+	Kind      string   `json:"kind,omitempty"`
+	IsSaga    bool     `json:"isSaga"`
+	Members   []string `json:"members,omitempty"`
+	MemberOf  string   `json:"memberOf,omitempty"`
+	Error     string   `json:"error,omitempty"`
+	Path      string   `json:"path"`
+	LogicalID *string  `json:"logicalId"`
 }
 
 func (a *app) sagaListCommand() *cobra.Command {
@@ -190,9 +194,12 @@ func (a *app) sagaListCommand() *cobra.Command {
 			if jsonOut {
 				rows := make([]sagaListRow, 0, len(entries))
 				for _, entry := range entries {
-					row := sagaListRow{ID: entry.ID, Kind: entry.Kind, IsSaga: entry.IsSaga, Members: entry.Members, MemberOf: entry.MemberOf}
+					row := sagaListRow{ID: entry.ID, Kind: entry.Kind, IsSaga: entry.IsSaga, Members: entry.Members, MemberOf: entry.MemberOf, Path: entry.Path}
 					if entry.Err != nil {
 						row.Error = entry.Err.Error()
+					} else {
+						logicalID := entry.LogicalID
+						row.LogicalID = &logicalID
 					}
 					rows = append(rows, row)
 				}
@@ -310,19 +317,34 @@ func mergedViaLabel(repo space.SagaRepoStatus, prs []space.SagaPRStatus) string 
 
 func (a *app) sagaSyncCommand() *cobra.Command {
 	var dryRun bool
+	var jsonOut bool
 	cmd := &cobra.Command{
 		Use:   "sync <saga-id>",
 		Short: "Fetch shared bare repos once and sync every live saga member",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			svc, err := a.serviceWithDryRun(cmd, dryRun)
-			if err != nil {
-				return err
-			}
-			return svc.SagaSync(cmd.Context(), args[0], space.SagaSyncOptions{DryRun: dryRun})
+			return runJSON(cmd, jsonOut, func() (any, error) {
+				sink := newOutputSink(cmd, jsonOut)
+				svc, err := a.serviceWithOutput(cmd, dryRun, sink.Writer())
+				if err != nil {
+					return nil, err
+				}
+				report, err := svc.SagaSyncWithReport(cmd.Context(), args[0], space.SagaSyncOptions{DryRun: dryRun})
+				if err != nil {
+					return nil, err
+				}
+				if !jsonOut {
+					return nil, nil
+				}
+				if dryRun {
+					return dryRunPayload(sink), nil
+				}
+				return sagaSyncPayload(report, sink), nil
+			})
 		},
 	}
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print operations without changing state")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON (result on success, {\"error\": {code, message}} on failure; exit 1)")
 	return cmd
 }
 
@@ -420,8 +442,8 @@ func (a *app) sagaArchiveCommand() *cobra.Command {
 				if fate == memory.FateDestroy {
 					return nil, argErrorf("--memory destroy is not valid for archive; use 'stave saga destroy --memory destroy' to destroy owned memory")
 				}
-				return a.runSagaTeardown(cmd, args[0], jsonOut, dryRun, fate, false, func(svc space.Service) error {
-					return svc.SagaArchive(cmd.Context(), args[0], space.SagaArchiveOptions{
+				return a.runSagaTeardown(cmd, args[0], jsonOut, dryRun, fate, false, func(svc space.Service) (space.SagaTeardownReport, error) {
+					return svc.SagaArchiveWithReport(cmd.Context(), args[0], space.SagaArchiveOptions{
 						Force:      force,
 						DryRun:     dryRun,
 						MemoryFate: fate,
@@ -452,8 +474,8 @@ func (a *app) sagaDestroyCommand() *cobra.Command {
 				if err != nil {
 					return nil, err
 				}
-				return a.runSagaTeardown(cmd, args[0], jsonOut, dryRun, fate, true, func(svc space.Service) error {
-					return svc.SagaDestroy(cmd.Context(), args[0], space.SagaDestroyOptions{
+				return a.runSagaTeardown(cmd, args[0], jsonOut, dryRun, fate, true, func(svc space.Service) (space.SagaTeardownReport, error) {
+					return svc.SagaDestroyWithReport(cmd.Context(), args[0], space.SagaDestroyOptions{
 						Force:      force,
 						DryRun:     dryRun,
 						MemoryFate: fate,
@@ -470,9 +492,11 @@ func (a *app) sagaDestroyCommand() *cobra.Command {
 }
 
 // runSagaTeardown runs a saga archive/destroy walk. In --json mode it snapshots
-// the members' states first (the walk's own per-member report is prose) and
-// returns the sagaTeardownJSON payload, or the dry-run plan.
-func (a *app) runSagaTeardown(cmd *cobra.Command, sagaID string, jsonOut, dryRun bool, fate memory.MemoryFate, destroy bool, run func(space.Service) error) (any, error) {
+// the members' states first (skipped members are not steps in the walk's
+// report) and returns the sagaTeardownJSON payload, or the dry-run plan. A
+// mid-walk failure surfaces as the service's *SagaTeardownError, whose
+// details (completed steps, failedMember) the error envelope carries.
+func (a *app) runSagaTeardown(cmd *cobra.Command, sagaID string, jsonOut, dryRun bool, fate memory.MemoryFate, destroy bool, run func(space.Service) (space.SagaTeardownReport, error)) (any, error) {
 	sink := newOutputSink(cmd, jsonOut)
 	svc, err := a.serviceWithOutput(cmd, dryRun, sink.Writer())
 	if err != nil {
@@ -484,7 +508,8 @@ func (a *app) runSagaTeardown(cmd *cobra.Command, sagaID string, jsonOut, dryRun
 			return nil, err
 		}
 	}
-	if err := run(svc); err != nil {
+	report, err := run(svc)
+	if err != nil {
 		return nil, err
 	}
 	if !jsonOut {
@@ -498,11 +523,13 @@ func (a *app) runSagaTeardown(cmd *cobra.Command, sagaID string, jsonOut, dryRun
 		action = "destroyed"
 	}
 	return sagaTeardownJSON{
-		SagaID:  sagaID,
-		Action:  action,
-		Memory:  string(fate),
-		Members: sagaTeardownMembers(states, destroy),
-		Notes:   sink.Lines(),
+		SagaID:           sagaID,
+		Action:           action,
+		Memory:           string(fate),
+		Members:          sagaTeardownMembers(svc, states, report, destroy),
+		Notes:            sink.Lines(),
+		SagaPath:         report.SagaPath,
+		SagaArchivedPath: report.SagaArchivedPath,
 	}, nil
 }
 

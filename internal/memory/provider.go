@@ -144,6 +144,20 @@ type MCPWirer interface {
 	RemoveMCPConfig(ctx context.Context, spacePath string) error
 }
 
+// CapabilityReporter is an OPTIONAL Provider extension: providers implementing
+// it name the probed feature set (e.g. "dens", "refs", "links", "warrens") for
+// `stave memory providers --json`. Providers without it report no
+// capabilities.
+type CapabilityReporter interface {
+	Capabilities(ctx context.Context) []string
+}
+
+// BinaryReporter is an OPTIONAL Provider extension for exec-backed providers:
+// the executable name/path the provider shells out to.
+type BinaryReporter interface {
+	BinaryName() string
+}
+
 type AttachResult struct {
 	Provider       string
 	StoreID        string
@@ -166,6 +180,11 @@ type AttachLink struct {
 	// Ref is the provider-side link label (e.g. "warren/project" for
 	// resolved refs, the spec name for unresolved ones).
 	Ref string
+	// Reference is the caller-side label the link was resolved from: the
+	// registered repo name (or URL) for --ref resolution, the raw ref for
+	// explicit --edit/--link pass-through. Empty on providers that do not
+	// report it; callers fall back to Ref.
+	Reference string
 	// Mode is edit|link|live, empty when the reference did not resolve.
 	Mode string
 	// ResolvedVia is warren-url|checkout-vault|none for --ref resolution,
