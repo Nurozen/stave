@@ -566,7 +566,7 @@ Space flags:
 | `--include-weak` | `create` | With `--common`, widen the expansion to weak tethers too (implies `-c`) |
 | `--no-learn` | `create`, `add` | Do not record co-occurrence tethers for this invocation |
 | `--edit`, `-e` / `--reference`, `-r` | `add`, `remove` | Mode: exactly one required for `add`; for `remove` one is required only when the repo is present in both modes |
-| `--base`, `-b` | `add` | Base branch/ref for edits (`space:<id>` sugar accepted), or ref for references |
+| `--base`, `-b` | `add` | Base branch/ref for edits (`space:<id>` sugar accepted; see [Base and ref resolution](#base-and-ref-resolution)), or ref for references |
 | `--branch` | `add` | Branch name for editable repos |
 | `--no-fetch` | `create`, `add` | Skip fetching the bare repo(s) before adding the worktree(s) |
 | `--references-only` | `sync` | Only sync reference worktrees |
@@ -647,9 +647,9 @@ stave space retarget pay-2 --repo api --base origin/main
 ```
 
 `retarget` rewrites only the recorded base in the manifest — the ref drift is
-measured against — without touching the worktree. `--repo` is required, the
-same base sugar and canonicalization apply, and a resolved `stave/...` base
-must exist in the bare repo. Archiving or destroying a space that a sibling
+measured against — without touching the worktree. `--repo` is required, and
+the same base sugar, canonicalization, remote resolution and existence check
+apply as for `create`/`add`, so the new base must resolve in the bare repo. Archiving or destroying a space that a sibling
 still stacks on fails closed unless `--force` is given.
 
 ### Learned repo tethers
@@ -1013,7 +1013,7 @@ exits 1 (nothing is written to stderr):
 | `memory_already_attached` | `memory attach` / `space create --memory`: the alias is already attached | `space`, `memory` |
 | `invalid_name` | a space id or repo name fails the safe-name pattern | `label`, `name` |
 | `branch_missing` | restore: an edit repo's recorded branch no longer exists in the bare repo | `repo`, `branch` |
-| `ref_not_found` | `space create`/`add`: the base or reference ref resolves to nothing in the repo's bare mirror | `repo`, `ref`, `tried`, `remotes[]` |
+| `ref_not_found` | `space create`/`add`/`retarget`: the base or reference ref resolves to nothing in the repo's bare mirror | `repo`, `ref`, `tried`, `remotes[]` |
 | `repo_path_taken` | `space add`: another manifest entry already occupies the directory the repo would take | `space`, `repo`, `path` |
 | `ambiguous_archive` | restore: several `<space-id>-<timestamp>` archives match; pass `--from` | `candidates[]` |
 | `archive_not_found` | restore: no `.archive/` entry for the id | |
