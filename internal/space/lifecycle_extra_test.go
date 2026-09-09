@@ -233,7 +233,6 @@ func TestRestoreRoundTrip(t *testing.T) {
 	var out bytes.Buffer
 	svc.Out = &out
 	fg.branchExists = true
-	fg.refExists = true
 	archived, before := archivedLifecycleSpace(t, svc, "rs-1")
 	spacePath := svc.SpacePath("rs-1")
 	fg.calls = nil
@@ -281,7 +280,6 @@ func TestRestoreRoundTrip(t *testing.T) {
 func TestRestoreTimestampedCandidates(t *testing.T) {
 	svc, fg, _ := testService(t)
 	fg.branchExists = true
-	fg.refExists = true
 	archived, _ := archivedLifecycleSpace(t, svc, "rs-2")
 	archiveRoot := filepath.Dir(archived)
 	one := filepath.Join(archiveRoot, "rs-2-20260101000000")
@@ -342,7 +340,6 @@ func TestRestoreTimestampedCandidates(t *testing.T) {
 func TestRestoreRefusesLiveSpaceAndMissingArchive(t *testing.T) {
 	svc, fg, _ := testService(t)
 	fg.branchExists = true
-	fg.refExists = true
 	lifecycleSpace(t, svc, "rs-3")
 	err := svc.Restore(context.Background(), RestoreOptions{SpaceID: "rs-3"})
 	var exists *SpaceExistsError
@@ -362,7 +359,6 @@ func TestRestoreRefusesLiveSpaceAndMissingArchive(t *testing.T) {
 func TestRestoreMissingBranchRefusesBeforeMutation(t *testing.T) {
 	svc, fg, _ := testService(t)
 	fg.branchExists = true
-	fg.refExists = true
 	archived, before := archivedLifecycleSpace(t, svc, "rs-4")
 	fg.branchExists = false
 	fg.calls = nil
@@ -392,9 +388,8 @@ func TestRestoreMissingRefSkipsReferenceWithWarning(t *testing.T) {
 	var out bytes.Buffer
 	svc.Out = &out
 	fg.branchExists = true
-	fg.refExists = true
 	archivedLifecycleSpace(t, svc, "rs-5")
-	fg.refExists = false
+	fg.refMissing = true
 	fg.calls = nil
 	out.Reset()
 
@@ -421,7 +416,6 @@ func TestRestoreDryRunChangesNothing(t *testing.T) {
 	var out bytes.Buffer
 	svc.Out = &out
 	fg.branchExists = true
-	fg.refExists = true
 	archived, _ := archivedLifecycleSpace(t, svc, "rs-6")
 	fg.calls = nil
 	out.Reset()
@@ -445,7 +439,6 @@ func TestRestoreDryRunChangesNothing(t *testing.T) {
 func TestRestoreRelocatesMemoryRouteBack(t *testing.T) {
 	svc, fg, _ := testService(t)
 	fg.branchExists = true
-	fg.refExists = true
 	fake := &memory.Fake{}
 	var detachCalls []memory.DetachOptions
 	fake.DetachFn = func(ctx context.Context, opts memory.DetachOptions) (memory.DetachResult, error) {
@@ -491,7 +484,6 @@ func TestRestorePrintsSagaNotes(t *testing.T) {
 	var out bytes.Buffer
 	svc.Out = &out
 	fg.branchExists = true
-	fg.refExists = true
 	// A member of a live saga: restoring prints the roster-staleness note.
 	lifecycleSpace(t, svc, "rs-8")
 	if err := svc.InitSpace(context.Background(), InitOptions{ID: "epic", Kind: KindSaga, Saga: &SagaManifest{Members: []SagaMember{{ID: "rs-8"}}}, viaSaga: true}); err != nil {

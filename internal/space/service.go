@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -31,6 +32,7 @@ type Git interface {
 	BranchExists(context.Context, string, string) (bool, error)
 	IsAncestor(context.Context, string, string, string) (bool, error)
 	RefExists(context.Context, string, string) (bool, error)
+	RemoteNames(context.Context, string) ([]string, error)
 	IsDirty(context.Context, string) (bool, string, error)
 	AheadBehind(context.Context, string, string) (int, int, error)
 }
@@ -495,7 +497,10 @@ func (s Service) createDryRun(ctx context.Context, opts CreateOptions) error {
 		if err != nil {
 			return err
 		}
-		baseRef := normalizeRemoteRef(firstNonEmpty(resolvedBase, repoCfg.DefaultBranch, s.Config.DefaultBase))
+		baseRef, err := s.resolveRef(ctx, spec.Name, repoCfg.BareRepoPath, firstNonEmpty(resolvedBase, repoCfg.DefaultBranch, s.Config.DefaultBase))
+		if err != nil {
+			return err
+		}
 		s.printf("dry-run: fetch %s\n", repoCfg.BareRepoPath)
 		s.printf("dry-run: add edit worktree %s from %s at %s\n", DefaultBranch(opts.ID, spec.Name), baseRef, filepath.Join(spacePath, spec.Name))
 	}
@@ -504,7 +509,10 @@ func (s Service) createDryRun(ctx context.Context, opts CreateOptions) error {
 		if !ok {
 			return &RepoNotFoundError{Repo: spec.Name}
 		}
-		ref := normalizeRemoteRef(firstNonEmpty(spec.Ref, repoCfg.DefaultBranch, s.Config.DefaultBase))
+		ref, err := s.resolveRef(ctx, spec.Name, repoCfg.BareRepoPath, firstNonEmpty(spec.Ref, repoCfg.DefaultBranch, s.Config.DefaultBase))
+		if err != nil {
+			return err
+		}
 		s.printf("dry-run: fetch %s\n", repoCfg.BareRepoPath)
 		s.printf("dry-run: add reference worktree %s at %s\n", ref, filepath.Join(spacePath, "references", spec.Name))
 	}
@@ -513,7 +521,10 @@ func (s Service) createDryRun(ctx context.Context, opts CreateOptions) error {
 		if !ok {
 			return &RepoNotFoundError{Repo: spec.Name}
 		}
-		ref := normalizeRemoteRef(firstNonEmpty(spec.Ref, repoCfg.DefaultBranch, s.Config.DefaultBase))
+		ref, err := s.resolveRef(ctx, spec.Name, repoCfg.BareRepoPath, firstNonEmpty(spec.Ref, repoCfg.DefaultBranch, s.Config.DefaultBase))
+		if err != nil {
+			return err
+		}
 		s.printf("dry-run: fetch %s\n", repoCfg.BareRepoPath)
 		s.printf("dry-run: add reference worktree %s at %s (from repo tethers)\n", ref, filepath.Join(spacePath, "references", spec.Name))
 	}
@@ -894,28 +905,30 @@ func (s Service) AddRepo(ctx context.Context, opts AddOptions) error {
 		if baseChanged && !opts.DryRun {
 			s.printf("notice: base %q canonicalized to %q (stave branches live only in the bare repo; %q would never resolve)\n", opts.Base, resolvedBase, "origin/"+strings.TrimPrefix(resolvedBase, "refs/heads/"))
 		}
-		baseRef := normalizeRemoteRef(firstNonEmpty(resolvedBase, repoCfg.DefaultBranch, s.Config.DefaultBase))
+		baseRef, err := s.resolveRef(ctx, opts.RepoName, repoCfg.BareRepoPath, firstNonEmpty(resolvedBase, repoCfg.DefaultBranch, s.Config.DefaultBase))
+		if err != nil {
+			// "space:<id>" sugar keeps its own phrasing: the caller named a
+			// sibling space, not a ref, and should hear about it that way.
+			var notFound *RefNotFoundError
+			if baseIsSugar && errors.As(err, &notFound) {
+				return coded(CodeRefNotFound, notFound.Details(), "base %q: space %q has no branch %q for repo %q",
+					opts.Base, strings.TrimPrefix(opts.Base, "space:"), strings.TrimPrefix(notFound.Tried, "refs/heads/"), opts.RepoName)
+			}
+			return err
+		}
 		branch := firstNonEmpty(opts.Branch, DefaultBranch(opts.SpaceID, opts.RepoName))
 		repoPath := opts.RepoName
 		if manifest.HasPath(repoPath) {
-			return fmt.Errorf("repo path %q already exists in manifest", repoPath)
+			return &RepoPathTakenError{SpaceID: opts.SpaceID, Repo: opts.RepoName, Path: repoPath}
 		}
 		startPoint := baseRef
 		if opts.StartPoint != "" {
-			startPoint = normalizeRemoteRef(opts.StartPoint)
+			if startPoint, err = s.resolveRef(ctx, opts.RepoName, repoCfg.BareRepoPath, opts.StartPoint); err != nil {
+				return err
+			}
 		}
 		worktreePath := filepath.Join(spacePath, repoPath)
 		if !opts.DryRun {
-			if baseIsSugar {
-				baseBranch := strings.TrimPrefix(baseRef, "refs/heads/")
-				baseExists, err := s.Git.BranchExists(ctx, repoCfg.BareRepoPath, baseBranch)
-				if err != nil {
-					return err
-				}
-				if !baseExists {
-					return fmt.Errorf("base %q: space %q has no branch %q for repo %q", opts.Base, strings.TrimPrefix(opts.Base, "space:"), baseBranch, opts.RepoName)
-				}
-			}
 			exists, err := s.Git.BranchExists(ctx, repoCfg.BareRepoPath, branch)
 			if err != nil {
 				return err
@@ -939,10 +952,13 @@ func (s Service) AddRepo(ctx context.Context, opts AddOptions) error {
 		}
 		entry = RepoManifest{Name: opts.RepoName, Mode: ModeEdit, Path: repoPath, Base: baseRef, Branch: branch, BareRepoPath: repoCfg.BareRepoPath}
 	case ModeReference:
-		ref := normalizeRemoteRef(firstNonEmpty(opts.Ref, repoCfg.DefaultBranch, s.Config.DefaultBase))
+		ref, err := s.resolveRef(ctx, opts.RepoName, repoCfg.BareRepoPath, firstNonEmpty(opts.Ref, repoCfg.DefaultBranch, s.Config.DefaultBase))
+		if err != nil {
+			return err
+		}
 		repoPath := filepath.Join("references", opts.RepoName)
 		if manifest.HasPath(repoPath) {
-			return fmt.Errorf("repo path %q already exists in manifest", repoPath)
+			return &RepoPathTakenError{SpaceID: opts.SpaceID, Repo: opts.RepoName, Path: repoPath}
 		}
 		worktreePath := filepath.Join(spacePath, repoPath)
 		if !opts.DryRun {
@@ -2193,12 +2209,67 @@ func (s Service) printf(format string, args ...any) {
 	}
 }
 
+// normalizeRemoteRef is the offline spelling rule: anything that is not
+// already a full ref or an origin/ ref is assumed to name a branch on origin.
+// It cannot see the bare repo, so it is only the fallback for
+// resolveRefSpelling; call that instead wherever a bare repo is in hand.
 func normalizeRemoteRef(ref string) string {
 	ref = strings.TrimSpace(ref)
 	if strings.HasPrefix(ref, "origin/") || strings.HasPrefix(ref, "refs/") {
 		return ref
 	}
 	return "origin/" + ref
+}
+
+// resolveRefSpelling maps a user-supplied base/ref onto the ref stave records
+// and hands to git, using the remotes the bare repo actually has. full is the
+// unambiguous ref RefExists verifies; spelling is what lands in the manifest.
+//
+// A base whose first path segment names a configured remote resolves against
+// THAT remote: with an origin + fork mirror, "fork/main" is
+// refs/remotes/fork/main, not the origin/fork/main that the origin-only rule
+// used to mint. Non-origin remotes keep the full refs/remotes/ spelling
+// because a bare "fork/main" is ambiguous under git's rev-parse ordering (a
+// local branch literally named fork/main would win); "origin/..." keeps its
+// short spelling, which is what every existing manifest already carries.
+func resolveRefSpelling(ref string, remotes []string) (full, spelling string) {
+	ref = strings.TrimSpace(ref)
+	if strings.HasPrefix(ref, "refs/") {
+		return ref, ref
+	}
+	if remote, rest, ok := strings.Cut(ref, "/"); ok && rest != "" && remote != "origin" && slices.Contains(remotes, remote) {
+		return "refs/remotes/" + ref, "refs/remotes/" + ref
+	}
+	spelling = normalizeRemoteRef(ref)
+	return "refs/remotes/" + spelling, spelling
+}
+
+// resolveRef is resolveRefSpelling plus an existence check, so a base that
+// cannot resolve is refused here — with a coded error naming the ref stave
+// looked for and the remotes it could have used — instead of reaching
+// 'git worktree add' as a raw git failure.
+//
+// The bare repo is the only source of truth for both halves. When it cannot
+// be interrogated at all (not cloned yet, unreadable) the offline spelling
+// rule stands in and the check is skipped: an unusable mirror is the worktree
+// add's problem to report, not a reason to invent a resolution error.
+func (s Service) resolveRef(ctx context.Context, repoName, bareRepoPath, ref string) (string, error) {
+	if strings.TrimSpace(ref) == "" {
+		return "", coded(CodeInvalidArguments, map[string]any{"repo": repoName}, "repo %q: a base ref is required", repoName)
+	}
+	remotes, err := s.Git.RemoteNames(ctx, bareRepoPath)
+	if err != nil {
+		return normalizeRemoteRef(ref), nil
+	}
+	full, spelling := resolveRefSpelling(ref, remotes)
+	exists, err := s.Git.RefExists(ctx, bareRepoPath, full)
+	if err != nil {
+		return "", err
+	}
+	if !exists {
+		return "", &RefNotFoundError{Repo: repoName, Ref: strings.TrimSpace(ref), Tried: full, Remotes: remotes}
+	}
+	return spelling, nil
 }
 
 func firstNonEmpty(values ...string) string {

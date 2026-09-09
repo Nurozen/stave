@@ -96,7 +96,6 @@ func TestSagaStatusBasic(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fg.refExists = true
 	fg.ahead, fg.behind = 3, 1
 	fg.dirty = map[string]bool{filepath.Join(svc.SpacePath("st-2"), "repo-a"): true}
 
@@ -147,7 +146,7 @@ func TestSagaStatusBasic(t *testing.T) {
 
 	// A base whose canonicalized ref is gone reports missing — every
 	// spelling, origin/ included, now goes through RefExists.
-	fg.refExists = false
+	fg.refMissing = true
 	fg.calls = nil
 	status, err = svc.SagaStatus(ctx, "epic-st")
 	if err != nil {
@@ -165,7 +164,6 @@ func TestSagaStatusBasic(t *testing.T) {
 	}
 
 	// Drift degrades to a repo note on AheadBehind failure.
-	fg.refExists = true
 	fg.driftErr = os.ErrInvalid
 	status, err = svc.SagaStatus(ctx, "epic-st")
 	if err != nil {
@@ -290,7 +288,6 @@ func TestSagaStatusPRLookupOverridesAndSquash(t *testing.T) {
 		}
 		return nil, nil
 	}
-	fg.refExists = true
 	fg.ancestorFn = func(bare, ancestor, descendant string) (bool, error) {
 		// Only own-1's branch landed in the OVERRIDDEN target release-1;
 		// nothing is an ancestor of the recorded origin/main.
@@ -368,7 +365,6 @@ func TestSagaStatusStackedTargetIgnoresClosedPRs(t *testing.T) {
 		}
 		return nil, nil
 	}
-	fg.refExists = true
 	bare := cfg.Repos["repo-a"].BareRepoPath
 
 	// CLOSED only: the recorded target origin/main stays.
@@ -410,7 +406,7 @@ func TestSagaStatusSiblingScanFailureDegrades(t *testing.T) {
 	if os.Getuid() == 0 {
 		t.Skip("root ignores permission bits")
 	}
-	svc, fg, cfg := testService(t)
+	svc, _, cfg := testService(t)
 	ctx := context.Background()
 	if err := svc.CreateSaga(ctx, SagaCreateOptions{ID: "epic-sf"}); err != nil {
 		t.Fatal(err)
@@ -423,7 +419,6 @@ func TestSagaStatusSiblingScanFailureDegrades(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	fg.refExists = true
 	// Execute-only work dir: ListSpaces' ReadDir fails while the manifests
 	// inside the space directories stay reachable.
 	if err := os.Chmod(cfg.AgentWorkDir, 0o311); err != nil {
@@ -453,7 +448,7 @@ func TestSagaStatusSiblingScanFailureDegrades(t *testing.T) {
 // TestSagaStatusPRLookupDegrades: a failing PRLookup yields ONE aggregated
 // degraded note and ancestry-only verdicts — never an error.
 func TestSagaStatusPRLookupDegrades(t *testing.T) {
-	svc, fg, _ := testService(t)
+	svc, _, _ := testService(t)
 	ctx := context.Background()
 	if err := svc.CreateSaga(ctx, SagaCreateOptions{ID: "epic-dg"}); err != nil {
 		t.Fatal(err)
@@ -467,7 +462,6 @@ func TestSagaStatusPRLookupDegrades(t *testing.T) {
 	svc.PRLookup = func(ctx context.Context, cloneURL, headBranch string) ([]gh.PR, error) {
 		return nil, errors.New("gh CLI not found in PATH")
 	}
-	fg.refExists = true
 	status, err := svc.SagaStatus(ctx, "epic-dg")
 	if err != nil {
 		t.Fatalf("SagaStatus() error = %v", err)
@@ -492,7 +486,7 @@ func TestSagaStatusPRLookupDegrades(t *testing.T) {
 // TestSagaStatusZeroWrites: status is a pure reader — no manifest in the work
 // dir may change bytes or mtime, PR layer active or not.
 func TestSagaStatusZeroWrites(t *testing.T) {
-	svc, fg, _ := testService(t)
+	svc, _, _ := testService(t)
 	ctx := context.Background()
 	if err := svc.CreateSaga(ctx, SagaCreateOptions{ID: "epic-zw"}); err != nil {
 		t.Fatal(err)
@@ -506,7 +500,6 @@ func TestSagaStatusZeroWrites(t *testing.T) {
 	svc.PRLookup = func(ctx context.Context, cloneURL, headBranch string) ([]gh.PR, error) {
 		return []gh.PR{{Number: 4, State: "MERGED", MergedAt: "2026-06-02T00:00:00Z", BaseRefName: "main"}}, nil
 	}
-	fg.refExists = true
 	type snapshot struct {
 		data    string
 		modTime time.Time
@@ -545,7 +538,7 @@ func TestSagaStatusZeroWrites(t *testing.T) {
 // TestSagaStatusJSONContract pins the frozen --json shape: snake_case tags,
 // omitempty behavior for non-live members, and a lossless round-trip.
 func TestSagaStatusJSONContract(t *testing.T) {
-	svc, fg, _ := testService(t)
+	svc, _, _ := testService(t)
 	ctx := context.Background()
 	if err := svc.CreateSaga(ctx, SagaCreateOptions{ID: "epic-js"}); err != nil {
 		t.Fatal(err)
@@ -560,7 +553,6 @@ func TestSagaStatusJSONContract(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	fg.refExists = true
 	status, err := svc.SagaStatus(ctx, "epic-js")
 	if err != nil {
 		t.Fatal(err)
@@ -639,7 +631,6 @@ func TestSagaSyncReportsMergeFindings(t *testing.T) {
 	if err := svc.Create(ctx, CreateOptions{ID: "ms-1", SagaID: "epic-ms", Edits: []RepoSpec{{Name: "repo-a"}}}); err != nil {
 		t.Fatal(err)
 	}
-	fg.refExists = true
 	fg.ancestorFn = func(bare, ancestor, descendant string) (bool, error) {
 		// ms-1's branch landed in origin/main; strictly behind it.
 		return ancestor == "refs/heads/stave/ms-1/repo-a" && descendant == "refs/remotes/origin/main", nil
@@ -677,7 +668,7 @@ func TestSagaSyncReportsMergeFindings(t *testing.T) {
 // sync with the same PRs writes nothing (bytes AND mtime), and later PRs
 // append without duplicating the cached ones.
 func TestSagaSyncCachesPRIdentityOnce(t *testing.T) {
-	svc, fg, _ := testService(t)
+	svc, _, _ := testService(t)
 	ctx := context.Background()
 	if err := svc.CreateSaga(ctx, SagaCreateOptions{ID: "epic-pc"}); err != nil {
 		t.Fatal(err)
@@ -685,7 +676,6 @@ func TestSagaSyncCachesPRIdentityOnce(t *testing.T) {
 	if err := svc.Create(ctx, CreateOptions{ID: "pc-1", SagaID: "epic-pc", Edits: []RepoSpec{{Name: "repo-a"}}}); err != nil {
 		t.Fatal(err)
 	}
-	fg.refExists = true
 	prs := []gh.PR{{Number: 7, State: "OPEN", BaseRefName: "main"}}
 	svc.PRLookup = func(ctx context.Context, cloneURL, headBranch string) ([]gh.PR, error) {
 		if headBranch == "stave/pc-1/repo-a" {

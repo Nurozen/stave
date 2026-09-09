@@ -17,9 +17,16 @@ type fakeGit struct {
 	calls        []string
 	branchExists bool
 	ancestor     bool
-	refExists    bool
+	// refMissing inverts the RefExists answer: the zero value models a healthy
+	// mirror where the refs a base resolves to exist, which is what AddRepo's
+	// base validation needs from nearly every test.
+	refMissing bool
+	// remotes is what RemoteNames reports; nil means the standard single
+	// origin mirror.
+	remotes    []string
+	remotesErr error
 	// ancestorFn / refExistsFn / removeFn, when set, take precedence over the
-	// flat ancestor / refExists / removeErr fields (verdict-matrix and
+	// flat ancestor / refMissing / removeErr fields (verdict-matrix and
 	// fault-injection tests need per-ref/per-path answers).
 	ancestorFn  func(bare, ancestor, descendant string) (bool, error)
 	refExistsFn func(bare, fullRef string) (bool, error)
@@ -42,6 +49,22 @@ type fakeGit struct {
 
 func (f *fakeGit) record(parts ...string) {
 	f.calls = append(f.calls, strings.Join(parts, "|"))
+}
+
+// mutatingCalls filters a fakeGit call log down to the calls that change
+// state. Dry-run paths legitimately issue read-only probes — base resolution
+// asks the bare repo for its remotes and verifies the ref exists — but must
+// never issue a mutating one.
+func mutatingCalls(calls []string) []string {
+	var out []string
+	for _, call := range calls {
+		switch strings.SplitN(call, "|", 2)[0] {
+		case "remote-names", "ref-exists", "branch-exists", "is-ancestor", "dirty", "ahead-behind":
+		default:
+			out = append(out, call)
+		}
+	}
+	return out
 }
 
 func (f *fakeGit) FetchAllPrune(ctx context.Context, bare string) error {
@@ -118,7 +141,18 @@ func (f *fakeGit) RefExists(ctx context.Context, bare, fullRef string) (bool, er
 	if f.refExistsFn != nil {
 		return f.refExistsFn(bare, fullRef)
 	}
-	return f.refExists, nil
+	return !f.refMissing, nil
+}
+
+func (f *fakeGit) RemoteNames(ctx context.Context, bare string) ([]string, error) {
+	f.record("remote-names", bare)
+	if f.remotesErr != nil {
+		return nil, f.remotesErr
+	}
+	if f.remotes == nil {
+		return []string{"origin"}, nil
+	}
+	return f.remotes, nil
 }
 
 func (f *fakeGit) IsDirty(ctx context.Context, path string) (bool, string, error) {
@@ -139,6 +173,9 @@ func (f *fakeGit) AheadBehind(ctx context.Context, path, base string) (int, int,
 	}
 	return f.ahead, f.behind, nil
 }
+
+// cfgRepoA is the bare mirror path of repo-a in a testService config.
+func cfgRepoA(svc Service) string { return svc.Config.Repos["repo-a"].BareRepoPath }
 
 func testService(t *testing.T) (Service, *fakeGit, config.Config) {
 	t.Helper()
@@ -722,17 +759,23 @@ func TestAddRepoSpaceSugarRequiresTargetBranch(t *testing.T) {
 	if err := svc.InitSpace(context.Background(), InitOptions{ID: "stack-1"}); err != nil {
 		t.Fatal(err)
 	}
+	fg.refMissing = true
 	err := svc.AddRepo(context.Background(), AddOptions{SpaceID: "stack-1", RepoName: "repo-a", Mode: ModeEdit, Base: "space:ghost", NoFetch: true})
 	if err == nil || !strings.Contains(err.Error(), `space "ghost" has no branch "stave/ghost/repo-a"`) {
 		t.Fatalf("missing-target error = %v", err)
+	}
+	if code := ErrorCode(err); code != CodeRefNotFound {
+		t.Fatalf("missing-target code = %q, want %q", code, CodeRefNotFound)
 	}
 	if containsCallPrefix(fg.calls, "add-branch|") || containsCallPrefix(fg.calls, "add-existing|") {
 		t.Fatalf("worktree created despite missing sugar target: %#v", fg.calls)
 	}
 
-	// Canonicalization warning + no BranchExists preflight for stave-spelled bases.
+	// Canonicalization warning; the resolved stave branch is preflighted via
+	// RefExists (on the full ref), never via the branch-name BranchExists probe.
 	fg.calls = nil
 	out.Reset()
+	fg.refMissing = false
 	fg.branchExists = false
 	if err := svc.AddRepo(context.Background(), AddOptions{SpaceID: "stack-1", RepoName: "repo-a", Mode: ModeEdit, Base: "origin/stave/other/repo-a", NoFetch: true}); err != nil {
 		t.Fatalf("AddRepo(canonicalized base) error = %v", err)
@@ -742,6 +785,9 @@ func TestAddRepoSpaceSugarRequiresTargetBranch(t *testing.T) {
 	}
 	if !containsCallPrefix(fg.calls, "add-branch|") {
 		t.Fatalf("worktree not created: %#v", fg.calls)
+	}
+	if !containsCall(fg.calls, "ref-exists|"+cfgRepoA(svc)+"|refs/heads/stave/other/repo-a") {
+		t.Fatalf("canonicalized base was not preflighted: %#v", fg.calls)
 	}
 	manifest, err := LoadManifest(svc.SpacePath("stack-1"))
 	if err != nil {
@@ -766,8 +812,8 @@ func TestAddRepoDryRunResolvesSugarWithoutGit(t *testing.T) {
 	if !strings.Contains(out.String(), "from refs/heads/stave/feat-1/repo-a") {
 		t.Fatalf("dry-run did not print resolved sugar ref:\n%s", out.String())
 	}
-	if len(fg.calls) != 0 {
-		t.Fatalf("dry-run touched git: %#v", fg.calls)
+	if mutating := mutatingCalls(fg.calls); len(mutating) != 0 {
+		t.Fatalf("dry-run issued mutating git calls: %#v", mutating)
 	}
 }
 
@@ -785,8 +831,8 @@ func TestCreateDryRunResolvesSugarInEditLoop(t *testing.T) {
 	if !strings.Contains(out.String(), "from refs/heads/stave/feat-1/repo-a") {
 		t.Fatalf("dry-run did not print resolved sugar ref:\n%s", out.String())
 	}
-	if len(fg.calls) != 0 {
-		t.Fatalf("dry-run touched git: %#v", fg.calls)
+	if mutating := mutatingCalls(fg.calls); len(mutating) != 0 {
+		t.Fatalf("dry-run issued mutating git calls: %#v", mutating)
 	}
 	if err := svc.Create(context.Background(), CreateOptions{
 		ID:     "dry-sugar",

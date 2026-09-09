@@ -574,6 +574,34 @@ Space flags:
 | `--from` | `restore` | `.archive/` entry name to restore when several `<id>-<timestamp>` copies exist |
 | `--dry-run` | `create`, `add`, `remove`, `archive`, `restore`, `destroy` | Print Git operations without changing state |
 
+#### Base and ref resolution
+
+A base (`-e repo:<base>`, `--base`) or reference ref (`-r repo:<ref>`) is
+resolved against the remotes the repo's bare mirror actually has, then checked
+for existence before any worktree is created:
+
+| Spelling | Resolves to | Recorded as |
+|----------|-------------|-------------|
+| `main` | `refs/remotes/origin/main` | `origin/main` |
+| `origin/main` | `refs/remotes/origin/main` | `origin/main` |
+| `fork/main`, when the mirror has a `fork` remote | `refs/remotes/fork/main` | `refs/remotes/fork/main` |
+| `fork/main`, when it does not | `refs/remotes/origin/fork/main` | `origin/fork/main` |
+| `refs/...` | itself | itself |
+
+So a mirror with a second remote (`stave repos add` clones one `origin`; a
+fork remote is added with `git remote add` in the bare repo) can be based on
+that remote directly — `-e t3code:fork/main` — instead of the long
+`refs/remotes/fork/main` spelling. A first path segment that names no remote
+is still treated as a branch on `origin`, which keeps `feature/login` working.
+
+A ref that resolves to nothing is refused by Stave, not by `git worktree add`:
+the message names the full ref it looked for and the remotes the mirror has,
+and `--json` returns `{"error":{"code":"ref_not_found","details":{"repo","ref","tried","remotes"}}}`.
+`--dry-run` performs the same resolution and the same check, so the printed
+plan names the ref the real run would use. The check reads the mirror as it
+stands; run `stave repos sync <repo>` first if the branch was pushed since the
+last fetch.
+
 When `--spec` points at a file, it is copied under `spec/` with its original basename. When it points at a directory, the directory contents are copied into `spec/`. The manifest records `specPath: spec`.
 
 When `--summon` is present, unrecognized trailing flags are passed verbatim to
@@ -972,6 +1000,8 @@ exits 1 (nothing is written to stderr):
 | `saga_member` | a single-space verb was aimed at a saga member; `stave saga remove` it first (or a space is already a member of another saga) | `saga` |
 | `invalid_name` | a space id or repo name fails the safe-name pattern | `label`, `name` |
 | `branch_missing` | restore: an edit repo's recorded branch no longer exists in the bare repo | `repo`, `branch` |
+| `ref_not_found` | `space create`/`add`: the base or reference ref resolves to nothing in the repo's bare mirror | `repo`, `ref`, `tried`, `remotes[]` |
+| `repo_path_taken` | `space add`: another manifest entry already occupies the directory the repo would take | `space`, `repo`, `path` |
 | `ambiguous_archive` | restore: several `<space-id>-<timestamp>` archives match; pass `--from` | `candidates[]` |
 | `archive_not_found` | restore: no `.archive/` entry for the id | |
 | `repo_exists` | `repos add`: the name is already registered | `repo` |
