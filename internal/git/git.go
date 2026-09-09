@@ -122,6 +122,23 @@ func (c *Client) RemoteFetchRefspecs(ctx context.Context, bareRepo, remote strin
 	return refspecs, nil
 }
 
+// RemoteNames lists the remotes configured on the bare repo, in the order
+// 'git remote' reports them. It is a read-only probe, so it runs under DryRun.
+// A repo with no remotes yields an empty slice rather than an error.
+func (c *Client) RemoteNames(ctx context.Context, bareRepo string) ([]string, error) {
+	out, err := c.probeOutput(ctx, "--git-dir", bareRepo, "remote")
+	if err != nil {
+		return nil, err
+	}
+	var remotes []string
+	for _, line := range strings.Split(out, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			remotes = append(remotes, line)
+		}
+	}
+	return remotes, nil
+}
+
 func (c *Client) FetchAllPrune(ctx context.Context, bareRepo string) error {
 	_, err := c.run(ctx, "--git-dir", bareRepo, "fetch", "--all", "--prune")
 	return err

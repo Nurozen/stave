@@ -636,6 +636,12 @@ func (r *executorGitRunner) Run(ctx context.Context, bin string, args []string, 
 	r.calls = append(r.calls, append([]string(nil), args...))
 	joined := strings.Join(args, " ")
 	switch {
+	case strings.HasSuffix(joined, " remote"):
+		return git.Result{Stdout: "origin\n"}, nil
+	// The mirror has the remote-tracking refs the plan's bases name; the
+	// stave/... branches the worktrees would mint do not exist yet.
+	case strings.Contains(joined, "show-ref") && strings.Contains(joined, "refs/remotes/"):
+		return git.Result{}, nil
 	case strings.Contains(joined, "show-ref"):
 		return git.Result{}, &git.GitError{Args: args, ExitCode: 1}
 	case strings.Contains(joined, "status --porcelain"):

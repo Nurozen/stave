@@ -566,13 +566,52 @@ Space flags:
 | `--include-weak` | `create` | With `--common`, widen the expansion to weak tethers too (implies `-c`) |
 | `--no-learn` | `create`, `add` | Do not record co-occurrence tethers for this invocation |
 | `--edit`, `-e` / `--reference`, `-r` | `add`, `remove` | Mode: exactly one required for `add`; for `remove` one is required only when the repo is present in both modes |
-| `--base`, `-b` | `add` | Base branch/ref for edits (`space:<id>` sugar accepted), or ref for references |
+| `--base`, `-b` | `add` | Base branch/ref for edits (`space:<id>` sugar accepted; see [Base and ref resolution](#base-and-ref-resolution)), or ref for references |
 | `--branch` | `add` | Branch name for editable repos |
-| `--no-fetch` | `add` | Skip fetching the bare repo before adding |
+| `--no-fetch` | `create`, `add` | Skip fetching the bare repo(s) before adding the worktree(s) |
 | `--references-only` | `sync` | Only sync reference worktrees |
 | `--force` | `remove`, `archive`, `destroy` | Proceed despite dirty edit worktrees (and, for `remove`/`archive`/`destroy`, other spaces stacked on the affected branches) |
 | `--from` | `restore` | `.archive/` entry name to restore when several `<id>-<timestamp>` copies exist |
 | `--dry-run` | `create`, `add`, `remove`, `archive`, `restore`, `destroy` | Print Git operations without changing state |
+
+#### Base and ref resolution
+
+A base (`-e repo:<base>`, `--base`) or reference ref (`-r repo:<ref>`) is
+resolved against the remotes the repo's bare mirror actually has, then checked
+for existence before any worktree is created:
+
+| Spelling | Resolves to | Recorded as |
+|----------|-------------|-------------|
+| `main` | `refs/remotes/origin/main` | `origin/main` |
+| `origin/main` | `refs/remotes/origin/main` | `origin/main` |
+| `fork/main`, when the mirror has a `fork` remote | `refs/remotes/fork/main` | `refs/remotes/fork/main` |
+| `fork/main`, when it does not | `refs/remotes/origin/fork/main` | `origin/fork/main` |
+| `refs/...` | itself | itself |
+
+So a mirror with a second remote (`stave repos add` clones one `origin`; a
+fork remote is added with `git remote add` in the bare repo) can be based on
+that remote directly — `-e t3code:fork/main` — instead of the long
+`refs/remotes/fork/main` spelling. A first path segment that names no remote
+is still treated as a branch on `origin`, which keeps `feature/login` working.
+
+A ref that resolves to nothing is refused by Stave, not by `git worktree add`:
+the message names the full ref it looked for and the remotes the mirror has,
+and `--json` returns `{"error":{"code":"ref_not_found","details":{"repo","ref","tried","remotes"}}}`.
+
+The check only refuses what a fetch could not fix, so it never makes a preview
+stricter than the run it previews:
+
+- A **local** ref — what `space:<id>` sugar and hand-typed `stave/...` bases
+  resolve to — is always conclusive. Stave never pushes its own branches, so no
+  fetch could conjure one.
+- A **remote-tracking** ref is conclusive only when that command fetched the
+  mirror itself. Under `--dry-run` (which only prints the fetch), `--no-fetch`,
+  or `space retarget` (which never fetches), a miss is a `warning:` on stderr
+  and the command proceeds — the branch may simply not be mirrored yet. Run
+  `stave repos sync <repo>` to make the answer authoritative.
+
+Either way `--dry-run` resolves the spelling exactly as the real run does, so
+the printed plan names the ref that run would use.
 
 When `--spec` points at a file, it is copied under `spec/` with its original basename. When it points at a directory, the directory contents are copied into `spec/`. The manifest records `specPath: spec`.
 
@@ -619,9 +658,9 @@ stave space retarget pay-2 --repo api --base origin/main
 ```
 
 `retarget` rewrites only the recorded base in the manifest — the ref drift is
-measured against — without touching the worktree. `--repo` is required, the
-same base sugar and canonicalization apply, and a resolved `stave/...` base
-must exist in the bare repo. Archiving or destroying a space that a sibling
+measured against — without touching the worktree. `--repo` is required, and
+the same base sugar, canonicalization, remote resolution and existence check
+apply as for `create`/`add`, so the new base must resolve in the bare repo. Archiving or destroying a space that a sibling
 still stacks on fails closed unless `--force` is given.
 
 ### Learned repo tethers
@@ -799,7 +838,15 @@ prints a note that saga status may be stale until `stave saga sync`.
 
 Summoned agents always launch from `agent-work/<space-id>`, not from an individual repo. That gives them the manifest, generated `AGENTS.md`, copied specs, editable top-level repos, and `references/` context in one working directory.
 
-`--print-command` prints the launch command instead of running it. Non-interactive terminals also print instead of launching. `cursor` maps to the Cursor Agent CLI (`cursor-agent`), not the Cursor GUI editor.
+`--print-command` prints the launch command instead of running it, and exits 0.
+Non-interactive terminals also print instead of launching, but exit **3** with
+a notice on stderr — the command itself stays on stdout, so it is still
+pipeable, and a scripted caller can tell "printed a command, launched nothing"
+from "launched the agent, which exited 0". Verbs that only trail a summon
+(`space create --summon`, `saga create --summon`, `review --summon`) keep their
+own exit status: their work succeeded, and the skipped launch is a stderr
+notice. `cursor` maps to the Cursor Agent CLI (`cursor-agent`), not the Cursor
+GUI editor.
 
 Agent flags can also follow the direct command, for example
 `stave summon ticket-482 --with codex --yolo`.
@@ -970,16 +1017,29 @@ exits 1 (nothing is written to stderr):
 | `repo_mode_ambiguous` | `space remove` needs `--edit` or `--reference` because the repo is present in both modes | `repo`, `modes` |
 | `saga_space` | a single-space verb was aimed at a saga space; use `stave saga archive|destroy` | |
 | `saga_member` | a single-space verb was aimed at a saga member; `stave saga remove` it first (or a space is already a member of another saga) | `saga` |
+| `not_a_saga` | a saga verb was aimed at a space with no saga roster | `space` |
+| `not_a_saga_member` | `saga remove`: the space is not on that saga's roster | `space`, `saga` |
+| `memory_not_found` | `memory status/sync/propose/detach`: the space has no attachment under that alias | `space`, `memory` |
+| `memory_alias_required` | the space has several attachments and the verb needs one alias | `space`, `count` |
+| `memory_already_attached` | `memory attach` / `space create --memory`: the alias is already attached | `space`, `memory` |
 | `invalid_name` | a space id or repo name fails the safe-name pattern | `label`, `name` |
 | `branch_missing` | restore: an edit repo's recorded branch no longer exists in the bare repo | `repo`, `branch` |
+| `ref_not_found` | `space create`/`add`/`retarget`: the base or reference ref resolves to nothing in the repo's bare mirror | `repo`, `ref`, `tried`, `remotes[]` |
+| `repo_path_taken` | `space add`: another manifest entry already occupies the directory the repo would take | `space`, `repo`, `path` |
 | `ambiguous_archive` | restore: several `<space-id>-<timestamp>` archives match; pass `--from` | `candidates[]` |
 | `archive_not_found` | restore: no `.archive/` entry for the id | |
 | `repo_exists` | `repos add`: the name is already registered | `repo` |
 | `cache_exists` | `repos add`: a bare repo already sits at the derived cache path; pass `--adopt` to reuse it | `repo`, `path` |
 | `clone_failed` | `repos add`: the fresh bare clone failed; `message` carries the git error | `repo` |
 | `config_exists` | `setup`: the config file exists and `--force` was not given | `path` |
-| `invalid_arguments` | flag/usage refusal (`--edit` with `--reference`, `--memory destroy` on archive, `--summon` with `--json`, `--repo`/`--base` missing on retarget, ...) | |
+| `invalid_arguments` | flag/usage refusal (`--edit` with `--reference`, `--memory destroy` on archive, `--summon` with `--json`, `--repo`/`--base` missing on retarget, `--after` without `--saga`, a saga added to itself, tethers disabled, ...) | varies |
 | `unknown` | any other failure; `message` is the human error text | |
+
+The read-only probes carry the envelope too: `space status --json`,
+`saga status --json` and `saga list --json` answer a failure with
+`{"error": {code, ...}}` on stdout and exit 1, so `space status <id> --json`
+is a usable existence check (`space_not_found`) rather than a prose message
+to parse.
 
 When `saga archive|destroy` fails **mid-walk** (a member's or the saga space's
 own teardown step errors after earlier members were already torn down), the

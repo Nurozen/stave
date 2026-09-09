@@ -2733,3 +2733,78 @@ func TestCLICredentialedURLNeverEchoed(t *testing.T) {
 		t.Fatalf("collision hint leaked the credential:\n%s\n%v", out, err)
 	}
 }
+
+// TestCLISummonNonInteractiveExitsDistinctly pins the scripted contract: an
+// off-TTY summon prints the command and reports exit 3, so a caller can tell
+// it from a launch that succeeded; --print-command asks for the same output
+// deliberately and stays exit 0. Composite verbs that only trail a summon
+// keep their own exit status.
+func TestCLISummonNonInteractiveExitsDistinctly(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	runCLI(t, "setup")
+	runCLI(t, "space", "init", "ex-nt")
+
+	launcher := &fakeSummonLauncher{}
+	offTTY := func() *app {
+		return &app{summonLauncher: launcher, isTerminal: func(*cobra.Command) bool { return false }}
+	}
+
+	var stdout, stderr bytes.Buffer
+	cmd := newRootCommand(offTTY())
+	cmd.SetArgs([]string{"summon", "ex-nt", "--with", "codex"})
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("off-TTY summon exited 0")
+	}
+	exitErr, ok := err.(interface {
+		ExitCode() int
+		Silent() bool
+	})
+	if !ok || exitErr.ExitCode() != 3 || !exitErr.Silent() {
+		t.Fatalf("off-TTY summon error = %#v", err)
+	}
+	if launcher.called {
+		t.Fatal("off-TTY summon launched the agent")
+	}
+	// The command stays on stdout (pipeable) and the notice on stderr.
+	if !strings.Contains(stdout.String(), "codex --cd") || strings.Contains(stdout.String(), "Non-interactive") {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "Non-interactive terminal detected") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+
+	// --print-command is an explicit request, not a degrade.
+	stdout.Reset()
+	stderr.Reset()
+	cmd = newRootCommand(offTTY())
+	cmd.SetArgs([]string{"summon", "ex-nt", "--with", "codex", "--print-command"})
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("--print-command error = %v", err)
+	}
+	if !strings.Contains(stdout.String(), "codex --cd") {
+		t.Fatalf("--print-command stdout = %q", stdout.String())
+	}
+
+	// The space was still created, so `space create --summon` stays exit 0.
+	stdout.Reset()
+	stderr.Reset()
+	cmd = newRootCommand(offTTY())
+	cmd.SetArgs([]string{"space", "create", "ex-nt2", "--summon", "codex"})
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("space create --summon off-TTY error = %v", err)
+	}
+	if !strings.Contains(stderr.String(), "Non-interactive terminal detected") {
+		t.Fatalf("space create --summon stderr = %q", stderr.String())
+	}
+	if _, statErr := os.Stat(filepath.Join(home, "stave", "agent-work", "ex-nt2")); statErr != nil {
+		t.Fatalf("space create --summon did not create the space: %v", statErr)
+	}
+}

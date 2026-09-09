@@ -199,6 +199,7 @@ func ToolDefinitions() []ToolDefinition {
 				},
 				"common":       boolSchema("When true, expand each editable repo's strong tethers into reference worktrees (-c)."),
 				"include_weak": boolSchema("When true, widen tether expansion to weak tethers (implies common)."),
+				"no_fetch":     boolSchema("When true, do not fetch the bare repos before adding the worktrees."),
 			}, []string{"space_id"}),
 		},
 		{
@@ -565,7 +566,7 @@ func (d *ToolDispatcher) dispatch(ctx context.Context, call ToolCall) ToolResult
 		if err != nil {
 			return toolError(call, err)
 		}
-		op := Operation{Type: OpSpaceCreate, SpaceID: args.SpaceID, Kind: args.Kind, SpecPath: args.SpecPath, Edits: edits, References: args.References, Memories: args.Memories, Common: args.Common || args.IncludeWeak, IncludeWeak: args.IncludeWeak}
+		op := Operation{Type: OpSpaceCreate, SpaceID: args.SpaceID, Kind: args.Kind, SpecPath: args.SpecPath, Edits: edits, References: args.References, Memories: args.Memories, Common: args.Common || args.IncludeWeak, IncludeWeak: args.IncludeWeak, NoFetch: args.NoFetch}
 		return d.queueOperation(call, op)
 	case ToolSpaceAdd:
 		var args spaceAddArgs
@@ -1103,6 +1104,7 @@ type spaceCreateArgs struct {
 	Memories    []string  `json:"memories"`
 	Common      bool      `json:"common"`
 	IncludeWeak bool      `json:"include_weak"`
+	NoFetch     bool      `json:"no_fetch"`
 }
 
 type spaceAddArgs struct {

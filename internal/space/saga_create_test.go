@@ -171,8 +171,8 @@ func TestCreateInSagaDryRunRegistersNothing(t *testing.T) {
 	if !strings.Contains(out.String(), "dry-run: add dry-m1 to saga epic-dry") {
 		t.Fatalf("dry-run missing registration line:\n%s", out.String())
 	}
-	if len(fg.calls) != 0 {
-		t.Fatalf("dry-run touched git: %#v", fg.calls)
+	if mutating := mutatingCalls(fg.calls); len(mutating) != 0 {
+		t.Fatalf("dry-run issued mutating git calls: %#v", mutating)
 	}
 	if _, err := os.Stat(svc.SpacePath("dry-m1")); !os.IsNotExist(err) {
 		t.Fatalf("dry-run created the space: %v", err)

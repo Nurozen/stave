@@ -1,7 +1,6 @@
 package space
 
 import (
-	"errors"
 	"fmt"
 
 	"github.com/Nurozen/stave/internal/config"
@@ -170,7 +169,7 @@ func stampStrength(f *tether.File, threshold int) {
 // not registered in config.Repos is skipped with an accumulated note.
 func (s Service) ExpandCommonRefs(cfg config.Config, edits, explicitRefs []RepoSpec, includeWeak bool) (extra []RepoSpec, notes []string, err error) {
 	if !cfg.Tethers.IsEnabled() {
-		return nil, nil, errors.New("repo tethers are disabled; enable tethers.enabled in config to use -c/--common")
+		return nil, nil, coded(CodeInvalidArguments, nil, "repo tethers are disabled; enable tethers.enabled in config to use -c/--common")
 	}
 	f, err := tether.Load(tether.Path(cfg))
 	if err != nil {

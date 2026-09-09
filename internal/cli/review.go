@@ -190,7 +190,7 @@ the space was created, it says so and suggests recreating the space.`,
 			if err := a.requestShellChdir(filepath.Join(cfg.AgentWorkDir, result.SpaceID)); err != nil {
 				return err
 			}
-			return a.runSummon(cmd, *cfg, result.SpaceID, summonName, summonPrompt, agentArgs, false)
+			return a.summonNotice(cmd, *cfg, result.SpaceID, summonName, summonPrompt, agentArgs)
 		},
 	}
 	cmd.Flags().StringVar(&summonName, "summon", "", "launch a summoner in the review space (codex, claude, or cursor)")

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 )
 
 // Stable error codes for machine-readable (--json) consumers. GUI hosts key
@@ -22,6 +23,13 @@ const (
 	CodeSagaMember         = "saga_member"
 	CodeInvalidName        = "invalid_name"
 	CodeBranchMissing      = "branch_missing"
+	CodeRefNotFound        = "ref_not_found"
+	CodeRepoPathTaken      = "repo_path_taken"
+	CodeNotASaga           = "not_a_saga"
+	CodeNotASagaMember     = "not_a_saga_member"
+	CodeMemoryNotFound     = "memory_not_found"
+	CodeMemoryAliasNeeded  = "memory_alias_required"
+	CodeMemoryAttached     = "memory_already_attached"
 	CodeAmbiguousArchive   = "ambiguous_archive"
 	CodeArchiveNotFound    = "archive_not_found"
 	CodeInvalidArguments   = "invalid_arguments"
@@ -209,6 +217,56 @@ func (e *BranchMissingError) Code() string { return CodeBranchMissing }
 
 func (e *BranchMissingError) Details() map[string]any {
 	return map[string]any{"repo": e.Repo, "branch": e.Branch}
+}
+
+// RefNotFoundError: a base/ref spelling did not resolve to any ref in the
+// repo's bare mirror. Tried is the full ref stave looked for and Remotes is
+// what the mirror actually has, so a caller who spelled a non-origin remote
+// wrong can see both halves without re-deriving them.
+type RefNotFoundError struct {
+	Repo    string
+	Ref     string
+	Tried   string
+	Remotes []string
+}
+
+func (e *RefNotFoundError) Error() string {
+	msg := fmt.Sprintf("repo %q: ref %q does not resolve (looked for %s)", e.Repo, e.Ref, e.Tried)
+	if len(e.Remotes) > 0 {
+		msg += fmt.Sprintf("; remotes on the bare repo: %s", strings.Join(e.Remotes, ", "))
+	}
+	// Only a remote-tracking ref can be fixed by fetching. A local ref is one
+	// stave owns and never pushes, so pointing at 'repos sync' would send the
+	// reader somewhere that cannot help.
+	if strings.HasPrefix(e.Tried, "refs/remotes/") {
+		msg += "; run 'stave repos sync " + e.Repo + "' if the branch was pushed after the last fetch"
+	}
+	return msg
+}
+
+func (e *RefNotFoundError) Code() string { return CodeRefNotFound }
+
+func (e *RefNotFoundError) Details() map[string]any {
+	return map[string]any{"repo": e.Repo, "ref": e.Ref, "tried": e.Tried, "remotes": e.Remotes}
+}
+
+// RepoPathTakenError: the directory a repo would occupy inside the space is
+// already claimed by another manifest entry. Distinct from
+// RepoAlreadyInSpaceError, which is about the same repo in the same mode.
+type RepoPathTakenError struct {
+	SpaceID string
+	Repo    string
+	Path    string
+}
+
+func (e *RepoPathTakenError) Error() string {
+	return fmt.Sprintf("repo path %q already exists in manifest", e.Path)
+}
+
+func (e *RepoPathTakenError) Code() string { return CodeRepoPathTaken }
+
+func (e *RepoPathTakenError) Details() map[string]any {
+	return map[string]any{"space": e.SpaceID, "repo": e.Repo, "path": e.Path}
 }
 
 // loadLiveManifest loads spaceID's manifest, typing a missing one as

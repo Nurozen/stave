@@ -114,7 +114,7 @@ func TestCLIJSONSpaceRetarget(t *testing.T) {
 	if code, _ := jsonErrorCode(t, "space", "retarget", "rt-j", "--repo", "repo-a", "--json"); code != space.CodeInvalidArguments {
 		t.Fatalf("retarget without --base = %s", code)
 	}
-	if code, _ := jsonErrorCode(t, "space", "retarget", "rt-j", "--repo", "repo-b", "--base", "origin/main", "--json"); code != space.CodeUnknown {
+	if code, _ := jsonErrorCode(t, "space", "retarget", "rt-j", "--repo", "repo-b", "--base", "origin/main", "--json"); code != space.CodeRepoNotInSpace {
 		t.Fatalf("retarget reference repo = %s", code)
 	}
 	// Human refusal is unchanged: plain error, no envelope.
@@ -201,7 +201,7 @@ func TestCLIJSONSagaSync(t *testing.T) {
 	if code, _ := jsonErrorCode(t, "saga", "sync", "epic-missing", "--json"); code != space.CodeSpaceNotFound {
 		t.Fatalf("saga sync missing = %s", code)
 	}
-	if code, _ := jsonErrorCode(t, "saga", "sync", "m-1", "--json"); code != space.CodeUnknown {
+	if code, _ := jsonErrorCode(t, "saga", "sync", "m-1", "--json"); code != space.CodeNotASaga {
 		t.Fatalf("saga sync non-saga = %s", code)
 	}
 }
@@ -318,5 +318,35 @@ func TestCLISetupHumanFirstRunUnchanged(t *testing.T) {
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("setup did not create %s: %v", path, err)
 		}
+	}
+}
+
+// TestCLIJSONReadVerbsUseTheEnvelope pins the probe contract a scripted caller
+// depends on: the read-only --json verbs answer a failure with the same coded
+// envelope the mutating verbs use, not raw prose on stdout.
+func TestCLIJSONReadVerbsUseTheEnvelope(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	runCLI(t, "setup")
+	runCLI(t, "space", "init", "probe-1")
+
+	if code, _ := jsonErrorCode(t, "space", "status", "ghost", "--json"); code != space.CodeSpaceNotFound {
+		t.Fatalf("space status missing = %s", code)
+	}
+	if code, _ := jsonErrorCode(t, "space", "status", "../escape", "--json"); code != space.CodeInvalidName {
+		t.Fatalf("space status bad id = %s", code)
+	}
+	if code, _ := jsonErrorCode(t, "saga", "status", "ghost", "--json"); code != space.CodeSpaceNotFound {
+		t.Fatalf("saga status missing = %s", code)
+	}
+	if code, _ := jsonErrorCode(t, "saga", "status", "probe-1", "--json"); code != space.CodeNotASaga {
+		t.Fatalf("saga status non-saga = %s", code)
+	}
+	// The success shapes are untouched.
+	if payload := decodeJSONObject(t, runCLI(t, "space", "status", "probe-1", "--json")); payload["spaceId"] != "probe-1" {
+		t.Fatalf("space status payload = %v", payload)
+	}
+	if rows := decodeJSONArray(t, runCLI(t, "saga", "list", "--json")); len(rows) != 1 {
+		t.Fatalf("saga list payload = %v", rows)
 	}
 }

@@ -958,3 +958,40 @@ func TestRemoteConfigURLIsRawWhileRemoteURLIsRewritten(t *testing.T) {
 		t.Fatalf("ConfigureBareRemoteTracking(multi-valued) error = %v, want git exit 5", err)
 	}
 }
+
+func TestRemoteNamesListsEveryConfiguredRemote(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	source := filepath.Join(tmp, "source")
+	bare := filepath.Join(tmp, "repo.git")
+
+	runGitTestCommand(t, "", "init", "--initial-branch=main", source)
+	runGitTestCommand(t, source, "config", "user.email", "test@example.invalid")
+	runGitTestCommand(t, source, "config", "user.name", "Stave Test")
+	runGitTestCommand(t, source, "commit", "--allow-empty", "-m", "initial")
+
+	client := New()
+	if err := client.CloneBare(ctx, source, bare); err != nil {
+		t.Fatalf("CloneBare() error = %v", err)
+	}
+	remotes, err := client.RemoteNames(ctx, bare)
+	if err != nil {
+		t.Fatalf("RemoteNames() error = %v", err)
+	}
+	if !reflect.DeepEqual(remotes, []string{"origin"}) {
+		t.Fatalf("RemoteNames() = %#v, want [origin]", remotes)
+	}
+
+	runGitTestCommand(t, "", "--git-dir", bare, "remote", "add", "fork", source)
+	remotes, err = client.RemoteNames(ctx, bare)
+	if err != nil {
+		t.Fatalf("RemoteNames() error = %v", err)
+	}
+	if !reflect.DeepEqual(remotes, []string{"fork", "origin"}) {
+		t.Fatalf("RemoteNames() = %#v, want [fork origin]", remotes)
+	}
+
+	if _, err := client.RemoteNames(ctx, filepath.Join(tmp, "missing.git")); err == nil {
+		t.Fatal("RemoteNames() on a missing repo returned no error")
+	}
+}
