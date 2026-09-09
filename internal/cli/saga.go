@@ -183,32 +183,34 @@ func (a *app) sagaListCommand() *cobra.Command {
 		Short: "List all spaces with their kind and saga membership",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			svc, err := a.service(cmd)
-			if err != nil {
-				return err
-			}
-			entries, err := svc.SagaList()
-			if err != nil {
-				return err
-			}
-			if jsonOut {
-				rows := make([]sagaListRow, 0, len(entries))
-				for _, entry := range entries {
-					row := sagaListRow{ID: entry.ID, Kind: entry.Kind, IsSaga: entry.IsSaga, Members: entry.Members, MemberOf: entry.MemberOf, Path: entry.Path}
-					if entry.Err != nil {
-						row.Error = entry.Err.Error()
-					} else {
-						logicalID := entry.LogicalID
-						row.LogicalID = &logicalID
-					}
-					rows = append(rows, row)
+			return runJSON(cmd, jsonOut, func() (any, error) {
+				svc, err := a.service(cmd)
+				if err != nil {
+					return nil, err
 				}
-				return writeJSON(cmd.OutOrStdout(), rows)
-			}
-			for _, entry := range entries {
-				fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\n", entry.ID, firstNonEmpty(entry.Kind, "-"), sagaMembershipColumn(entry))
-			}
-			return nil
+				entries, err := svc.SagaList()
+				if err != nil {
+					return nil, err
+				}
+				if jsonOut {
+					rows := make([]sagaListRow, 0, len(entries))
+					for _, entry := range entries {
+						row := sagaListRow{ID: entry.ID, Kind: entry.Kind, IsSaga: entry.IsSaga, Members: entry.Members, MemberOf: entry.MemberOf, Path: entry.Path}
+						if entry.Err != nil {
+							row.Error = entry.Err.Error()
+						} else {
+							logicalID := entry.LogicalID
+							row.LogicalID = &logicalID
+						}
+						rows = append(rows, row)
+					}
+					return rows, nil
+				}
+				for _, entry := range entries {
+					fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\n", entry.ID, firstNonEmpty(entry.Kind, "-"), sagaMembershipColumn(entry))
+				}
+				return nil, nil
+			})
 		},
 	}
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON")
@@ -240,19 +242,24 @@ func (a *app) sagaStatusCommand() *cobra.Command {
 		Short: "Show saga members in topological order with drift and topology notes",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			svc, err := a.service(cmd)
-			if err != nil {
-				return err
-			}
-			status, err := svc.SagaStatus(cmd.Context(), args[0])
-			if err != nil {
-				return err
-			}
-			if jsonOut {
-				return writeJSON(cmd.OutOrStdout(), status)
-			}
-			printSagaStatus(cmd.OutOrStdout(), status)
-			return nil
+			// Wrapped in runJSON so a failed probe answers with the
+			// {"error": {code, ...}} envelope like the mutating saga verbs;
+			// the success shape is the frozen SagaStatus contract, unchanged.
+			return runJSON(cmd, jsonOut, func() (any, error) {
+				svc, err := a.service(cmd)
+				if err != nil {
+					return nil, err
+				}
+				status, err := svc.SagaStatus(cmd.Context(), args[0])
+				if err != nil {
+					return nil, err
+				}
+				if jsonOut {
+					return status, nil
+				}
+				printSagaStatus(cmd.OutOrStdout(), status)
+				return nil, nil
+			})
 		},
 	}
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON (the frozen SagaStatus contract)")

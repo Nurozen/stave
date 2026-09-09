@@ -2233,27 +2233,32 @@ func (a *app) statusCommand() *cobra.Command {
 		Short: "Show workspace manifest, dirty state, and editable drift",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			svc, err := a.service(cmd)
-			if err != nil {
-				return err
-			}
-			status, err := svc.Status(cmd.Context(), args[0])
-			if err != nil {
-				return err
-			}
-			// S4 skew intelligence: each memory row gains a compact state
-			// suffix (e.g. " (2 unpushed)", " (stale)"); provider failures
-			// degrade to no suffix.
-			memStates := map[string]string{}
-			for _, mem := range status.Manifest.Memories {
-				memStates[mem.Name] = svc.MemoryStateSuffix(cmd.Context(), mem)
-			}
-			spacePath := svc.SpacePath(args[0])
-			if jsonOut {
-				return writeJSON(cmd.OutOrStdout(), buildSpaceStatusJSON(args[0], spacePath, status, memStates))
-			}
-			printStatus(cmd.OutOrStdout(), spacePath, status, memStates)
-			return nil
+			// Wrapped in runJSON so a failed probe answers with the
+			// {"error": {code, ...}} envelope like every other --json verb;
+			// a missing space is space_not_found, not a raw os.Open message.
+			return runJSON(cmd, jsonOut, func() (any, error) {
+				svc, err := a.service(cmd)
+				if err != nil {
+					return nil, err
+				}
+				status, err := svc.Status(cmd.Context(), args[0])
+				if err != nil {
+					return nil, err
+				}
+				// S4 skew intelligence: each memory row gains a compact state
+				// suffix (e.g. " (2 unpushed)", " (stale)"); provider failures
+				// degrade to no suffix.
+				memStates := map[string]string{}
+				for _, mem := range status.Manifest.Memories {
+					memStates[mem.Name] = svc.MemoryStateSuffix(cmd.Context(), mem)
+				}
+				spacePath := svc.SpacePath(args[0])
+				if jsonOut {
+					return buildSpaceStatusJSON(args[0], spacePath, status, memStates), nil
+				}
+				printStatus(cmd.OutOrStdout(), spacePath, status, memStates)
+				return nil, nil
+			})
 		},
 	}
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON")

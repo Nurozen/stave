@@ -355,7 +355,7 @@ func (s Service) SagaStatus(ctx context.Context, sagaID string) (SagaStatus, err
 	if err != nil {
 		return SagaStatus{}, err
 	}
-	manifest, err := LoadManifest(sagaPath)
+	manifest, err := loadLiveManifest(sagaID, sagaPath)
 	if err != nil {
 		return SagaStatus{}, err
 	}

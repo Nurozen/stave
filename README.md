@@ -1024,6 +1024,12 @@ exits 1 (nothing is written to stderr):
 | `invalid_arguments` | flag/usage refusal (`--edit` with `--reference`, `--memory destroy` on archive, `--summon` with `--json`, `--repo`/`--base` missing on retarget, `--after` without `--saga`, a saga added to itself, tethers disabled, ...) | varies |
 | `unknown` | any other failure; `message` is the human error text | |
 
+The read-only probes carry the envelope too: `space status --json`,
+`saga status --json` and `saga list --json` answer a failure with
+`{"error": {code, ...}}` on stdout and exit 1, so `space status <id> --json`
+is a usable existence check (`space_not_found`) rather than a prose message
+to parse.
+
 When `saga archive|destroy` fails **mid-walk** (a member's or the saga space's
 own teardown step errors after earlier members were already torn down), the
 envelope keeps the cause's `code` and `details` and adds what got done, so a

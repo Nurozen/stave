@@ -1173,7 +1173,9 @@ func (s Service) Status(ctx context.Context, spaceID string) (Status, error) {
 	if err != nil {
 		return Status{}, err
 	}
-	manifest, err := LoadManifest(spacePath)
+	// Typed, so a caller probing "does this space exist?" reads a
+	// space_not_found code instead of matching an os.Open message.
+	manifest, err := loadLiveManifest(spaceID, spacePath)
 	if err != nil {
 		return Status{}, err
 	}
