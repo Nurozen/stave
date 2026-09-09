@@ -97,7 +97,7 @@ func (s Service) mutateSagaManifestLocked(sagaID, spacePath string, fn func(*Man
 		return err
 	}
 	if manifest.Saga == nil {
-		return fmt.Errorf("space %q is not a saga", sagaID)
+		return coded(CodeNotASaga, map[string]any{"space": sagaID}, "space %q is not a saga", sagaID)
 	}
 	if err := fn(&manifest); err != nil {
 		return err
@@ -158,7 +158,7 @@ func (s Service) CreateSaga(ctx context.Context, opts SagaCreateOptions) error {
 		}
 	}
 	if fresh > 1 {
-		return fmt.Errorf("saga %q: at most one owned memory store may be created with the saga (%d fresh --memory specs)", opts.ID, fresh)
+		return coded(CodeInvalidArguments, map[string]any{"saga": opts.ID, "fresh": fresh}, "saga %q: at most one owned memory store may be created with the saga (%d fresh --memory specs)", opts.ID, fresh)
 	}
 	create := CreateOptions{
 		ID:                  opts.ID,
@@ -200,7 +200,7 @@ func (s Service) SagaAdd(ctx context.Context, sagaID, spaceID string, after []st
 		return err
 	}
 	if sagaID == spaceID {
-		return fmt.Errorf("saga %q cannot be its own member", sagaID)
+		return coded(CodeInvalidArguments, map[string]any{"saga": sagaID}, "saga %q cannot be its own member", sagaID)
 	}
 	var memberManifest, updated Manifest
 	var siblings []SpaceEntry
@@ -321,7 +321,7 @@ func (s Service) createInSaga(ctx context.Context, opts CreateOptions) error {
 		return err
 	}
 	if opts.ID == sagaID {
-		return fmt.Errorf("saga %q cannot be its own member", sagaID)
+		return coded(CodeInvalidArguments, map[string]any{"saga": sagaID}, "saga %q cannot be its own member", sagaID)
 	}
 	run := func() error {
 		sagaManifest, err := LoadManifest(sagaPath)
@@ -329,7 +329,7 @@ func (s Service) createInSaga(ctx context.Context, opts CreateOptions) error {
 			return err
 		}
 		if sagaManifest.Saga == nil {
-			return fmt.Errorf("space %q is not a saga", sagaID)
+			return coded(CodeNotASaga, map[string]any{"space": sagaID}, "space %q is not a saga", sagaID)
 		}
 		// PREFLIGHT — manifest-level checks only, before anything is created:
 		// a roster copy gains the candidate member and revalidates, rejecting
@@ -431,7 +431,7 @@ func (s Service) resolveAfterBases(opts CreateOptions) ([]RepoSpec, error) {
 			for j, pred := range preds {
 				ids[j] = pred.id
 			}
-			return nil, fmt.Errorf("repo %q: multiple --after predecessors edit it (%s); pick an explicit base with -e %s:space:<id>", spec.Name, strings.Join(ids, ", "), spec.Name)
+			return nil, coded(CodeInvalidArguments, map[string]any{"repo": spec.Name, "candidates": ids}, "repo %q: multiple --after predecessors edit it (%s); pick an explicit base with -e %s:space:<id>", spec.Name, strings.Join(ids, ", "), spec.Name)
 		}
 	}
 	return edits, nil
@@ -458,7 +458,7 @@ func (s Service) SagaRemove(ctx context.Context, sagaID, spaceID string) error {
 			}
 		}
 		if idx < 0 {
-			return fmt.Errorf("space %q is not a member of saga %q", spaceID, sagaID)
+			return coded(CodeNotASagaMember, map[string]any{"space": spaceID, "saga": sagaID}, "space %q is not a member of saga %q", spaceID, sagaID)
 		}
 		manifest.Saga.Members = append(members[:idx], members[idx+1:]...)
 		for i := range manifest.Saga.Members {
@@ -536,7 +536,7 @@ func (s Service) SagaArchive(ctx context.Context, sagaID string, opts SagaArchiv
 // partial report (guard refusals and preflight errors return unwrapped).
 func (s Service) SagaArchiveWithReport(ctx context.Context, sagaID string, opts SagaArchiveOptions) (SagaTeardownReport, error) {
 	if opts.MemoryFate == memory.FateDestroy {
-		return SagaTeardownReport{}, fmt.Errorf("archive does not destroy memory; use 'stave saga destroy --memory destroy' instead")
+		return SagaTeardownReport{}, coded(CodeInvalidArguments, nil, "archive does not destroy memory; use 'stave saga destroy --memory destroy' instead")
 	}
 	return s.sagaTeardown(ctx, sagaID, sagaTeardownSpec{
 		verb:   "archive",
@@ -621,7 +621,7 @@ func (s Service) sagaTeardownLocked(ctx context.Context, sagaID, sagaPath string
 		return err
 	}
 	if manifest.Saga == nil {
-		return fmt.Errorf("space %q is not a saga", sagaID)
+		return coded(CodeNotASaga, map[string]any{"space": sagaID}, "space %q is not a saga", sagaID)
 	}
 	plan := s.sagaTeardownOrder(manifest)
 	for _, p := range plan {
@@ -820,7 +820,7 @@ func (s Service) SagaMemberStates(sagaID string) ([]SagaMemberState, error) {
 		return nil, err
 	}
 	if manifest.Saga == nil {
-		return nil, fmt.Errorf("space %q is not a saga", sagaID)
+		return nil, coded(CodeNotASaga, map[string]any{"space": sagaID}, "space %q is not a saga", sagaID)
 	}
 	return s.sagaTeardownOrder(manifest), nil
 }

@@ -1276,8 +1276,9 @@ func TestRetargetUpdatesBaseWithoutWorktreeCalls(t *testing.T) {
 	if err := svc.Retarget(context.Background(), "ret-1", "repo-a", "release", false); err != nil {
 		t.Fatalf("Retarget() error = %v", err)
 	}
-	if len(fg.calls) != 0 {
-		t.Fatalf("Retarget(plain ref) called git: %#v", fg.calls)
+	// Retarget resolves and verifies the new base, but never touches a worktree.
+	if mutating := mutatingCalls(fg.calls); len(mutating) != 0 {
+		t.Fatalf("Retarget(plain ref) issued mutating git calls: %#v", mutating)
 	}
 	after, err := LoadManifest(svc.SpacePath("ret-1"))
 	if err != nil {
@@ -1299,10 +1300,16 @@ func TestRetargetUpdatesBaseWithoutWorktreeCalls(t *testing.T) {
 		t.Fatalf("Retarget touched the reference repo: %#v -> %#v", refBefore, refAfter)
 	}
 
-	// Reference repos are refused.
+	// Reference repos are refused, with the same code 'space remove' uses.
 	err = svc.Retarget(context.Background(), "ret-1", "repo-b", "main", false)
-	if err == nil || !strings.Contains(err.Error(), "reference-only") {
-		t.Fatalf("Retarget(reference) error = %v", err)
+	if ErrorCode(err) != CodeRepoNotInSpace || !strings.Contains(err.Error(), `has no edit repo "repo-b"`) {
+		t.Fatalf("Retarget(reference) error = %v (code %q)", err, ErrorCode(err))
+	}
+	if code := ErrorCode(svc.Retarget(context.Background(), "ret-1", "ghost", "main", false)); code != CodeRepoNotInSpace {
+		t.Fatalf("Retarget(unknown repo) code = %q", code)
+	}
+	if code := ErrorCode(svc.Retarget(context.Background(), "ret-1", "repo-a", " ", false)); code != CodeInvalidArguments {
+		t.Fatalf("Retarget(empty base) code = %q", code)
 	}
 
 	// Unknown repo, empty base.
@@ -1321,12 +1328,16 @@ func TestRetargetSugarRequiresExistingBranch(t *testing.T) {
 	}
 	fg.calls = nil
 
+	fg.refMissing = true
 	err := svc.Retarget(context.Background(), "ret-2", "repo-a", "space:ghost", false)
-	if err == nil || !strings.Contains(err.Error(), "does not exist") {
+	if err == nil || !strings.Contains(err.Error(), "does not resolve") {
 		t.Fatalf("Retarget(missing sugar target) error = %v", err)
 	}
-	if !containsCallPrefix(fg.calls, "branch-exists|") {
-		t.Fatalf("sugar retarget skipped BranchExists: %#v", fg.calls)
+	if ErrorCode(err) != CodeRefNotFound {
+		t.Fatalf("missing sugar target code = %q", ErrorCode(err))
+	}
+	if !containsCall(fg.calls, "ref-exists|"+cfgRepoA(svc)+"|refs/heads/stave/ghost/repo-a") {
+		t.Fatalf("sugar retarget skipped the ref preflight: %#v", fg.calls)
 	}
 	manifest, err := LoadManifest(svc.SpacePath("ret-2"))
 	if err != nil {
@@ -1336,7 +1347,7 @@ func TestRetargetSugarRequiresExistingBranch(t *testing.T) {
 		t.Fatalf("failed retarget mutated Base: %q", manifest.Repos[0].Base)
 	}
 
-	fg.branchExists = true
+	fg.refMissing = false
 	if err := svc.Retarget(context.Background(), "ret-2", "repo-a", "space:other", false); err != nil {
 		t.Fatalf("Retarget(sugar) error = %v", err)
 	}

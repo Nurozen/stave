@@ -267,7 +267,7 @@ func (s Service) Restore(ctx context.Context, opts RestoreOptions) error {
 		return fmt.Errorf("archive %s: %w", archivedPath, err)
 	}
 	if manifest.ID != opts.SpaceID {
-		return fmt.Errorf("archive %s holds space %q, not %q", archivedPath, manifest.ID, opts.SpaceID)
+		return coded(CodeArchiveNotFound, map[string]any{"space": opts.SpaceID, "path": archivedPath, "holds": manifest.ID}, "archive %s holds space %q, not %q", archivedPath, manifest.ID, opts.SpaceID)
 	}
 
 	// Preflight every repo before touching anything.
@@ -376,7 +376,7 @@ func (s Service) locateArchive(spaceID, from string) (string, error) {
 			return "", fmt.Errorf("archive %q: %w", from, err)
 		}
 		if !info.IsDir() {
-			return "", fmt.Errorf("archive %q is not a directory", from)
+			return "", coded(CodeArchiveNotFound, map[string]any{"from": from}, "archive %q is not a directory", from)
 		}
 		return path, nil
 	}

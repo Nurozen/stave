@@ -114,7 +114,7 @@ func TestCLIJSONSpaceRetarget(t *testing.T) {
 	if code, _ := jsonErrorCode(t, "space", "retarget", "rt-j", "--repo", "repo-a", "--json"); code != space.CodeInvalidArguments {
 		t.Fatalf("retarget without --base = %s", code)
 	}
-	if code, _ := jsonErrorCode(t, "space", "retarget", "rt-j", "--repo", "repo-b", "--base", "origin/main", "--json"); code != space.CodeUnknown {
+	if code, _ := jsonErrorCode(t, "space", "retarget", "rt-j", "--repo", "repo-b", "--base", "origin/main", "--json"); code != space.CodeRepoNotInSpace {
 		t.Fatalf("retarget reference repo = %s", code)
 	}
 	// Human refusal is unchanged: plain error, no envelope.
@@ -201,7 +201,7 @@ func TestCLIJSONSagaSync(t *testing.T) {
 	if code, _ := jsonErrorCode(t, "saga", "sync", "epic-missing", "--json"); code != space.CodeSpaceNotFound {
 		t.Fatalf("saga sync missing = %s", code)
 	}
-	if code, _ := jsonErrorCode(t, "saga", "sync", "m-1", "--json"); code != space.CodeUnknown {
+	if code, _ := jsonErrorCode(t, "saga", "sync", "m-1", "--json"); code != space.CodeNotASaga {
 		t.Fatalf("saga sync non-saga = %s", code)
 	}
 }

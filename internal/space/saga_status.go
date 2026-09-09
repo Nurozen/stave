@@ -360,7 +360,7 @@ func (s Service) SagaStatus(ctx context.Context, sagaID string) (SagaStatus, err
 		return SagaStatus{}, err
 	}
 	if manifest.Saga == nil {
-		return SagaStatus{}, fmt.Errorf("space %q is not a saga", sagaID)
+		return SagaStatus{}, coded(CodeNotASaga, map[string]any{"space": sagaID}, "space %q is not a saga", sagaID)
 	}
 	// Siblings feed base-owner resolution (verdicts + topology notes); a scan
 	// failure degrades stacked detection to unknown rather than failing status.
@@ -466,7 +466,7 @@ func (s Service) SagaSync(ctx context.Context, sagaID string, opts SagaSyncOptio
 		return err
 	}
 	if manifest.Saga == nil {
-		return fmt.Errorf("space %q is not a saga", sagaID)
+		return coded(CodeNotASaga, map[string]any{"space": sagaID}, "space %q is not a saga", sagaID)
 	}
 	type liveMember struct {
 		id       string

@@ -235,7 +235,7 @@ func TestCLIJSONSagaLifecycle(t *testing.T) {
 	if code, _ := jsonErrorCode(t, "saga", "add", "epic-j", "epic-z", "--json"); code != space.CodeSagaSpace {
 		t.Fatalf("saga add saga = %s", code)
 	}
-	if code, _ := jsonErrorCode(t, "saga", "add", "epic-j", "epic-j", "--json"); code != space.CodeUnknown {
+	if code, _ := jsonErrorCode(t, "saga", "add", "epic-j", "epic-j", "--json"); code != space.CodeInvalidArguments {
 		t.Fatalf("saga self-add = %s", code)
 	}
 	if code, _ := jsonErrorCode(t, "saga", "add", "epic-j", "ghost", "--json"); code != space.CodeSpaceNotFound {

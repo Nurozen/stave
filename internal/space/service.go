@@ -290,7 +290,7 @@ func ParseRepoSpec(raw string) (RepoSpec, error) {
 		return RepoSpec{}, err
 	}
 	if found && strings.TrimSpace(ref) == "" {
-		return RepoSpec{}, fmt.Errorf("repo spec %q has an empty ref", raw)
+		return RepoSpec{}, coded(CodeInvalidArguments, map[string]any{"spec": raw}, "repo spec %q has an empty ref", raw)
 	}
 	return RepoSpec{Name: name, Ref: ref}, nil
 }
@@ -336,7 +336,7 @@ func (s Service) InitSpace(ctx context.Context, opts InitOptions) error {
 		return err
 	}
 	if opts.Kind == KindSaga && !opts.viaSaga {
-		return fmt.Errorf("kind %q is reserved; use 'stave saga create'", KindSaga)
+		return coded(CodeInvalidArguments, map[string]any{"kind": KindSaga}, "kind %q is reserved; use 'stave saga create'", KindSaga)
 	}
 	spacePath := s.SpacePath(opts.ID)
 	_, statErr := os.Stat(spacePath)
@@ -414,7 +414,7 @@ func (s Service) InitSpace(ctx context.Context, opts InitOptions) error {
 
 func (s Service) Create(ctx context.Context, opts CreateOptions) error {
 	if len(opts.After) > 0 && opts.SagaID == "" {
-		return fmt.Errorf("--after requires --saga")
+		return coded(CodeInvalidArguments, nil, "--after requires --saga")
 	}
 	if opts.SagaID != "" {
 		if err := s.createInSaga(ctx, opts); err != nil {
@@ -616,7 +616,7 @@ func (s Service) AttachMemories(ctx context.Context, opts AttachMemoriesOptions)
 			}
 			key := parsed.Provider + ":" + parsed.Spec
 			if prev, dup := seen[key]; dup {
-				return fmt.Errorf("--memory specs %q and %q target the same store on provider %q; nothing attached", prev, raw, parsed.Provider)
+				return coded(CodeInvalidArguments, map[string]any{"specs": []string{prev, raw}, "provider": parsed.Provider}, "--memory specs %q and %q target the same store on provider %q; nothing attached", prev, raw, parsed.Provider)
 			}
 			seen[key] = raw
 		}
@@ -723,7 +723,7 @@ func (s Service) AttachMemory(ctx context.Context, opts AttachMemoryOptions) err
 		}
 		for _, existing := range manifest.Memories {
 			if existing.Name == name || existing.ID == storeIDHint {
-				return fmt.Errorf("memory %q already attached to space %q", name, opts.SpaceID)
+				return coded(CodeMemoryAttached, map[string]any{"space": opts.SpaceID, "memory": name}, "memory %q already attached to space %q", name, opts.SpaceID)
 			}
 		}
 	}
@@ -791,7 +791,7 @@ func (s Service) AttachMemory(ctx context.Context, opts AttachMemoryOptions) err
 	// Re-check after attach (another process may have raced).
 	for _, existing := range manifest.Memories {
 		if existing.Name == result.Name || existing.ID == result.StoreID {
-			return fmt.Errorf("memory %q already attached to space %q", result.Name, opts.SpaceID)
+			return coded(CodeMemoryAttached, map[string]any{"space": opts.SpaceID, "memory": result.Name}, "memory %q already attached to space %q", result.Name, opts.SpaceID)
 		}
 	}
 	manifest.Memories = append(manifest.Memories, MemoryManifest{
@@ -858,7 +858,7 @@ func (s Service) AddRepo(ctx context.Context, opts AddOptions) error {
 		return err
 	}
 	if opts.Mode != ModeEdit && opts.Mode != ModeReference {
-		return fmt.Errorf("repo mode must be edit or reference")
+		return coded(CodeInvalidArguments, map[string]any{"mode": string(opts.Mode)}, "repo mode must be edit or reference")
 	}
 	repoCfg, ok := s.Config.Repos[opts.RepoName]
 	if !ok {
@@ -882,7 +882,7 @@ func (s Service) AddRepo(ctx context.Context, opts AddOptions) error {
 	priorRepos := append([]RepoManifest(nil), manifest.Repos...)
 	if manifest.Saga != nil {
 		if opts.Mode == ModeEdit {
-			return fmt.Errorf("saga space %q holds no edit worktrees; add the repo to a member space instead", opts.SpaceID)
+			return coded(CodeSagaSpace, map[string]any{"space": opts.SpaceID}, "saga space %q holds no edit worktrees; add the repo to a member space instead", opts.SpaceID)
 		}
 		// Saga spaces serialize manifest writers under the per-saga lock;
 		// re-run under it (re-loading inside) unless the caller holds it.
@@ -1214,7 +1214,7 @@ func (s Service) Retarget(ctx context.Context, spaceID, repoName, base string, d
 		return err
 	}
 	if strings.TrimSpace(base) == "" {
-		return fmt.Errorf("a base ref is required")
+		return coded(CodeInvalidArguments, map[string]any{"space": spaceID, "repo": repoName}, "a base ref is required")
 	}
 	manifest, err := LoadManifest(spacePath)
 	if err != nil {
@@ -1222,10 +1222,10 @@ func (s Service) Retarget(ctx context.Context, spaceID, repoName, base string, d
 	}
 	repo, idx, ok := manifest.FindRepo(repoName)
 	if !ok {
-		return fmt.Errorf("repo %q not found in space %q", repoName, spaceID)
+		return &RepoNotInSpaceError{SpaceID: spaceID, Repo: repoName}
 	}
 	if repo.Mode != ModeEdit {
-		return fmt.Errorf("repo %q is reference-only", repoName)
+		return &RepoNotInSpaceError{SpaceID: spaceID, Repo: repoName, Mode: ModeEdit}
 	}
 	resolved, changed, err := ResolveBaseRef(base, repoName)
 	if err != nil {
@@ -1234,20 +1234,21 @@ func (s Service) Retarget(ctx context.Context, spaceID, repoName, base string, d
 	if changed && !dryRun {
 		s.printf("notice: base %q canonicalized to %q (stave branches live only in the bare repo; %q would never resolve)\n", base, resolved, "origin/"+strings.TrimPrefix(resolved, "refs/heads/"))
 	}
-	baseRef := normalizeRemoteRef(resolved)
+	// Resolution (non-origin remotes included) and the existence check are the
+	// same ones AddRepo applies, so a base that retarget accepts is one a
+	// worktree could actually be built from. Under --dry-run the manifest is
+	// not written, so an unresolvable base is previewed, not refused.
+	baseRef, err := s.resolveRef(ctx, repoName, repo.BareRepoPath, resolved)
+	if err != nil {
+		if !dryRun {
+			return err
+		}
+		baseRef = normalizeRemoteRef(resolved)
+		s.printf("warning: base %s\n", err)
+	}
 	if dryRun {
 		s.printf("dry-run: retarget %s repo %s to base %s\n", spaceID, repoName, baseRef)
 		return nil
-	}
-	if strings.HasPrefix(baseRef, "refs/heads/stave/") {
-		baseBranch := strings.TrimPrefix(baseRef, "refs/heads/")
-		exists, err := s.Git.BranchExists(ctx, repo.BareRepoPath, baseBranch)
-		if err != nil {
-			return err
-		}
-		if !exists {
-			return fmt.Errorf("base %q: branch %q does not exist in %s", base, baseBranch, repo.BareRepoPath)
-		}
 	}
 	manifest.Repos[idx].Base = baseRef
 	if err := SaveManifest(spacePath, manifest); err != nil {
@@ -1282,7 +1283,7 @@ func (s Service) Archive(ctx context.Context, opts ArchiveOptions) error {
 		fate = memory.FateKeep
 	}
 	if fate == memory.FateDestroy {
-		return fmt.Errorf("archive does not destroy memory; use 'stave space destroy --memory destroy' instead")
+		return coded(CodeInvalidArguments, nil, "archive does not destroy memory; use 'stave space destroy --memory destroy' instead")
 	}
 	if fate == memory.FateContribute {
 		// Contribute-then-keep: propose for EVERY attachment (contribute is
@@ -1617,9 +1618,9 @@ func (s Service) detachMemoryLocked(ctx context.Context, spacePath, spaceID, ali
 	mem, idx, ok := manifest.FindMemory(alias)
 	if !ok {
 		if alias == "" {
-			return fmt.Errorf("space %q has %d memory attachments; specify an alias", spaceID, len(manifest.Memories))
+			return coded(CodeMemoryAliasNeeded, map[string]any{"space": spaceID, "count": len(manifest.Memories)}, "space %q has %d memory attachments; specify an alias", spaceID, len(manifest.Memories))
 		}
-		return fmt.Errorf("memory %q not found on space %q", alias, spaceID)
+		return coded(CodeMemoryNotFound, map[string]any{"space": spaceID, "memory": alias}, "memory %q not found on space %q", alias, spaceID)
 	}
 	if fate == "" {
 		fate = memory.FateKeep
@@ -1726,9 +1727,9 @@ func (s Service) ProposeMemory(ctx context.Context, spaceID, alias string, dryRu
 	mem, _, ok := manifest.FindMemory(alias)
 	if !ok {
 		if alias == "" {
-			return fmt.Errorf("space %q has %d memory attachments; specify an alias", spaceID, len(manifest.Memories))
+			return coded(CodeMemoryAliasNeeded, map[string]any{"space": spaceID, "count": len(manifest.Memories)}, "space %q has %d memory attachments; specify an alias", spaceID, len(manifest.Memories))
 		}
-		return fmt.Errorf("memory %q not found on space %q", alias, spaceID)
+		return coded(CodeMemoryNotFound, map[string]any{"space": spaceID, "memory": alias}, "memory %q not found on space %q", alias, spaceID)
 	}
 	prov, err := s.provider(mem.Provider)
 	if err != nil {
@@ -1761,9 +1762,9 @@ func (s Service) SyncMemory(ctx context.Context, spaceID, alias string, dryRun b
 	mem, _, ok := manifest.FindMemory(alias)
 	if !ok {
 		if alias == "" {
-			return fmt.Errorf("space %q has %d memory attachments; specify an alias", spaceID, len(manifest.Memories))
+			return coded(CodeMemoryAliasNeeded, map[string]any{"space": spaceID, "count": len(manifest.Memories)}, "space %q has %d memory attachments; specify an alias", spaceID, len(manifest.Memories))
 		}
-		return fmt.Errorf("memory %q not found on space %q", alias, spaceID)
+		return coded(CodeMemoryNotFound, map[string]any{"space": spaceID, "memory": alias}, "memory %q not found on space %q", alias, spaceID)
 	}
 	prov, err := s.provider(mem.Provider)
 	if err != nil {
@@ -1809,7 +1810,7 @@ func (s Service) MemoryStatus(ctx context.Context, spaceID, alias string) error 
 	if alias != "" {
 		mem, _, ok := manifest.FindMemory(alias)
 		if !ok {
-			return fmt.Errorf("memory %q not found on space %q", alias, spaceID)
+			return coded(CodeMemoryNotFound, map[string]any{"space": spaceID, "memory": alias}, "memory %q not found on space %q", alias, spaceID)
 		}
 		targets = []MemoryManifest{mem}
 	}

@@ -998,6 +998,11 @@ exits 1 (nothing is written to stderr):
 | `repo_mode_ambiguous` | `space remove` needs `--edit` or `--reference` because the repo is present in both modes | `repo`, `modes` |
 | `saga_space` | a single-space verb was aimed at a saga space; use `stave saga archive|destroy` | |
 | `saga_member` | a single-space verb was aimed at a saga member; `stave saga remove` it first (or a space is already a member of another saga) | `saga` |
+| `not_a_saga` | a saga verb was aimed at a space with no saga roster | `space` |
+| `not_a_saga_member` | `saga remove`: the space is not on that saga's roster | `space`, `saga` |
+| `memory_not_found` | `memory status/sync/propose/detach`: the space has no attachment under that alias | `space`, `memory` |
+| `memory_alias_required` | the space has several attachments and the verb needs one alias | `space`, `count` |
+| `memory_already_attached` | `memory attach` / `space create --memory`: the alias is already attached | `space`, `memory` |
 | `invalid_name` | a space id or repo name fails the safe-name pattern | `label`, `name` |
 | `branch_missing` | restore: an edit repo's recorded branch no longer exists in the bare repo | `repo`, `branch` |
 | `ref_not_found` | `space create`/`add`: the base or reference ref resolves to nothing in the repo's bare mirror | `repo`, `ref`, `tried`, `remotes[]` |
@@ -1008,7 +1013,7 @@ exits 1 (nothing is written to stderr):
 | `cache_exists` | `repos add`: a bare repo already sits at the derived cache path; pass `--adopt` to reuse it | `repo`, `path` |
 | `clone_failed` | `repos add`: the fresh bare clone failed; `message` carries the git error | `repo` |
 | `config_exists` | `setup`: the config file exists and `--force` was not given | `path` |
-| `invalid_arguments` | flag/usage refusal (`--edit` with `--reference`, `--memory destroy` on archive, `--summon` with `--json`, `--repo`/`--base` missing on retarget, ...) | |
+| `invalid_arguments` | flag/usage refusal (`--edit` with `--reference`, `--memory destroy` on archive, `--summon` with `--json`, `--repo`/`--base` missing on retarget, `--after` without `--saga`, a saga added to itself, tethers disabled, ...) | varies |
 | `unknown` | any other failure; `message` is the human error text | |
 
 When `saga archive|destroy` fails **mid-walk** (a member's or the saga space's

@@ -139,7 +139,7 @@ func TestCLIMemoryAttachJSONErrorEnvelope(t *testing.T) {
 	runCLI(t, "space", "init", "demo")
 	runCLI(t, "memory", "attach", "demo")
 	code, _ := jsonErrorCode(t, "memory", "attach", "demo", "--json")
-	if code != "unknown" {
+	if code != "memory_already_attached" {
 		t.Fatalf("duplicate attach code = %q", code)
 	}
 	code, _ = jsonErrorCode(t, "memory", "attach", "demo", "--opt", "novalue", "--json")
@@ -303,7 +303,7 @@ func TestCLIMemoryStatusJSON(t *testing.T) {
 		t.Fatalf("alias filter: %v", rows)
 	}
 	code, _ := jsonErrorCode(t, "memory", "status", "demo", "nope", "--json")
-	if code != "unknown" {
+	if code != "memory_not_found" {
 		t.Fatalf("unknown alias code = %q", code)
 	}
 }
