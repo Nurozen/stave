@@ -502,7 +502,7 @@ func (s Service) createDryRun(ctx context.Context, opts CreateOptions) error {
 		if err != nil {
 			return err
 		}
-		baseRef, err := s.resolveRef(ctx, spec.Name, repoCfg.BareRepoPath, firstNonEmpty(resolvedBase, repoCfg.DefaultBranch, s.Config.DefaultBase))
+		baseRef, err := s.resolveRef(ctx, spec.Name, repoCfg.BareRepoPath, firstNonEmpty(resolvedBase, repoCfg.DefaultBranch, s.Config.DefaultBase), false)
 		if err != nil {
 			return err
 		}
@@ -516,7 +516,7 @@ func (s Service) createDryRun(ctx context.Context, opts CreateOptions) error {
 		if !ok {
 			return &RepoNotFoundError{Repo: spec.Name}
 		}
-		ref, err := s.resolveRef(ctx, spec.Name, repoCfg.BareRepoPath, firstNonEmpty(spec.Ref, repoCfg.DefaultBranch, s.Config.DefaultBase))
+		ref, err := s.resolveRef(ctx, spec.Name, repoCfg.BareRepoPath, firstNonEmpty(spec.Ref, repoCfg.DefaultBranch, s.Config.DefaultBase), false)
 		if err != nil {
 			return err
 		}
@@ -530,7 +530,7 @@ func (s Service) createDryRun(ctx context.Context, opts CreateOptions) error {
 		if !ok {
 			return &RepoNotFoundError{Repo: spec.Name}
 		}
-		ref, err := s.resolveRef(ctx, spec.Name, repoCfg.BareRepoPath, firstNonEmpty(spec.Ref, repoCfg.DefaultBranch, s.Config.DefaultBase))
+		ref, err := s.resolveRef(ctx, spec.Name, repoCfg.BareRepoPath, firstNonEmpty(spec.Ref, repoCfg.DefaultBranch, s.Config.DefaultBase), false)
 		if err != nil {
 			return err
 		}
@@ -751,7 +751,7 @@ func (s Service) AttachMemory(ctx context.Context, opts AttachMemoryOptions) err
 		refSpecs = append(refSpecs, memory.ReferenceSpec{
 			Name:        r.Name,
 			URL:         repoCfg.URL,
-			Ref:         r.Ref,
+			Ref:         memoryRefHint(r.Ref),
 			MarmotVault: repoCfg.MarmotVault,
 		})
 	}
@@ -897,9 +897,14 @@ func (s Service) AddRepo(ctx context.Context, opts AddOptions) error {
 			return err
 		}
 	}
+	// mirrorFresh: this call actually refreshed the mirror, so a
+	// remote-tracking ref that is still absent is conclusively absent. A
+	// dry-run only prints the fetch and --no-fetch skips it, so neither may
+	// turn a not-yet-fetched branch into a refusal (see resolveRef).
+	mirrorFresh := !opts.NoFetch && !opts.DryRun
 	if !opts.NoFetch && opts.DryRun {
 		s.printf("dry-run: fetch %s\n", repoCfg.BareRepoPath)
-	} else if !opts.NoFetch {
+	} else if mirrorFresh {
 		if err := s.Git.FetchAllPrune(ctx, repoCfg.BareRepoPath); err != nil {
 			return err
 		}
@@ -916,7 +921,11 @@ func (s Service) AddRepo(ctx context.Context, opts AddOptions) error {
 		if baseChanged && !opts.DryRun {
 			s.printf("notice: base %q canonicalized to %q (stave branches live only in the bare repo; %q would never resolve)\n", opts.Base, resolvedBase, "origin/"+strings.TrimPrefix(resolvedBase, "refs/heads/"))
 		}
-		baseRef, err := s.resolveRef(ctx, opts.RepoName, repoCfg.BareRepoPath, firstNonEmpty(resolvedBase, repoCfg.DefaultBranch, s.Config.DefaultBase))
+		repoPath := opts.RepoName
+		if manifest.HasPath(repoPath) {
+			return &RepoPathTakenError{SpaceID: opts.SpaceID, Repo: opts.RepoName, Path: repoPath}
+		}
+		baseRef, err := s.resolveRef(ctx, opts.RepoName, repoCfg.BareRepoPath, firstNonEmpty(resolvedBase, repoCfg.DefaultBranch, s.Config.DefaultBase), mirrorFresh)
 		if err != nil {
 			// "space:<id>" sugar keeps its own phrasing: the caller named a
 			// sibling space, not a ref, and should hear about it that way.
@@ -928,13 +937,9 @@ func (s Service) AddRepo(ctx context.Context, opts AddOptions) error {
 			return err
 		}
 		branch := firstNonEmpty(opts.Branch, DefaultBranch(opts.SpaceID, opts.RepoName))
-		repoPath := opts.RepoName
-		if manifest.HasPath(repoPath) {
-			return &RepoPathTakenError{SpaceID: opts.SpaceID, Repo: opts.RepoName, Path: repoPath}
-		}
 		startPoint := baseRef
 		if opts.StartPoint != "" {
-			if startPoint, err = s.resolveRef(ctx, opts.RepoName, repoCfg.BareRepoPath, opts.StartPoint); err != nil {
+			if startPoint, err = s.resolveRef(ctx, opts.RepoName, repoCfg.BareRepoPath, opts.StartPoint, mirrorFresh); err != nil {
 				return err
 			}
 		}
@@ -963,13 +968,13 @@ func (s Service) AddRepo(ctx context.Context, opts AddOptions) error {
 		}
 		entry = RepoManifest{Name: opts.RepoName, Mode: ModeEdit, Path: repoPath, Base: baseRef, Branch: branch, BareRepoPath: repoCfg.BareRepoPath}
 	case ModeReference:
-		ref, err := s.resolveRef(ctx, opts.RepoName, repoCfg.BareRepoPath, firstNonEmpty(opts.Ref, repoCfg.DefaultBranch, s.Config.DefaultBase))
-		if err != nil {
-			return err
-		}
 		repoPath := filepath.Join("references", opts.RepoName)
 		if manifest.HasPath(repoPath) {
 			return &RepoPathTakenError{SpaceID: opts.SpaceID, Repo: opts.RepoName, Path: repoPath}
+		}
+		ref, err := s.resolveRef(ctx, opts.RepoName, repoCfg.BareRepoPath, firstNonEmpty(opts.Ref, repoCfg.DefaultBranch, s.Config.DefaultBase), mirrorFresh)
+		if err != nil {
+			return err
 		}
 		worktreePath := filepath.Join(spacePath, repoPath)
 		if !opts.DryRun {
@@ -1027,7 +1032,7 @@ func (s Service) linkMemoryOnAdd(ctx context.Context, spacePath string, manifest
 	spec := memory.ReferenceSpec{
 		Name:        opts.RepoName,
 		URL:         repoCfg.URL,
-		Ref:         entry.Ref,
+		Ref:         memoryRefHint(entry.Ref),
 		MarmotVault: repoCfg.MarmotVault,
 	}
 	for _, mem := range manifest.Memories {
@@ -1240,13 +1245,12 @@ func (s Service) Retarget(ctx context.Context, spaceID, repoName, base string, d
 	// same ones AddRepo applies, so a base that retarget accepts is one a
 	// worktree could actually be built from. Under --dry-run the manifest is
 	// not written, so an unresolvable base is previewed, not refused.
-	baseRef, err := s.resolveRef(ctx, repoName, repo.BareRepoPath, resolved)
+	// Retarget never fetches, so a missing remote-tracking ref only warns; a
+	// missing stave branch is still conclusive (resolveRef's local-ref rule),
+	// which is the check retarget carried before.
+	baseRef, err := s.resolveRef(ctx, repoName, repo.BareRepoPath, resolved, false)
 	if err != nil {
-		if !dryRun {
-			return err
-		}
-		baseRef = normalizeRemoteRef(resolved)
-		s.printf("warning: base %s\n", err)
+		return err
 	}
 	if dryRun {
 		s.printf("dry-run: retarget %s repo %s to base %s\n", spaceID, repoName, baseRef)
@@ -2254,6 +2258,15 @@ func resolveRefSpelling(ref string, remotes []string) (full, spelling string) {
 	if remote, rest, ok := strings.Cut(ref, "/"); ok && rest != "" && remote != "origin" && slices.Contains(remotes, remote) {
 		return "refs/remotes/" + ref, "refs/remotes/" + ref
 	}
+	// A mirror with no origin at all — one remote under a different name —
+	// resolves a bare branch against the remote it does have. Without this the
+	// origin-only rule could never name anything in such a repo. An explicit
+	// "origin/..." is left alone: the caller named a remote, and being told it
+	// does not exist is more useful than a silent substitution.
+	if !strings.HasPrefix(ref, "origin/") && len(remotes) == 1 && remotes[0] != "origin" {
+		full = "refs/remotes/" + remotes[0] + "/" + ref
+		return full, full
+	}
 	spelling = normalizeRemoteRef(ref)
 	return "refs/remotes/" + spelling, spelling
 }
@@ -2263,27 +2276,65 @@ func resolveRefSpelling(ref string, remotes []string) (full, spelling string) {
 // looked for and the remotes it could have used — instead of reaching
 // 'git worktree add' as a raw git failure.
 //
-// The bare repo is the only source of truth for both halves. When it cannot
-// be interrogated at all (not cloned yet, unreadable) the offline spelling
-// rule stands in and the check is skipped: an unusable mirror is the worktree
-// add's problem to report, not a reason to invent a resolution error.
-func (s Service) resolveRef(ctx context.Context, repoName, bareRepoPath, ref string) (string, error) {
-	if strings.TrimSpace(ref) == "" {
+// mirrorFresh says the caller fetched the mirror during THIS call, which is
+// what makes a missing remote-tracking ref conclusive. It decides whether a
+// miss refuses or only warns:
+//
+//   - A local ref (refs/heads/..., which is what "space:<id>" sugar and
+//     hand-typed stave branches resolve to) is always conclusive: stave never
+//     pushes its own branches, so no fetch could conjure one.
+//   - A remote-tracking ref is only conclusive against a mirror this call just
+//     refreshed. Otherwise the ref may simply not be fetched yet — a branch
+//     pushed a minute ago, or a review whose base branch was deleted on merge
+//     — and refusing would make --dry-run and --no-fetch stricter than the
+//     real, fetching run they are meant to preview. Those warn and let git
+//     have the last word.
+//
+// When the mirror cannot be interrogated at all (not cloned yet, unreadable)
+// the offline spelling rule stands in and the remote-tracking check is
+// skipped: an unusable mirror is the worktree add's problem to report, not a
+// reason to invent a resolution error.
+func (s Service) resolveRef(ctx context.Context, repoName, bareRepoPath, ref string, mirrorFresh bool) (string, error) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
 		return "", coded(CodeInvalidArguments, map[string]any{"repo": repoName}, "repo %q: a base ref is required", repoName)
 	}
-	remotes, err := s.Git.RemoteNames(ctx, bareRepoPath)
-	if err != nil {
+	remotes, remotesErr := s.Git.RemoteNames(ctx, bareRepoPath)
+	full, spelling := resolveRefSpelling(ref, remotes)
+	local := strings.HasPrefix(full, "refs/heads/")
+	if remotesErr != nil && !local {
 		return normalizeRemoteRef(ref), nil
 	}
-	full, spelling := resolveRefSpelling(ref, remotes)
 	exists, err := s.Git.RefExists(ctx, bareRepoPath, full)
 	if err != nil {
 		return "", err
 	}
-	if !exists {
-		return "", &RefNotFoundError{Repo: repoName, Ref: strings.TrimSpace(ref), Tried: full, Remotes: remotes}
+	if exists {
+		return spelling, nil
 	}
+	missing := &RefNotFoundError{Repo: repoName, Ref: ref, Tried: full, Remotes: remotes}
+	if local || mirrorFresh {
+		return "", missing
+	}
+	s.printf("warning: %s\n", missing)
 	return spelling, nil
+}
+
+// memoryRefHint adapts a manifest ref for a memory provider, which resolves
+// against the repo's clone URL rather than stave's mirror. A remote-tracking
+// full ref is a mirror-local spelling that means nothing there, so it is
+// reduced to the branch it names: refs/remotes/fork/main → main. Everything
+// else — "origin/main", "main", a refs/heads/ branch — is passed through, so
+// this only touches the spelling that became possible with non-origin remotes.
+func memoryRefHint(ref string) string {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(ref), "refs/remotes/")
+	if !ok {
+		return ref
+	}
+	if _, branch, found := strings.Cut(rest, "/"); found {
+		return branch
+	}
+	return ref
 }
 
 func firstNonEmpty(values ...string) string {

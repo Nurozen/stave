@@ -34,6 +34,11 @@ func TestResolveRefSpelling(t *testing.T) {
 		{"refs/heads/stave/x/repo-a", remotes, "refs/heads/stave/x/repo-a", "refs/heads/stave/x/repo-a"},
 		{"refs/remotes/fork/main", remotes, "refs/remotes/fork/main", "refs/remotes/fork/main"},
 		{" main ", remotes, "refs/remotes/origin/main", "origin/main"},
+		// A mirror with a single, differently-named remote resolves bare
+		// branches against it; an explicit origin/ is left to fail honestly.
+		{"main", []string{"fork"}, "refs/remotes/fork/main", "refs/remotes/fork/main"},
+		{"origin/main", []string{"fork"}, "refs/remotes/origin/main", "origin/main"},
+		{"main", []string{"fork", "upstream"}, "refs/remotes/origin/main", "origin/main"},
 	}
 	for _, tt := range tests {
 		full, spelling := resolveRefSpelling(tt.ref, tt.remotes)
@@ -154,11 +159,13 @@ func TestAddRepoResolvesNonOriginRemoteBase(t *testing.T) {
 
 // TestResolveRefFallsBackWhenRemotesUnreadable pins the degrade path: a mirror
 // that cannot be interrogated keeps the offline origin/ spelling rather than
-// inventing a resolution failure.
+// inventing a resolution failure — but a local ref, which no fetch could
+// conjure, is still checked.
 func TestResolveRefFallsBackWhenRemotesUnreadable(t *testing.T) {
 	svc, fg, cfg := testService(t)
+	bare := cfg.Repos["repo-a"].BareRepoPath
 	fg.remotesErr = os.ErrNotExist
-	got, err := svc.resolveRef(context.Background(), "repo-a", cfg.Repos["repo-a"].BareRepoPath, "main")
+	got, err := svc.resolveRef(context.Background(), "repo-a", bare, "main", true)
 	if err != nil {
 		t.Fatalf("resolveRef() error = %v", err)
 	}
@@ -168,8 +175,110 @@ func TestResolveRefFallsBackWhenRemotesUnreadable(t *testing.T) {
 	if containsCallPrefix(fg.calls, "ref-exists|") {
 		t.Fatalf("existence was probed against an unreadable mirror: %#v", fg.calls)
 	}
-	if _, err := svc.resolveRef(context.Background(), "repo-a", cfg.Repos["repo-a"].BareRepoPath, "  "); ErrorCode(err) != CodeInvalidArguments {
+	fg.refMissing = true
+	if _, err := svc.resolveRef(context.Background(), "repo-a", bare, "refs/heads/stave/x/repo-a", false); ErrorCode(err) != CodeRefNotFound {
+		t.Fatalf("local ref check skipped on an unreadable mirror: %v", err)
+	}
+	if _, err := svc.resolveRef(context.Background(), "repo-a", bare, "  ", true); ErrorCode(err) != CodeInvalidArguments {
 		t.Fatalf("empty ref error = %v (code %q)", err, ErrorCode(err))
+	}
+}
+
+// TestResolveRefOnlyRefusesWhatAFetchCannotFix is the guard against making
+// --dry-run and --no-fetch stricter than the real, fetching run they preview.
+// A missing remote-tracking ref is conclusive only against a mirror the call
+// just refreshed; a missing local ref always is.
+func TestResolveRefOnlyRefusesWhatAFetchCannotFix(t *testing.T) {
+	svc, fg, cfg := testService(t)
+	var out strings.Builder
+	svc.Out = &out
+	bare := cfg.Repos["repo-a"].BareRepoPath
+	fg.refMissing = true
+	ctx := context.Background()
+
+	// Not fetched this call: the branch may simply not be mirrored yet.
+	got, err := svc.resolveRef(ctx, "repo-a", bare, "just-pushed", false)
+	if err != nil {
+		t.Fatalf("stale-mirror miss refused: %v", err)
+	}
+	if got != "origin/just-pushed" {
+		t.Fatalf("resolveRef() = %q", got)
+	}
+	if !strings.Contains(out.String(), "warning:") || !strings.Contains(out.String(), "refs/remotes/origin/just-pushed") {
+		t.Fatalf("stale-mirror miss was silent:\n%s", out.String())
+	}
+
+	// Fetched this call: the same miss is conclusive.
+	if _, err := svc.resolveRef(ctx, "repo-a", bare, "just-pushed", true); ErrorCode(err) != CodeRefNotFound {
+		t.Fatalf("fresh-mirror miss = %v (code %q)", err, ErrorCode(err))
+	}
+	// Stave never pushes its own branches, so a missing one is conclusive
+	// however stale the mirror is.
+	if _, err := svc.resolveRef(ctx, "repo-a", bare, "refs/heads/stave/ghost/repo-a", false); ErrorCode(err) != CodeRefNotFound {
+		t.Fatalf("local ref miss = %v (code %q)", err, ErrorCode(err))
+	}
+}
+
+// TestAddRepoDoesNotRefuseWhatTheRealRunWouldFetch covers the two callers that
+// reach resolveRef with an unrefreshed mirror: --dry-run (fetch is only
+// printed) and --no-fetch (which `stave review` uses after fetching the PR ref
+// itself, for a base branch that may have been deleted on merge).
+func TestAddRepoDoesNotRefuseWhatTheRealRunWouldFetch(t *testing.T) {
+	svc, fg, _ := testService(t)
+	var out strings.Builder
+	svc.Out = &out
+	ctx := context.Background()
+	fg.refMissing = true
+
+	if err := svc.Create(ctx, CreateOptions{ID: "dr-1", Edits: []RepoSpec{{Name: "repo-a", Ref: "unfetched"}}, DryRun: true}); err != nil {
+		t.Fatalf("dry-run refused an unfetched base: %v", err)
+	}
+	if !strings.Contains(out.String(), "dry-run: add edit worktree stave/dr-1/repo-a from origin/unfetched") {
+		t.Fatalf("dry-run plan:\n%s", out.String())
+	}
+
+	out.Reset()
+	if err := svc.InitSpace(ctx, InitOptions{ID: "nf-rev"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.AddRepo(ctx, AddOptions{
+		SpaceID: "nf-rev", RepoName: "repo-a", Mode: ModeEdit,
+		Base: "deleted-on-merge", StartPoint: "pr/7", NoFetch: true,
+	}); err != nil {
+		t.Fatalf("--no-fetch refused a base the mirror has not seen: %v", err)
+	}
+	if !strings.Contains(out.String(), "warning:") {
+		t.Fatalf("missing base was not reported at all:\n%s", out.String())
+	}
+	manifest, err := LoadManifest(svc.SpacePath("nf-rev"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Repos[0].Base != "origin/deleted-on-merge" {
+		t.Fatalf("manifest Base = %q", manifest.Repos[0].Base)
+	}
+
+	// A real (fetching) run still refuses: that is the must-fix case.
+	if err := svc.Create(ctx, CreateOptions{ID: "hard-1", Edits: []RepoSpec{{Name: "repo-a", Ref: "unfetched"}}}); ErrorCode(err) != CodeRefNotFound {
+		t.Fatalf("fetching create = %v (code %q)", err, ErrorCode(err))
+	}
+}
+
+// TestMemoryRefHintStripsMirrorLocalSpellings: memory providers resolve against
+// the clone URL, so the mirror-local refs/remotes/ spelling is reduced to the
+// branch it names and every pre-existing spelling passes through untouched.
+func TestMemoryRefHintStripsMirrorLocalSpellings(t *testing.T) {
+	for ref, want := range map[string]string{
+		"refs/remotes/fork/main":          "main",
+		"refs/remotes/origin/release/2.0": "release/2.0",
+		"origin/main":                     "origin/main",
+		"main":                            "main",
+		"refs/heads/stave/x/repo-a":       "refs/heads/stave/x/repo-a",
+		"":                                "",
+	} {
+		if got := memoryRefHint(ref); got != want {
+			t.Fatalf("memoryRefHint(%q) = %q, want %q", ref, got, want)
+		}
 	}
 }
 

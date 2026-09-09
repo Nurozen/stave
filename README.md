@@ -597,10 +597,21 @@ is still treated as a branch on `origin`, which keeps `feature/login` working.
 A ref that resolves to nothing is refused by Stave, not by `git worktree add`:
 the message names the full ref it looked for and the remotes the mirror has,
 and `--json` returns `{"error":{"code":"ref_not_found","details":{"repo","ref","tried","remotes"}}}`.
-`--dry-run` performs the same resolution and the same check, so the printed
-plan names the ref the real run would use. The check reads the mirror as it
-stands; run `stave repos sync <repo>` first if the branch was pushed since the
-last fetch.
+
+The check only refuses what a fetch could not fix, so it never makes a preview
+stricter than the run it previews:
+
+- A **local** ref — what `space:<id>` sugar and hand-typed `stave/...` bases
+  resolve to — is always conclusive. Stave never pushes its own branches, so no
+  fetch could conjure one.
+- A **remote-tracking** ref is conclusive only when that command fetched the
+  mirror itself. Under `--dry-run` (which only prints the fetch), `--no-fetch`,
+  or `space retarget` (which never fetches), a miss is a `warning:` on stderr
+  and the command proceeds — the branch may simply not be mirrored yet. Run
+  `stave repos sync <repo>` to make the answer authoritative.
+
+Either way `--dry-run` resolves the spelling exactly as the real run does, so
+the printed plan names the ref that run would use.
 
 When `--spec` points at a file, it is copied under `spec/` with its original basename. When it points at a directory, the directory contents are copied into `spec/`. The manifest records `specPath: spec`.
 

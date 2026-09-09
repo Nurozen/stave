@@ -235,7 +235,13 @@ func (e *RefNotFoundError) Error() string {
 	if len(e.Remotes) > 0 {
 		msg += fmt.Sprintf("; remotes on the bare repo: %s", strings.Join(e.Remotes, ", "))
 	}
-	return msg + "; run 'stave repos sync " + e.Repo + "' if the branch was pushed after the last fetch"
+	// Only a remote-tracking ref can be fixed by fetching. A local ref is one
+	// stave owns and never pushes, so pointing at 'repos sync' would send the
+	// reader somewhere that cannot help.
+	if strings.HasPrefix(e.Tried, "refs/remotes/") {
+		msg += "; run 'stave repos sync " + e.Repo + "' if the branch was pushed after the last fetch"
+	}
+	return msg
 }
 
 func (e *RefNotFoundError) Code() string { return CodeRefNotFound }
