@@ -94,6 +94,11 @@ type CreateOptions struct {
 	// (--no-learn). The space is built normally; only the tether recording is
 	// skipped.
 	NoLearn bool
+	// NoFetch skips the pre-add fetch of every repo's bare mirror, exactly as
+	// AddOptions.NoFetch does for a single 'space add'. Scripted callers that
+	// already synced the mirrors (or are deliberately building against a
+	// pinned one) pay one fetch per repo otherwise.
+	NoFetch bool
 	// suppressCapture (unexported) blocks capture on the inner non-saga Create
 	// composed by createInSaga, so the saga member's realized set is captured
 	// exactly once, OUTSIDE the per-saga lock (D2).
@@ -437,21 +442,21 @@ func (s Service) Create(ctx context.Context, opts CreateOptions) error {
 		return err
 	}
 	for _, spec := range opts.Edits {
-		if err := s.AddRepo(ctx, AddOptions{SpaceID: opts.ID, RepoName: spec.Name, Mode: ModeEdit, Base: spec.Ref, DryRun: opts.DryRun, sagaLockHeld: opts.sagaLockHeld}); err != nil {
+		if err := s.AddRepo(ctx, AddOptions{SpaceID: opts.ID, RepoName: spec.Name, Mode: ModeEdit, Base: spec.Ref, DryRun: opts.DryRun, NoFetch: opts.NoFetch, sagaLockHeld: opts.sagaLockHeld}); err != nil {
 			return err
 		}
 	}
 	for _, spec := range opts.References {
 		// LinkMemory is a no-op here (memory attaches AFTER the repo loop and
 		// passes the references itself); set for uniform semantics.
-		if err := s.AddRepo(ctx, AddOptions{SpaceID: opts.ID, RepoName: spec.Name, Mode: ModeReference, Ref: spec.Ref, DryRun: opts.DryRun, LinkMemory: true, sagaLockHeld: opts.sagaLockHeld}); err != nil {
+		if err := s.AddRepo(ctx, AddOptions{SpaceID: opts.ID, RepoName: spec.Name, Mode: ModeReference, Ref: spec.Ref, DryRun: opts.DryRun, NoFetch: opts.NoFetch, LinkMemory: true, sagaLockHeld: opts.sagaLockHeld}); err != nil {
 			return err
 		}
 	}
 	// Tether-expanded references (-c/--common) get worktrees exactly like
 	// explicit references, but are excluded from capture below (OQ-E).
 	for _, spec := range opts.CommonReferences {
-		if err := s.AddRepo(ctx, AddOptions{SpaceID: opts.ID, RepoName: spec.Name, Mode: ModeReference, Ref: spec.Ref, DryRun: opts.DryRun, LinkMemory: true, sagaLockHeld: opts.sagaLockHeld}); err != nil {
+		if err := s.AddRepo(ctx, AddOptions{SpaceID: opts.ID, RepoName: spec.Name, Mode: ModeReference, Ref: spec.Ref, DryRun: opts.DryRun, NoFetch: opts.NoFetch, LinkMemory: true, sagaLockHeld: opts.sagaLockHeld}); err != nil {
 			return err
 		}
 	}
@@ -501,7 +506,9 @@ func (s Service) createDryRun(ctx context.Context, opts CreateOptions) error {
 		if err != nil {
 			return err
 		}
-		s.printf("dry-run: fetch %s\n", repoCfg.BareRepoPath)
+		if !opts.NoFetch {
+			s.printf("dry-run: fetch %s\n", repoCfg.BareRepoPath)
+		}
 		s.printf("dry-run: add edit worktree %s from %s at %s\n", DefaultBranch(opts.ID, spec.Name), baseRef, filepath.Join(spacePath, spec.Name))
 	}
 	for _, spec := range opts.References {
@@ -513,7 +520,9 @@ func (s Service) createDryRun(ctx context.Context, opts CreateOptions) error {
 		if err != nil {
 			return err
 		}
-		s.printf("dry-run: fetch %s\n", repoCfg.BareRepoPath)
+		if !opts.NoFetch {
+			s.printf("dry-run: fetch %s\n", repoCfg.BareRepoPath)
+		}
 		s.printf("dry-run: add reference worktree %s at %s\n", ref, filepath.Join(spacePath, "references", spec.Name))
 	}
 	for _, spec := range opts.CommonReferences {
@@ -525,7 +534,9 @@ func (s Service) createDryRun(ctx context.Context, opts CreateOptions) error {
 		if err != nil {
 			return err
 		}
-		s.printf("dry-run: fetch %s\n", repoCfg.BareRepoPath)
+		if !opts.NoFetch {
+			s.printf("dry-run: fetch %s\n", repoCfg.BareRepoPath)
+		}
 		s.printf("dry-run: add reference worktree %s at %s (from repo tethers)\n", ref, filepath.Join(spacePath, "references", spec.Name))
 	}
 	// Memory dry-run lines (no binary invoke).

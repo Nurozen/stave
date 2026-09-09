@@ -1155,6 +1155,7 @@ func (a *app) createCommand() *cobra.Command {
 	var common bool
 	var includeWeak bool
 	var noLearn bool
+	var noFetch bool
 	var jsonOut bool
 	cmd := &cobra.Command{
 		Use:   "create <space-id>",
@@ -1196,6 +1197,7 @@ func (a *app) createCommand() *cobra.Command {
 					References: refSpecs,
 					Memories:   memories,
 					NoLearn:    noLearn,
+					NoFetch:    noFetch,
 					DryRun:     dryRun,
 					SagaID:     sagaID,
 					After:      after,
@@ -1262,6 +1264,7 @@ func (a *app) createCommand() *cobra.Command {
 	cmd.Flags().BoolVarP(&common, "common", "c", false, "also add reference worktrees for the edited repos' strong learned tethers")
 	cmd.Flags().BoolVar(&includeWeak, "include-weak", false, "with --common, include weak tethers too")
 	cmd.Flags().BoolVar(&noLearn, "no-learn", false, "do not record co-occurrence tethers for this create")
+	cmd.Flags().BoolVar(&noFetch, "no-fetch", false, "skip fetching the bare repos before adding the worktrees")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON (result on success, {\"error\": {code, message}} on failure; exit 1)")
 	cmd.Flags().SetInterspersed(false)
 	return cmd

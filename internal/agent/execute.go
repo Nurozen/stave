@@ -135,6 +135,7 @@ func (e Executor) executeOperation(ctx context.Context, op Operation) error {
 			References:       refSpecs,
 			CommonReferences: commonRefs,
 			Memories:         op.Memories,
+			NoFetch:          op.NoFetch,
 		})
 	case OpSpaceAdd:
 		mode := space.ModeEdit

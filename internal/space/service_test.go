@@ -1614,3 +1614,54 @@ func containsCallPrefix(calls []string, prefix string) bool {
 	}
 	return false
 }
+
+// TestCreateNoFetchSkipsEveryMirrorFetch pins the create-side counterpart of
+// AddOptions.NoFetch: one flag, no fetch for any repo the create materializes,
+// in the dry-run plan and for real.
+func TestCreateNoFetchSkipsEveryMirrorFetch(t *testing.T) {
+	svc, fg, cfg := testService(t)
+	var out strings.Builder
+	svc.Out = &out
+
+	opts := CreateOptions{
+		ID:               "nf-dry",
+		Edits:            []RepoSpec{{Name: "repo-a"}},
+		References:       []RepoSpec{{Name: "repo-b"}},
+		CommonReferences: []RepoSpec{{Name: "repo-a"}},
+		NoFetch:          true,
+		DryRun:           true,
+	}
+	if err := svc.Create(context.Background(), opts); err != nil {
+		t.Fatalf("Create(--no-fetch dry-run) error = %v", err)
+	}
+	if strings.Contains(out.String(), "dry-run: fetch") {
+		t.Fatalf("--no-fetch dry-run still planned a fetch:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "dry-run: add edit worktree") {
+		t.Fatalf("--no-fetch dry-run skipped the worktrees:\n%s", out.String())
+	}
+
+	out.Reset()
+	fg.calls = nil
+	opts.ID = "nf-1"
+	opts.DryRun = false
+	if err := svc.Create(context.Background(), opts); err != nil {
+		t.Fatalf("Create(--no-fetch) error = %v", err)
+	}
+	if containsCallPrefix(fg.calls, "fetch|") {
+		t.Fatalf("--no-fetch still fetched: %#v", fg.calls)
+	}
+
+	// Without the flag every repo's mirror is fetched, as before.
+	fg.calls = nil
+	opts.ID = "nf-2"
+	opts.NoFetch = false
+	if err := svc.Create(context.Background(), opts); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	for _, repo := range []string{"repo-a", "repo-b"} {
+		if !containsCall(fg.calls, "fetch|"+cfg.Repos[repo].BareRepoPath) {
+			t.Fatalf("%s mirror was not fetched: %#v", repo, fg.calls)
+		}
+	}
+}

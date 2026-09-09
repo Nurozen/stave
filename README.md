@@ -568,7 +568,7 @@ Space flags:
 | `--edit`, `-e` / `--reference`, `-r` | `add`, `remove` | Mode: exactly one required for `add`; for `remove` one is required only when the repo is present in both modes |
 | `--base`, `-b` | `add` | Base branch/ref for edits (`space:<id>` sugar accepted), or ref for references |
 | `--branch` | `add` | Branch name for editable repos |
-| `--no-fetch` | `add` | Skip fetching the bare repo before adding |
+| `--no-fetch` | `create`, `add` | Skip fetching the bare repo(s) before adding the worktree(s) |
 | `--references-only` | `sync` | Only sync reference worktrees |
 | `--force` | `remove`, `archive`, `destroy` | Proceed despite dirty edit worktrees (and, for `remove`/`archive`/`destroy`, other spaces stacked on the affected branches) |
 | `--from` | `restore` | `.archive/` entry name to restore when several `<id>-<timestamp>` copies exist |

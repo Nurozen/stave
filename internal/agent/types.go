@@ -310,6 +310,9 @@ func EquivalentCommand(op Operation) string {
 		if op.IncludeWeak {
 			parts = append(parts, "--include-weak")
 		}
+		if op.NoFetch {
+			parts = append(parts, "--no-fetch")
+		}
 		return strings.Join(parts, " ")
 	case OpSpaceAdd:
 		parts := []string{"stave", "space", "add", shellQuote(op.SpaceID), shellQuote(op.Repo)}
