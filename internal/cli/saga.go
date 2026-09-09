@@ -128,7 +128,7 @@ func (a *app) sagaCreateCommand() *cobra.Command {
 				if summonName == "" {
 					return nil, nil
 				}
-				return nil, a.runSummon(cmd, svc.Config, sagaID, summonName, "", agentArgs, false)
+				return nil, a.summonNotice(cmd, svc.Config, sagaID, summonName, "", agentArgs)
 			})
 		},
 	}

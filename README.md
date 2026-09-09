@@ -827,7 +827,15 @@ prints a note that saga status may be stale until `stave saga sync`.
 
 Summoned agents always launch from `agent-work/<space-id>`, not from an individual repo. That gives them the manifest, generated `AGENTS.md`, copied specs, editable top-level repos, and `references/` context in one working directory.
 
-`--print-command` prints the launch command instead of running it. Non-interactive terminals also print instead of launching. `cursor` maps to the Cursor Agent CLI (`cursor-agent`), not the Cursor GUI editor.
+`--print-command` prints the launch command instead of running it, and exits 0.
+Non-interactive terminals also print instead of launching, but exit **3** with
+a notice on stderr — the command itself stays on stdout, so it is still
+pipeable, and a scripted caller can tell "printed a command, launched nothing"
+from "launched the agent, which exited 0". Verbs that only trail a summon
+(`space create --summon`, `saga create --summon`, `review --summon`) keep their
+own exit status: their work succeeded, and the skipped launch is a stderr
+notice. `cursor` maps to the Cursor Agent CLI (`cursor-agent`), not the Cursor
+GUI editor.
 
 Agent flags can also follow the direct command, for example
 `stave summon ticket-482 --with codex --yolo`.

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -1248,7 +1249,7 @@ func (a *app) createCommand() *cobra.Command {
 				if err := a.requestShellChdir(svc.SpacePath(spaceID)); err != nil {
 					return nil, err
 				}
-				return nil, a.runSummon(cmd, svc.Config, spaceID, summonName, "", agentArgs, false)
+				return nil, a.summonNotice(cmd, svc.Config, spaceID, summonName, "", agentArgs)
 			})
 		},
 	}
@@ -3031,13 +3032,52 @@ func splitPortalExecArgs(args []string, argsLenAtDash int) (string, string, []st
 	return head[0], portalID, argv, nil
 }
 
+// errSummonNotLaunched reports that summon degraded to printing the command
+// because the terminal is not interactive. It exits 3 so a scripted caller can
+// tell "printed a command, launched nothing" from "launched the agent, which
+// exited 0" — at exit 0 the two were indistinguishable, and only a stderr
+// notice separated them. Asking for the preview explicitly with
+// --print-command is a success and stays exit 0.
+//
+// It is a notice, not a failure: the composite verbs (space create --summon,
+// saga create --summon, review --summon) swallow it, since their own work
+// succeeded and only the trailing launch was skipped.
+var errSummonNotLaunched = &summonNotLaunchedError{}
+
+type summonNotLaunchedError struct{}
+
+func (e *summonNotLaunchedError) Error() string {
+	return "summon printed the launch command instead of launching: no interactive terminal"
+}
+
+func (e *summonNotLaunchedError) ExitCode() int { return 3 }
+
+func (e *summonNotLaunchedError) Silent() bool { return true }
+
 func (a *app) runSummon(cmd *cobra.Command, cfg config.Config, spaceID string, summoner string, prompt string, agentArgs []string, printCommand bool) error {
 	svc := summon.NewService(cfg, a.effectiveSummonLauncher(), cmd.OutOrStdout())
 	svc.Interactive = a.commandIsTerminal(cmd)
-	if !printCommand && !svc.Interactive {
-		fmt.Fprintln(cmd.ErrOrStderr(), "Non-interactive terminal detected; printing summon command instead of launching.")
+	degraded := !printCommand && !svc.Interactive
+	if degraded {
+		fmt.Fprintln(cmd.ErrOrStderr(), "Non-interactive terminal detected; printing summon command instead of launching (exit 3; pass --print-command to ask for this and exit 0).")
 	}
-	return svc.Summon(cmd.Context(), summon.Options{SpaceID: spaceID, Summoner: summoner, Prompt: prompt, AgentArgs: agentArgs, PrintCommand: printCommand})
+	if err := svc.Summon(cmd.Context(), summon.Options{SpaceID: spaceID, Summoner: summoner, Prompt: prompt, AgentArgs: agentArgs, PrintCommand: printCommand}); err != nil {
+		return err
+	}
+	if degraded {
+		return errSummonNotLaunched
+	}
+	return nil
+}
+
+// summonNotice runs a trailing summon for a composite verb, where a
+// non-interactive degrade must not fail the command that already did its work.
+func (a *app) summonNotice(cmd *cobra.Command, cfg config.Config, spaceID, summoner, prompt string, agentArgs []string) error {
+	err := a.runSummon(cmd, cfg, spaceID, summoner, prompt, agentArgs, false)
+	if errors.Is(err, errSummonNotLaunched) {
+		return nil
+	}
+	return err
 }
 
 func (a *app) printPlannedSummon(cmd *cobra.Command, cfg config.Config, spaceID string, summoner string, specPath string, agentArgs []string) error {
